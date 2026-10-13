@@ -7,7 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    model::{Operation, OutboxEntry, RemoteFilter, RemoteLabel, RemoteProject, RemoteTask},
+    model::{
+        Due, Operation, OutboxEntry, RemoteFilter, RemoteLabel, RemoteProject, RemoteTask, Task,
+    },
     store::Store,
 };
 
@@ -124,6 +126,21 @@ impl TodoistClient {
                     "id": entry.entity_id, "content": content, "description": description
                 }),
             )?,
+            Operation::QuickEdit {
+                expression,
+                description,
+                update_uuid,
+                move_uuid,
+                delete_uuid,
+            } => self.quick_edit(
+                store,
+                entry,
+                expression,
+                description,
+                update_uuid,
+                move_uuid,
+                delete_uuid,
+            )?,
             Operation::UpdateDue { due_string } => {
                 self.command(
                     entry,
@@ -154,6 +171,80 @@ impl TodoistClient {
             }
         }
         store.finish_outbox(entry.seq)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn quick_edit(
+        &self,
+        store: &Store,
+        entry: &OutboxEntry,
+        expression: &str,
+        description: &str,
+        update_uuid: &str,
+        move_uuid: &str,
+        delete_uuid: &str,
+    ) -> Result<()> {
+        let original = store
+            .task(&entry.entity_id)?
+            .context("edited task no longer exists")?;
+        let response = Self::check(
+            self.auth(self.http.post(format!("{}/tasks/quick", self.base)))
+                .header("X-Request-Id", &entry.uuid)
+                .json(&json!({"text": expression, "meta": true}))
+                .send()?,
+        )?;
+        let value: Value = response
+            .json()
+            .context("decode Quick Edit parsing response")?;
+        let task_value = value
+            .get("task")
+            .or_else(|| value.get("item"))
+            .unwrap_or(&value);
+        let parsed: RemoteTask = serde_json::from_value(task_value.clone())
+            .context("Todoist Quick Edit response did not contain a task")?;
+
+        let parsed_project_selected = store
+            .project(&parsed.project_id)?
+            .is_some_and(|project| expression_mentions_project(expression, &project.name));
+        let parsed_due = parsed.due.is_some();
+        let updated = merge_quick_edit(
+            &original,
+            &parsed,
+            expression,
+            description,
+            parsed_project_selected,
+        );
+        let move_project =
+            (updated.project_id != original.project_id).then(|| updated.project_id.clone());
+
+        let mut args = json!({
+            "id": entry.entity_id,
+            "content": updated.content,
+            "description": updated.description,
+            "labels": updated.labels,
+            "priority": updated.priority,
+        });
+        if parsed_due {
+            args["due"] = due_value(updated.due.as_ref());
+        }
+
+        let update_result = (|| -> Result<()> {
+            self.command_with_uuid(update_uuid, "item_update", args)?;
+            if let Some(project_id) = move_project {
+                self.command_with_uuid(
+                    move_uuid,
+                    "item_move",
+                    json!({"id": entry.entity_id, "project_id": project_id}),
+                )?;
+            }
+            Ok(())
+        })();
+        let cleanup_result =
+            self.command_with_uuid(delete_uuid, "item_delete", json!({"id": parsed.id}));
+        update_result?;
+        cleanup_result.context("remove temporary Quick Edit parser task")?;
+        store.apply_synced_task_edit(&updated, entry.seq)?;
         Ok(())
     }
 
@@ -267,26 +358,87 @@ impl TodoistClient {
 }
 
 fn due_update_args(task_id: &str, due_string: &str) -> Value {
-    let due = if due_string.is_empty() {
-        Value::Null
-    } else {
-        // Todoist parses this user-provided string with its natural-language
-        // date parser, using the account language when no language is given.
-        json!({"string": due_string})
-    };
-    json!({"id": task_id, "due": due})
+    let due = (!due_string.is_empty()).then(|| Due {
+        string: Some(due_string.to_owned()),
+        ..Due::default()
+    });
+    json!({"id": task_id, "due": due_value(due.as_ref())})
+}
+
+fn due_value(due: Option<&Due>) -> Value {
+    due.and_then(|due| due.string.as_deref().or_else(|| due.display()))
+        .map_or(Value::Null, |value| json!({"string": value}))
 }
 
 fn quick_add_request(expression: &str, project_name: &str, is_inbox: bool) -> (String, bool) {
-    let has_explicit_project = expression.split_whitespace().any(|word| {
-        word.strip_prefix('#')
-            .is_some_and(|project| !project.is_empty())
-    });
+    let has_explicit_project = contains_explicit_project(expression);
     if is_inbox || has_explicit_project {
         (expression.to_owned(), false)
     } else {
         (format!("{expression} #{project_name}"), true)
     }
+}
+
+fn contains_explicit_project(expression: &str) -> bool {
+    expression.split_whitespace().any(|word| {
+        word.strip_prefix('#')
+            .is_some_and(|project| !project.is_empty())
+    })
+}
+
+fn contains_priority(expression: &str) -> bool {
+    expression.split_whitespace().any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "p1" | "p2" | "p3" | "p4" | "!!1" | "!!2" | "!!3" | "!!4"
+        )
+    })
+}
+
+fn expression_mentions_project(expression: &str, project_name: &str) -> bool {
+    let expression = expression.to_lowercase();
+    let project = format!("#{}", project_name.replace(' ', "\\ ")).to_lowercase();
+    expression.match_indices(&project).any(|(index, _)| {
+        expression[index + project.len()..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+    })
+}
+
+fn merge_quick_edit(
+    original: &Task,
+    parsed: &RemoteTask,
+    expression: &str,
+    description: &str,
+    parsed_project_selected: bool,
+) -> Task {
+    let mut updated = original.clone();
+    updated.content.clone_from(&parsed.content);
+    updated.description = if description.is_empty() {
+        parsed.description.clone()
+    } else {
+        description.to_owned()
+    };
+    if let Some(due) = parsed.due.clone() {
+        updated.due = Some(due);
+    }
+    for label in &parsed.labels {
+        if !updated
+            .labels
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(label))
+        {
+            updated.labels.push(label.clone());
+        }
+    }
+    if contains_priority(expression) {
+        updated.priority = parsed.priority;
+    }
+    if parsed_project_selected {
+        updated.project_id.clone_from(&parsed.project_id);
+    }
+    updated
 }
 
 fn concise_json(value: &Value) -> String {
@@ -296,6 +448,40 @@ fn concise_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task() -> Task {
+        Task {
+            id: "task-1".into(),
+            project_id: "inbox".into(),
+            content: "Original".into(),
+            description: "Old description".into(),
+            labels: vec!["Work".into()],
+            due: Some(Due {
+                string: Some("next week".into()),
+                ..Due::default()
+            }),
+            priority: 2,
+            child_order: 7,
+            checked: false,
+        }
+    }
+
+    fn parsed_task() -> RemoteTask {
+        RemoteTask {
+            id: "parser-task".into(),
+            project_id: "project-2".into(),
+            content: "Buy milk".into(),
+            description: String::new(),
+            labels: vec![],
+            due: None,
+            priority: 1,
+            child_order: 0,
+            checked: false,
+            is_completed: false,
+            completed_at: None,
+            is_deleted: false,
+        }
+    }
 
     #[test]
     fn due_update_preserves_natural_language_for_todoist() {
@@ -323,5 +509,57 @@ mod tests {
             quick_add_request("Buy milk", "Inbox", true),
             ("Buy milk".into(), false)
         );
+    }
+
+    #[test]
+    fn quick_edit_preserves_metadata_that_was_not_present_in_the_expression() {
+        let original = task();
+        let updated = merge_quick_edit(&original, &parsed_task(), "Buy milk", "", false);
+
+        assert_eq!(updated.content, "Buy milk");
+        assert!(updated.description.is_empty());
+        assert_eq!(updated.project_id, original.project_id);
+        assert_eq!(updated.labels, original.labels);
+        assert_eq!(updated.due, original.due);
+        assert_eq!(updated.priority, original.priority);
+    }
+
+    #[test]
+    fn quick_edit_applies_metadata_parsed_from_the_expression() {
+        let original = task();
+        let mut parsed = parsed_task();
+        parsed.labels = vec!["Errands".into(), "work".into()];
+        parsed.due = Some(Due {
+            string: Some("tomorrow at 9".into()),
+            ..Due::default()
+        });
+        parsed.priority = 4;
+
+        let updated = merge_quick_edit(
+            &original,
+            &parsed,
+            "Buy milk tomorrow #Shopping @Errands p1",
+            "Two bottles",
+            true,
+        );
+
+        assert_eq!(updated.project_id, "project-2");
+        assert_eq!(updated.labels, ["Work", "Errands"]);
+        assert_eq!(
+            updated.due.unwrap().string.as_deref(),
+            Some("tomorrow at 9")
+        );
+        assert_eq!(updated.priority, 4);
+        assert_eq!(updated.description, "Two bottles");
+    }
+
+    #[test]
+    fn project_detection_handles_case_and_escaped_spaces() {
+        assert!(expression_mentions_project(
+            "Plan trip #Summer\\ Holiday tomorrow",
+            "summer holiday"
+        ));
+        assert!(expression_mentions_project("Do it #✅TODO", "✅todo"));
+        assert!(!expression_mentions_project("Do it #Unknown", "Inbox"));
     }
 }

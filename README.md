@@ -13,6 +13,15 @@ cache, applies changes immediately, and synchronizes with Todoist in the
 background. The interface uses Vim-style navigation and embeds your normal
 Neovim configuration for task and due-date editing.
 
+<p align="center">
+  <img src="docs/images/todoist-tui_1.png" alt="todoist-tui screenshot 1" width="49%">
+  <img src="docs/images/todoist-tui_2.png" alt="todoist-tui screenshot 2" width="49%">
+</p>
+<p align="center">
+  <img src="docs/images/todoist-tui_3.png" alt="todoist-tui screenshot 3" width="49%">
+  <img src="docs/images/todoist-tui_4.png" alt="todoist-tui screenshot 4" width="49%">
+</p>
+
 ## Features
 
 - Fully usable offline; queued changes survive restarts.
@@ -116,9 +125,12 @@ configured project as the fallback. For example, pressing `w` can default the
 new task to `#week`. A `#Project` typed in the Quick Add expression always
 takes precedence over that fallback.
 
-Press `o` to edit a task. The first line is its title and remaining lines are
-its description. Press `t` to edit a due date using Todoist natural language,
-such as `tod`, `tomorrow at 9`, or `every Friday`.
+Press `o` or `e` to edit a task. The first line accepts Todoist Quick Add syntax, so
+dates, projects, labels, and priorities can be written naturally while editing.
+Metadata not mentioned in the expression is preserved. Remaining lines are the
+task description. Edits are stored offline and parsed by Todoist during the
+next synchronization. Press `t` to edit only the due date using Todoist natural
+language, such as `tod`, `tomorrow at 9`, or `every Friday`.
 
 All editors start in Insert mode with the cursor at the useful editing
 position. `Enter` saves in Insert or Normal mode; any other successful write
@@ -133,6 +145,11 @@ search projects and move the selected task. In either picker:
 - press `Esc` once, choose with `j`/`k`, and press `Enter`.
 - Press `Esc` again from selection mode to cancel.
 
+Press `f` to search every task in the local cache, including cached completed
+tasks. Search uses the same prefix and `Esc` selection behavior. `Enter` opens
+the selected task's details, and `o` or `e` edits it in Neovim. Both keys also
+work from the regular task-details dialog.
+
 ## Default keybindings
 
 Press `?` to see the active bindings and configuration path.
@@ -145,8 +162,9 @@ Press `?` to see the active bindings and configuration path.
 | `Shift+K` | Move up five projects or tasks |
 | `h` / `l` | Focus projects / tasks |
 | `Enter` | Enter the task pane or show task details |
+| `f` | Search all locally cached tasks |
 | `q` / `a` | Add a task with Quick Add |
-| `o` | Edit title and description |
+| `o` / `e` | Edit title and description |
 | `d` | Complete or reopen the selected task |
 | `u` | Undo the last task change |
 | `Ctrl+R` | Redo the last undone change |

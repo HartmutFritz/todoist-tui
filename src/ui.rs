@@ -12,7 +12,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{
         App, Focus, LabelPickerItem, Overlay, PickerMode, ProjectPickerItem, SyncStatus,
-        filtered_label_indices, filtered_project_indices,
+        TaskPickerItem, filtered_label_indices, filtered_project_indices, filtered_task_indices,
     },
     keymap::{Action, KeyBindings},
     model::{NavRow, Task},
@@ -32,6 +32,15 @@ const SYNC_RED: Color = Color::Rgb(222, 76, 86);
 const TASK_LOOKAHEAD: usize = 4;
 const LIST_TOP_PADDING: u16 = 1;
 const TASK_RIGHT_PADDING: u16 = 2;
+
+fn priority_display(priority: u8) -> (&'static str, Option<Color>) {
+    match priority {
+        4 => ("p1", Some(RED_BRIGHT)),
+        3 => ("p2", Some(SYNC_ORANGE)),
+        2 => ("p3", Some(GOLD)),
+        _ => ("p4", None),
+    }
+}
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(
@@ -229,13 +238,16 @@ fn task_lines<'a>(
         } else {
             row_style
         };
-        let priority = (task.priority >= 3).then(|| format!("  p{}", 5 - task.priority));
+        let (priority_label, priority_color) = priority_display(task.priority);
+        let priority = priority_color.map(|color| (format!("  {priority_label}"), color));
         let due = task
             .due
             .as_ref()
             .and_then(|due| due.list_display_on(today))
             .map(|due| format!("  {due}"));
-        let suffix_width = priority.as_deref().map_or(0, UnicodeWidthStr::width)
+        let suffix_width = priority
+            .as_ref()
+            .map_or(0, |(label, _)| UnicodeWidthStr::width(label.as_str()))
             + due.as_deref().map_or(0, UnicodeWidthStr::width);
         let title_width = content_width.saturating_sub(2 + suffix_width);
         let visible_content = complete_words_within(&task.content, title_width);
@@ -243,11 +255,11 @@ fn task_lines<'a>(
             Span::styled(if is_selected { "▸ " } else { "  " }, row_style),
             Span::styled(visible_content, content_style),
         ];
-        if let Some(priority) = priority {
+        if let Some((priority, color)) = priority {
             spans.push(Span::styled(
                 priority,
                 Style::default()
-                    .fg(if task.checked { MUTED } else { GOLD })
+                    .fg(if task.checked { MUTED } else { color })
                     .bg(if is_selected { SELECT } else { PANEL }),
             ));
         }
@@ -346,7 +358,9 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
     let config_path = app.config_path.to_string_lossy().into_owned();
     match app.overlay.as_mut() {
         Some(Overlay::Help) => draw_help(frame, keybindings, &config_path),
-        Some(Overlay::Details(task)) => draw_details(frame, task),
+        Some(Overlay::Details(task)) => {
+            draw_details(frame, task, keybindings.display(Action::EditTask))
+        }
         Some(Overlay::LabelPicker {
             query,
             cursor,
@@ -361,6 +375,12 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
             projects,
             ..
         }) => draw_project_picker(frame, query, *cursor, *mode, projects),
+        Some(Overlay::TaskPicker {
+            query,
+            cursor,
+            mode,
+            tasks,
+        }) => draw_task_picker(frame, query, *cursor, *mode, tasks),
         Some(Overlay::Editor(editor)) => {
             let area = centered(frame.area(), 82, 18, 94, 70);
             let title = " Neovim — Enter accepts; :cq cancels ";
@@ -416,6 +436,10 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str) {
         (
             keys.display(Action::Confirm).into(),
             "enter tasks or show task details",
+        ),
+        (
+            keys.display(Action::SearchTasks).into(),
+            "search all cached tasks",
         ),
         (
             format!(
@@ -551,7 +575,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str) {
     );
 }
 
-fn draw_details(frame: &mut Frame<'_>, task: &Task) {
+fn draw_details(frame: &mut Frame<'_>, task: &Task, edit_key: &str) {
     let area = centered(frame.area(), 72, 18, 94, 82);
     let due = task.due.as_ref().and_then(|d| d.display()).unwrap_or("—");
     let labels = if task.labels.is_empty() {
@@ -559,6 +583,7 @@ fn draw_details(frame: &mut Frame<'_>, task: &Task) {
     } else {
         task.labels.join(", ")
     };
+    let (priority_label, priority_color) = priority_display(task.priority);
     let text = Text::from(vec![
         Line::styled(
             "Title",
@@ -572,7 +597,10 @@ fn draw_details(frame: &mut Frame<'_>, task: &Task) {
         ]),
         Line::from(vec![
             Span::styled("Priority: ", Style::default().fg(MUTED)),
-            Span::raw(format!("p{}", 5 - task.priority)),
+            Span::styled(
+                priority_label,
+                Style::default().fg(priority_color.unwrap_or(TEXT)),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Labels: ", Style::default().fg(MUTED)),
@@ -591,11 +619,107 @@ fn draw_details(frame: &mut Frame<'_>, task: &Task) {
     ]);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(panel(" Task details ", true).padding(Padding::new(2, 2, 1, 1))),
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            panel(format!(" Task details — {edit_key} edits "), true)
+                .padding(Padding::new(2, 2, 1, 1)),
+        ),
         area,
     );
+}
+
+fn draw_task_picker(
+    frame: &mut Frame<'_>,
+    query: &str,
+    cursor: usize,
+    mode: PickerMode,
+    tasks: &[TaskPickerItem],
+) {
+    let area = centered(frame.area(), 72, 20, 94, 76);
+    let title = match mode {
+        PickerMode::Filtering => " Search tasks — type prefix; Esc selects ",
+        PickerMode::Selecting => " Search tasks — j/k select; Esc cancels ",
+    };
+    let block = panel(title, true);
+    let inner = block.inner(area);
+    let matches = filtered_task_indices(tasks, query);
+    let list_height = inner.height.saturating_sub(2) as usize;
+    let selected = cursor.min(matches.len().saturating_sub(1));
+    let scroll = selected.saturating_sub(list_height.saturating_sub(1));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "  > ",
+                Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(query.to_owned(), Style::default().fg(TEXT)),
+        ]),
+        Line::raw(""),
+    ];
+    if matches.is_empty() {
+        lines.push(Line::styled(
+            "  No matching tasks",
+            Style::default().fg(MUTED),
+        ));
+    } else {
+        let content_width = inner.width.saturating_sub(3) as usize;
+        lines.extend(
+            matches
+                .iter()
+                .skip(scroll)
+                .take(list_height)
+                .enumerate()
+                .filter_map(|(visible_index, task_index)| {
+                    tasks.get(*task_index).map(|item| {
+                        let is_selected = scroll + visible_index == selected;
+                        let row_style = if is_selected {
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(SELECT)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(TEXT)
+                        };
+                        let candidate_suffix = format!("  · {}", item.project_name);
+                        let suffix = if UnicodeWidthStr::width(candidate_suffix.as_str())
+                            <= content_width / 3
+                        {
+                            candidate_suffix
+                        } else {
+                            String::new()
+                        };
+                        let title_width =
+                            content_width.saturating_sub(UnicodeWidthStr::width(suffix.as_str()));
+                        let task_style = if item.task.checked {
+                            row_style.fg(MUTED).add_modifier(Modifier::CROSSED_OUT)
+                        } else {
+                            row_style
+                        };
+                        Line::from(vec![
+                            Span::styled(if is_selected { "▸ " } else { "  " }, row_style),
+                            Span::styled(
+                                complete_words_within(&item.task.content, title_width),
+                                task_style,
+                            ),
+                            Span::styled(suffix, row_style.fg(MUTED)),
+                        ])
+                        .style(if is_selected {
+                            Style::default().bg(SELECT)
+                        } else {
+                            Style::default()
+                        })
+                    })
+                }),
+        );
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    if mode == PickerMode::Filtering {
+        let query_width = UnicodeWidthStr::width(query) as u16;
+        frame.set_cursor_position(Position::new(
+            (inner.x + 4 + query_width).min(inner.right().saturating_sub(1)),
+            inner.y,
+        ));
+    }
 }
 
 fn draw_label_picker(
@@ -838,6 +962,24 @@ mod tests {
 
         assert_eq!(lines[0].spans[1].content.as_ref(), "Alpha");
         assert_eq!(lines[0].spans[2].content.as_ref(), "  p1");
+    }
+
+    #[test]
+    fn task_priorities_use_todoist_labels_and_distinct_colors() {
+        for (priority, label, color) in [
+            (4, "  p1", RED_BRIGHT),
+            (3, "  p2", SYNC_ORANGE),
+            (2, "  p3", GOLD),
+        ] {
+            let mut item = task("Important", &[]);
+            item.priority = priority;
+            let tasks = [item];
+
+            let (lines, _) = task_lines(&tasks, Some(0), true, false, false, 80);
+
+            assert_eq!(lines[0].spans[2].content.as_ref(), label);
+            assert_eq!(lines[0].spans[2].style.fg, Some(color));
+        }
     }
 
     #[test]

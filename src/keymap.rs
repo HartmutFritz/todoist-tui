@@ -17,6 +17,7 @@ pub enum Action {
     FocusNavigation,
     FocusTasks,
     Confirm,
+    SearchTasks,
     EditTask,
     CompleteTask,
     MoveTask,
@@ -51,7 +52,7 @@ pub enum Action {
 }
 
 impl Action {
-    const ALL: [Self; 37] = [
+    const ALL: [Self; 38] = [
         Self::Down,
         Self::Up,
         Self::DownFive,
@@ -59,6 +60,7 @@ impl Action {
         Self::FocusNavigation,
         Self::FocusTasks,
         Self::Confirm,
+        Self::SearchTasks,
         Self::EditTask,
         Self::CompleteTask,
         Self::MoveTask,
@@ -135,6 +137,7 @@ struct BindingConfig {
     focus_navigation: Vec<String>,
     focus_tasks: Vec<String>,
     confirm: Vec<String>,
+    search_tasks: Vec<String>,
     edit_task: Vec<String>,
     complete_task: Vec<String>,
     move_task: Vec<String>,
@@ -181,7 +184,8 @@ impl Default for BindingConfig {
             focus_navigation: strings(&["h"]),
             focus_tasks: strings(&["l"]),
             confirm: strings(&["enter"]),
-            edit_task: strings(&["o"]),
+            search_tasks: strings(&["f"]),
+            edit_task: strings(&["o", "e"]),
             complete_task: strings(&["d"]),
             move_task: strings(&["v"]),
             edit_due: strings(&["t"]),
@@ -330,6 +334,7 @@ impl KeyBindings {
             (Action::FocusNavigation, config.focus_navigation),
             (Action::FocusTasks, config.focus_tasks),
             (Action::Confirm, config.confirm),
+            (Action::SearchTasks, config.search_tasks),
             (Action::EditTask, config.edit_task),
             (Action::CompleteTask, config.complete_task),
             (Action::MoveTask, config.move_task),
@@ -508,6 +513,7 @@ impl Action {
             Self::FocusNavigation => "focus_navigation",
             Self::FocusTasks => "focus_tasks",
             Self::Confirm => "confirm",
+            Self::SearchTasks => "search_tasks",
             Self::EditTask => "edit_task",
             Self::CompleteTask => "complete_task",
             Self::MoveTask => "move_task",
@@ -716,6 +722,25 @@ mod tests {
             Action::MoveTask,
             KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)
         ));
+    }
+
+    #[test]
+    fn task_search_defaults_to_f() {
+        assert!(KeyBindings::defaults().matches(
+            Action::SearchTasks,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn task_edit_defaults_to_o_and_e() {
+        let bindings = KeyBindings::defaults();
+        for key in ['o', 'e'] {
+            assert!(bindings.matches(
+                Action::EditTask,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+            ));
+        }
     }
 
     #[test]

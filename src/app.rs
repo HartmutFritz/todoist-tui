@@ -64,6 +64,12 @@ pub enum Overlay {
         mode: PickerMode,
         projects: Vec<ProjectPickerItem>,
     },
+    TaskPicker {
+        query: String,
+        cursor: usize,
+        mode: PickerMode,
+        tasks: Vec<TaskPickerItem>,
+    },
     Editor(EmbeddedEditor),
 }
 
@@ -78,6 +84,13 @@ pub struct ProjectPickerItem {
 pub struct LabelPickerItem {
     pub name: String,
     pub selected: bool,
+    search_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskPickerItem {
+    pub task: Task,
+    pub project_name: String,
     search_name: String,
 }
 
@@ -167,6 +180,7 @@ pub struct App {
     view_date: NaiveDate,
     last_sync_started: Instant,
     scheduled_sync_running: bool,
+    sync_follow_up_requested: bool,
     transient_status: Option<(String, Instant)>,
     persistent_status: Option<String>,
 }
@@ -223,6 +237,7 @@ impl App {
             view_date: Local::now().date_naive(),
             last_sync_started: Instant::now(),
             scheduled_sync_running: false,
+            sync_follow_up_requested: false,
             transient_status: None,
             persistent_status,
         };
@@ -360,6 +375,7 @@ impl App {
         }
         match action {
             Action::EditLabels => self.open_labels()?,
+            Action::SearchTasks => self.open_task_search()?,
             Action::Help => self.overlay = Some(Overlay::Help),
             Action::Quit => self.quit = true,
             Action::Sync => self.start_sync(),
@@ -404,6 +420,10 @@ impl App {
 
     fn handle_overlay(&mut self, key: KeyEvent) -> Result<()> {
         match self.overlay.as_mut() {
+            Some(Overlay::Details(task)) if self.keybindings.matches(Action::EditTask, key) => {
+                let task_id = task.id.clone();
+                self.open_task_editor(&task_id)?;
+            }
             Some(Overlay::Help | Overlay::Details(_))
                 if self.keybindings.matches(Action::CloseDialog, key) =>
             {
@@ -506,6 +526,55 @@ impl App {
                         *cursor = cursor.saturating_sub(1);
                     } else if self.keybindings.matches(Action::Down, key) {
                         let count = filtered_project_indices(projects, query).len();
+                        if *cursor + 1 < count {
+                            *cursor += 1;
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Backspace if !query.is_empty() => {
+                            query.pop();
+                            *cursor = 0;
+                        }
+                        KeyCode::Char(character)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            query.push(character);
+                            *cursor = 0;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(Overlay::TaskPicker {
+                query,
+                cursor,
+                mode,
+                tasks,
+            }) => {
+                if self.keybindings.matches(Action::Cancel, key) {
+                    if mode.cancel() {
+                        self.overlay = None;
+                        self.status = "Task search cancelled".into();
+                    }
+                } else if self.keybindings.matches(Action::Confirm, key) {
+                    let matches = filtered_task_indices(tasks, query);
+                    if let Some(task) = matches
+                        .get((*cursor).min(matches.len().saturating_sub(1)))
+                        .and_then(|index| tasks.get(*index))
+                        .map(|item| item.task.clone())
+                    {
+                        self.overlay = Some(Overlay::Details(task));
+                    } else {
+                        self.status = "No task matches that prefix".into();
+                    }
+                } else if *mode == PickerMode::Selecting {
+                    if self.keybindings.matches(Action::Up, key) {
+                        *cursor = cursor.saturating_sub(1);
+                    } else if self.keybindings.matches(Action::Down, key) {
+                        let count = filtered_task_indices(tasks, query).len();
                         if *cursor + 1 < count {
                             *cursor += 1;
                         }
@@ -809,6 +878,30 @@ impl App {
         }
     }
 
+    fn open_task_search(&mut self) -> Result<()> {
+        let tasks = self
+            .store
+            .tasks_for_search()?
+            .into_iter()
+            .map(|(task, project_name)| TaskPickerItem {
+                search_name: task.content.to_lowercase(),
+                task,
+                project_name,
+            })
+            .collect::<Vec<_>>();
+        if tasks.is_empty() {
+            self.status = "No tasks are available to search".into();
+            return Ok(());
+        }
+        self.overlay = Some(Overlay::TaskPicker {
+            query: String::new(),
+            cursor: 0,
+            mode: PickerMode::Filtering,
+            tasks,
+        });
+        Ok(())
+    }
+
     fn open_labels(&mut self) -> Result<()> {
         if self.focus != Focus::Tasks {
             return Ok(());
@@ -885,20 +978,31 @@ impl App {
             return Ok(());
         }
         self.force_tasks()?;
-        if let Some(task) = self.selected_task() {
-            let initial = if task.description.is_empty() {
-                task.content.clone()
-            } else {
-                format!("{}\n{}", task.content, task.description)
-            };
-            self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
-                EditorPurpose::Edit,
-                Some(task.id.clone()),
-                &initial,
-                16,
-                76,
-            )?));
+        if let Some(task_id) = self.selected_task().map(|task| task.id.clone()) {
+            self.open_task_editor(&task_id)?;
         }
+        Ok(())
+    }
+
+    fn open_task_editor(&mut self, task_id: &str) -> Result<()> {
+        let Some(task) = self.store.task(task_id)? else {
+            self.overlay = None;
+            self.status = "Task is no longer available".into();
+            return Ok(());
+        };
+        let initial = if task.description.is_empty() {
+            task.content.clone()
+        } else {
+            format!("{}\n{}", task.content, task.description)
+        };
+        self.pending_add_target = None;
+        self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
+            EditorPurpose::Edit,
+            Some(task.id),
+            &initial,
+            16,
+            76,
+        )?));
         Ok(())
     }
 
@@ -1373,7 +1477,12 @@ impl App {
     fn mark_pending_and_sync(&mut self) {
         self.scheduled_sync_running = false;
         self.sync_status.mark_local_change();
-        if self.start_sync_run() {
+        if self.sync.is_running() {
+            self.sync_follow_up_requested = true;
+            self.sync_status = SyncStatus::Syncing;
+            self.sync_issue = None;
+            self.set_persistent_status("Syncing…");
+        } else if self.start_sync_run() {
             self.sync_status = SyncStatus::Syncing;
             self.sync_issue = None;
         }
@@ -1410,6 +1519,7 @@ impl App {
             SyncEvent::Finished { pending } => {
                 let was_scheduled = self.scheduled_sync_running;
                 self.scheduled_sync_running = false;
+                self.sync_follow_up_requested = false;
                 self.sync_issue = None;
                 if pending == 0 {
                     let recovered = self.sync_status != SyncStatus::Synced;
@@ -1433,6 +1543,12 @@ impl App {
             }
             SyncEvent::Failed { kind, message } => {
                 self.scheduled_sync_running = false;
+                if std::mem::take(&mut self.sync_follow_up_requested) && self.start_sync_run() {
+                    self.sync_status = SyncStatus::Syncing;
+                    self.sync_issue = None;
+                    self.set_persistent_status("Syncing corrected changes…");
+                    return Ok(());
+                }
                 let display = match kind {
                     SyncFailureKind::Offline => format!("Cannot reach Todoist: {message}"),
                     SyncFailureKind::Problem => format!("Sync error: {message}"),
@@ -1549,6 +1665,15 @@ pub fn filtered_label_indices(labels: &[LabelPickerItem], query: &str) -> Vec<us
         .iter()
         .enumerate()
         .filter_map(|(index, label)| label.search_name.starts_with(&query).then_some(index))
+        .collect()
+}
+
+pub fn filtered_task_indices(tasks: &[TaskPickerItem], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, task)| task.search_name.starts_with(&query).then_some(index))
         .collect()
 }
 
@@ -1679,6 +1804,40 @@ mod tests {
             Some(NavId::Project(id)) if id == "weekend-project"
         ));
         assert_eq!(app.status, "Jumped to Weekend");
+    }
+
+    #[test]
+    fn task_search_opens_details_and_details_can_open_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        store.add_task("Alpha task", &inbox).unwrap();
+        let expected_id = store.add_task("Beta task", &inbox).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "beta".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            app.overlay.as_ref(),
+            Some(Overlay::Details(task)) if task.id == expected_id
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.overlay, Some(Overlay::Editor(_))));
     }
 
     #[test]

@@ -189,6 +189,7 @@ impl Store {
              PRAGMA user_version=5;
              COMMIT;",
         )?;
+        compact_pending_due_updates(&conn)?;
         Ok(())
     }
 
@@ -458,6 +459,19 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn tasks_for_search(&self) -> Result<Vec<(Task, String)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,
+                    t.priority,t.child_order,t.checked,COALESCE(p.name,'Unknown project')
+             FROM tasks t LEFT JOIN projects p ON p.id=t.project_id AND p.deleted=0
+             WHERE t.deleted=0
+             ORDER BY t.checked,lower(t.content),t.child_order,t.id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row_to_task(row)?, row.get(9)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn project(&self, id: &str) -> Result<Option<Project>> {
         project_from(&self.connect()?, id)
     }
@@ -516,9 +530,12 @@ impl Store {
         queue(
             &tx,
             id,
-            Operation::UpdateTask {
-                content: content.into(),
+            Operation::QuickEdit {
+                expression: content.into(),
                 description: description.into(),
+                update_uuid: Uuid::new_v4().to_string(),
+                move_uuid: Uuid::new_v4().to_string(),
+                delete_uuid: Uuid::new_v4().to_string(),
             },
         )?;
         tx.commit()?;
@@ -540,6 +557,7 @@ impl Store {
             "UPDATE tasks SET due_json=?2 WHERE id=?1",
             params![id, due.map(|d| serde_json::to_string(&d)).transpose()?],
         )?;
+        remove_pending_due_updates(&tx, id)?;
         queue(
             &tx,
             id,
@@ -587,6 +605,55 @@ impl Store {
             },
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn apply_synced_task_edit(&self, task: &Task, completed_seq: i64) -> Result<()> {
+        let conn = self.connect()?;
+        let has_newer_text_edit = {
+            let mut stmt = conn
+                .prepare("SELECT payload FROM outbox WHERE entity_id=?1 AND seq>?2 ORDER BY seq")?;
+            let rows = stmt.query_map(params![task.id, completed_seq], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut found = false;
+            for payload in rows {
+                if matches!(
+                    serde_json::from_str::<Operation>(&payload?),
+                    Ok(Operation::QuickEdit { .. } | Operation::UpdateTask { .. })
+                ) {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if has_newer_text_edit {
+            conn.execute(
+                "UPDATE tasks SET project_id=?2,labels_json=?3,due_json=?4,priority=?5 WHERE id=?1",
+                params![
+                    task.id,
+                    task.project_id,
+                    serde_json::to_string(&task.labels)?,
+                    task.due.as_ref().map(serde_json::to_string).transpose()?,
+                    task.priority,
+                ],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE tasks SET project_id=?2,content=?3,description=?4,labels_json=?5,
+                 due_json=?6,priority=?7 WHERE id=?1",
+                params![
+                    task.id,
+                    task.project_id,
+                    task.content,
+                    task.description,
+                    serde_json::to_string(&task.labels)?,
+                    task.due.as_ref().map(serde_json::to_string).transpose()?,
+                    task.priority,
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -645,6 +712,7 @@ impl Store {
             )?;
         }
         if current.due != target.due {
+            remove_pending_due_updates(&tx, &id)?;
             queue(
                 &tx,
                 &id,
@@ -1243,6 +1311,65 @@ fn queue(tx: &Transaction<'_>, entity_id: &str, operation: Operation) -> Result<
     Ok(())
 }
 
+fn remove_pending_due_updates(conn: &Connection, entity_id: &str) -> Result<()> {
+    let sequences = {
+        let mut stmt = conn.prepare("SELECT seq,payload FROM outbox WHERE entity_id=?1")?;
+        let rows = stmt.query_map([entity_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut sequences = Vec::new();
+        for row in rows {
+            let (seq, payload) = row?;
+            if matches!(
+                serde_json::from_str::<Operation>(&payload),
+                Ok(Operation::UpdateDue { .. })
+            ) {
+                sequences.push(seq);
+            }
+        }
+        sequences
+    };
+    for seq in sequences {
+        conn.execute("DELETE FROM outbox WHERE seq=?1", [seq])?;
+    }
+    Ok(())
+}
+
+fn compact_pending_due_updates(conn: &Connection) -> Result<()> {
+    let stale_sequences = {
+        let mut stmt = conn.prepare("SELECT seq,entity_id,payload FROM outbox ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut latest_by_entity = HashMap::<String, i64>::new();
+        let mut stale = Vec::new();
+        for row in rows {
+            let (seq, entity_id, payload) = row?;
+            if matches!(
+                serde_json::from_str::<Operation>(&payload),
+                Ok(Operation::UpdateDue { .. })
+            ) && let Some(previous) = latest_by_entity.insert(entity_id, seq)
+            {
+                stale.push(previous);
+            }
+        }
+        stale
+    };
+    if stale_sequences.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for seq in stale_sequences {
+        tx.execute("DELETE FROM outbox WHERE seq=?1", [seq])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,6 +1449,23 @@ mod tests {
     }
 
     #[test]
+    fn global_task_search_source_includes_active_and_completed_tasks() {
+        let store = store();
+        let inbox = store.projects().unwrap().remove(0);
+        let active_id = store.add_task("Active task", &inbox).unwrap();
+        let completed_id = store.add_task("Completed task", &inbox).unwrap();
+        store.set_task_completed(&completed_id, true).unwrap();
+
+        let tasks = store.tasks_for_search().unwrap();
+        assert!(tasks.iter().any(|(task, project)| {
+            task.id == active_id && !task.checked && project == "Inbox"
+        }));
+        assert!(tasks.iter().any(|(task, project)| {
+            task.id == completed_id && task.checked && project == "Inbox"
+        }));
+    }
+
+    #[test]
     fn today_and_upcoming_are_offline_due_date_views() {
         let store = store();
         let inbox = store.projects().unwrap().remove(0);
@@ -1398,6 +1542,137 @@ mod tests {
             store.next_outbox().unwrap().unwrap().operation,
             Operation::QuickAdd { .. }
         ));
+    }
+
+    #[test]
+    fn corrected_due_date_replaces_the_pending_due_operation() {
+        let store = store();
+        let inbox = store.projects().unwrap().remove(0);
+        let id = store.add_task("Dated task", &inbox).unwrap();
+
+        store.update_due(&id, "not a real date").unwrap();
+        store.update_due(&id, "tomorrow at 9").unwrap();
+
+        let due_updates = store
+            .outbox()
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry.operation {
+                Operation::UpdateDue { due_string } => Some(due_string),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(due_updates, ["tomorrow at 9"]);
+    }
+
+    #[test]
+    fn task_edits_queue_the_complete_quick_add_expression() {
+        let store = store();
+        let inbox = store.projects().unwrap().remove(0);
+        let id = store.add_task("Original", &inbox).unwrap();
+
+        store
+            .edit_task(&id, "Buy milk tomorrow @errands p1", "Two bottles")
+            .unwrap();
+
+        let edit = store
+            .outbox()
+            .unwrap()
+            .into_iter()
+            .find_map(|entry| match entry.operation {
+                Operation::QuickEdit {
+                    expression,
+                    description,
+                    update_uuid,
+                    move_uuid,
+                    delete_uuid,
+                } => Some((expression, description, update_uuid, move_uuid, delete_uuid)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(edit.0, "Buy milk tomorrow @errands p1");
+        assert_eq!(edit.1, "Two bottles");
+        assert!(!edit.2.is_empty());
+        assert!(!edit.3.is_empty());
+        assert!(!edit.4.is_empty());
+    }
+
+    #[test]
+    fn an_older_synced_edit_does_not_overwrite_newer_local_text() {
+        let store = store();
+        let inbox = store.projects().unwrap().remove(0);
+        let id = store.add_task("Original", &inbox).unwrap();
+        store
+            .edit_task(&id, "First edit tomorrow", "First")
+            .unwrap();
+        store
+            .edit_task(&id, "Second edit next week", "Second")
+            .unwrap();
+        let first_edit_seq = store
+            .outbox()
+            .unwrap()
+            .into_iter()
+            .find(|entry| matches!(entry.operation, Operation::QuickEdit { .. }))
+            .unwrap()
+            .seq;
+
+        let mut parsed_first = store.task(&id).unwrap().unwrap();
+        parsed_first.content = "First edit".into();
+        parsed_first.description = "First".into();
+        parsed_first.due = Some(Due {
+            string: Some("tomorrow".into()),
+            ..Due::default()
+        });
+        store
+            .apply_synced_task_edit(&parsed_first, first_edit_seq)
+            .unwrap();
+
+        let current = store.task(&id).unwrap().unwrap();
+        assert_eq!(current.content, "Second edit next week");
+        assert_eq!(current.description, "Second");
+        assert_eq!(current.due.unwrap().string.as_deref(), Some("tomorrow"));
+    }
+
+    #[test]
+    fn reopening_store_discards_obsolete_pending_due_operations() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let store = Store::open(&path).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        let id = store.add_task("Dated task", &inbox).unwrap();
+        let conn = store.connect().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        queue(
+            &tx,
+            &id,
+            Operation::UpdateDue {
+                due_string: "invalid date".into(),
+            },
+        )
+        .unwrap();
+        queue(
+            &tx,
+            &id,
+            Operation::UpdateDue {
+                due_string: "tomorrow".into(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+        drop(store);
+
+        let reopened = Store::open(path).unwrap();
+        let due_updates = reopened
+            .outbox()
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry.operation {
+                Operation::UpdateDue { due_string } => Some(due_string),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(due_updates, ["tomorrow"]);
     }
 
     #[test]

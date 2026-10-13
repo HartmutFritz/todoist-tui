@@ -143,6 +143,13 @@ pub enum Operation {
         content: String,
         description: String,
     },
+    QuickEdit {
+        expression: String,
+        description: String,
+        update_uuid: String,
+        move_uuid: String,
+        delete_uuid: String,
+    },
     UpdateDue {
         due_string: String,
     },
