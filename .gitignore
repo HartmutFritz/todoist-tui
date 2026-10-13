@@ -1,0 +1,61 @@
+# Rust build output
+/target/
+
+# Credentials and environment files
+/API_TOKEN
+/TODOIST_API_TOKEN
+/.env
+/.env.*
+!/.env.example
+
+# Personal application configuration and state
+/config.toml
+/.todoist-tui/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
+
+# AI and coding-agent instructions or workspace data
+/AGENTS.md
+/.agents/
+/.codex/
+/CLAUDE.md
+/.claude/
+/.cursor/
+/.aider*
+
+# Runtime logs and diagnostics
+*.log
+*.profraw
+*.profdata
+/flamegraph.svg
+/perf.data
+/perf.data.old
+
+# Local development environments
+/.direnv/
+/.devenv/
+/.envrc
+/result
+/result-*
+
+# Editor and IDE state
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

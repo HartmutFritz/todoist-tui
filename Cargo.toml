@@ -1,0 +1,39 @@
+[package]
+name = "todoist-tui"
+version = "0.1.0"
+edition = "2024"
+description = "A fast, offline-first Todoist terminal client"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/HartmutFritz/todoist-tui"
+homepage = "https://github.com/HartmutFritz/todoist-tui"
+rust-version = "1.88"
+keywords = ["todoist", "tui", "terminal", "productivity"]
+categories = ["command-line-utilities"]
+exclude = ["API_TOKEN", "AGENTS.md", ".github/"]
+
+[[bin]]
+name = "todoist-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossterm = "0.29"
+dirs = "6.0"
+portable-pty = "0.9"
+ratatui = "0.30"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "query", "rustls"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.23"
+toml = "0.9"
+unicode-width = "0.2"
+uuid = { version = "1.18", default-features = false, features = ["v4"] }
+vt100 = "0.16"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

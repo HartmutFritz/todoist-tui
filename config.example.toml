@@ -1,0 +1,61 @@
+# Copy this file to ~/.config/todoist-tui/config.toml on Linux.
+# Set TODOIST_TUI_CONFIG_PATH to use a different location.
+#
+# Each action accepts alternatives; use [] to leave it unbound. Key names are case-insensitive.
+# Modifiers use ctrl+, alt+, shift+, or super+. Named keys include enter, esc,
+# space, arrows, home, end, pageup, pagedown, tab, backtab, insert, delete,
+# backspace, and f1 through f255.
+
+# Optional direct Quick Add shortcuts. No special-add keys are enabled by
+# default. The project name may be written with or without its leading #.
+# An explicit #Project in the Quick Add text takes precedence.
+# [special_add]
+# w = "#week"
+# n = "#notes"
+
+# Optional project-specific jump prefixes. The key is typed after the regular
+# jump key, so this example makes gww jump directly to the project "week".
+# Prefixes must contain at least two characters and project lookup ignores case.
+# Mapped projects are excluded from normal name-prefix jumping.
+# [project_jumps]
+# ww = "#week"
+
+[keybindings]
+down = ["j", "down"]
+up = ["k", "up"]
+down_five = ["shift+j"]
+up_five = ["shift+k"]
+focus_navigation = ["h"]
+focus_tasks = ["l"]
+confirm = ["enter"]
+edit_task = ["o"]
+complete_task = ["d"]
+move_task = ["v"]
+edit_due = ["t"]
+add_task = ["q", "a"]
+quit = ["shift+q"]
+first = ["g g"]
+last = ["shift+g"]
+jump = ["g"]
+cancel = ["esc"]
+sync = ["r"]
+undo = ["u"]
+redo = ["ctrl+r"]
+toggle_label_grouping = ["shift+m"]
+toggle_alphabetical_sort = ["shift+n"]
+toggle_completed_tasks = ["shift+c"]
+toggle_hidden_projects = ["shift+i"]
+toggle_project_hidden = ["ctrl+i"]
+space_0 = ["ctrl+0"]
+space_1 = ["ctrl+1"]
+space_2 = ["ctrl+2"]
+space_3 = ["ctrl+3"]
+space_4 = ["ctrl+4"]
+space_5 = ["ctrl+5"]
+space_6 = ["ctrl+6"]
+space_7 = ["ctrl+7"]
+space_8 = ["ctrl+8"]
+space_9 = ["ctrl+9"]
+edit_labels = ["@"]
+help = ["?"]
+close_dialog = ["enter", "esc", "q"]
