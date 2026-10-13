@@ -1,12 +1,8 @@
 # todoist-tui
 
-Do you love Todoist, the terminal, and Neovim, but find it frustrating that
-Todoist does not let you customize its keyboard shortcuts? Then `todoist-tui`
-may be exactly what you are looking for. It is a keyboard-only TUI written in
-Rust, with a rich set of useful shortcuts that let you move quickly between
-projects and tasks. Every shortcut is fully customizable through a
-configuration file, and tasks are added and edited in real, embedded Neovim
-instances.
+Do you love Todoist, the terminal, and Neovim, but wish Todoist had customizable keyboard shortcuts? Then `todoist-tui` might be exactly what you're looking for.
+
+`todoist-tui` is a keyboard-driven terminal interface for Todoist, written in Rust. It features Vim-like keybindings and a rich set of shortcuts that let you navigate projects and manage tasks quickly and efficiently. Every shortcut is fully customizable through a configuration file. And the best part? Tasks can be added and edited directly in embedded Neovim instances.
 
 `todoist-tui` is a fast, offline-first Todoist client. It keeps a local SQLite
 cache, applies changes immediately, and synchronizes with Todoist in the
