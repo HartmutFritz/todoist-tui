@@ -17,8 +17,13 @@ use tempfile::TempDir;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorPurpose {
     Add,
+    AddChild,
     Edit,
     Due,
+    AddFilter,
+    EditFilter,
+    AddProject,
+    RenameProject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +33,8 @@ pub enum EditorCursorShape {
 }
 
 const DOUBLE_ESCAPE_INTERVAL: Duration = Duration::from_millis(400);
+const FALLBACK_VISUAL_DOWN: &str = "lua if vim.fn.maparg('j', 'n') == '' then vim.keymap.set('n', 'j', 'gj', { buffer = true, silent = true, noremap = true }) end";
+const FALLBACK_VISUAL_UP: &str = "lua if vim.fn.maparg('k', 'n') == '' then vim.keymap.set('n', 'k', 'gk', { buffer = true, silent = true, noremap = true }) end";
 
 pub struct EmbeddedEditor {
     purpose: EditorPurpose,
@@ -53,16 +60,38 @@ pub struct EditorResult {
 }
 
 impl EmbeddedEditor {
+    #[cfg(test)]
+    pub fn purpose(&self) -> EditorPurpose {
+        self.purpose
+    }
+
+    pub fn edits_filter(&self) -> bool {
+        matches!(
+            self.purpose,
+            EditorPurpose::AddFilter | EditorPurpose::EditFilter
+        )
+    }
+
     pub fn open(
         purpose: EditorPurpose,
         task_id: Option<String>,
         initial: &str,
         rows: u16,
         cols: u16,
+        visual_line_navigation: bool,
     ) -> Result<Self> {
-        Self::open_inner(purpose, task_id, initial, rows, cols, true)
+        Self::open_inner_with_options(
+            purpose,
+            task_id,
+            initial,
+            rows,
+            cols,
+            true,
+            visual_line_navigation,
+        )
     }
 
+    #[cfg(test)]
     fn open_inner(
         purpose: EditorPurpose,
         task_id: Option<String>,
@@ -70,6 +99,26 @@ impl EmbeddedEditor {
         rows: u16,
         cols: u16,
         load_user_config: bool,
+    ) -> Result<Self> {
+        Self::open_inner_with_options(
+            purpose,
+            task_id,
+            initial,
+            rows,
+            cols,
+            load_user_config,
+            true,
+        )
+    }
+
+    fn open_inner_with_options(
+        purpose: EditorPurpose,
+        task_id: Option<String>,
+        initial: &str,
+        rows: u16,
+        cols: u16,
+        load_user_config: bool,
+        visual_line_navigation: bool,
     ) -> Result<Self> {
         let dir = tempfile::Builder::new()
             .prefix("todoist-tui-editor-")
@@ -96,20 +145,26 @@ impl EmbeddedEditor {
         }
         command.args([
             "-c",
-            "set noswapfile nowrap laststatus=0 noshowmode noruler",
+            "set noswapfile wrap linebreak laststatus=0 noshowmode noruler",
             "-c",
             "set shortmess+=I",
             "-c",
             "set guicursor=n-v-c-sm:block-blinkon0,i-ci-ve:ver25-blinkon0,r-cr-o:hor20-blinkon0",
         ]);
+        if visual_line_navigation {
+            command.args(["-c", FALLBACK_VISUAL_DOWN, "-c", FALLBACK_VISUAL_UP]);
+        }
         match purpose {
-            EditorPurpose::Add => {
+            EditorPurpose::Add
+            | EditorPurpose::AddChild
+            | EditorPurpose::AddFilter
+            | EditorPurpose::AddProject => {
                 command.args(["-c", "startinsert"]);
             }
             EditorPurpose::Due => {
                 command.args(["-c", "normal! G$", "-c", "startinsert!"]);
             }
-            EditorPurpose::Edit => {
+            EditorPurpose::Edit | EditorPurpose::EditFilter | EditorPurpose::RenameProject => {
                 command.args(["-c", "normal! gg$", "-c", "startinsert!"]);
             }
         }
@@ -432,6 +487,29 @@ mod tests {
         );
         update_cursor_shape(b"\x1b[2 qtext\x1b[6 q", &shape);
         assert_eq!(shape.load(Ordering::Acquire), EditorCursorShape::Bar as u8);
+    }
+
+    #[test]
+    fn visual_line_fallback_preserves_an_init_lua_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = dir.path().join("init.lua");
+        let result = dir.path().join("mappings.txt");
+        fs::write(&init, "vim.keymap.set('n', 'j', 'zz')\n").unwrap();
+        let record = format!(
+            "lua vim.fn.writefile({{vim.fn.maparg('j', 'n'), vim.fn.maparg('k', 'n')}}, [[{}]])",
+            result.display()
+        );
+        let status = std::process::Command::new("nvim")
+            .arg("--headless")
+            .arg("-u")
+            .arg(&init)
+            .args(["-i", "NONE", "-c", FALLBACK_VISUAL_DOWN])
+            .args(["-c", FALLBACK_VISUAL_UP, "-c", &record, "-c", "qall!"])
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(result).unwrap(), "zz\ngk\n");
     }
 
     #[test]

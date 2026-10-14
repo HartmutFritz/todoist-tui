@@ -25,15 +25,20 @@ Neovim configuration for task and due-date editing.
   sync after local changes and clear status reporting.
 - Inbox, Today, Upcoming, projects, favorite filters, labels, due dates,
   priorities, and Quick Add.
+- Nested projects and subtasks remain directly below their parent and are
+  visually indented.
 - Ten project spaces plus a persistent, collapsible hidden-project group.
 - Optional label grouping and alphabetical task ordering.
 - Configurable keybindings and an in-app `?` help screen.
 - Optional Quick Add shortcuts with per-key fallback projects.
+- Offline-first creation and editing of personal Todoist filters.
 
 ## Requirements
 
 - Rust 1.88 or newer
 - Neovim (`nvim`) on `PATH`
+- A clipboard helper: `wl-copy` from `wl-clipboard` on Wayland, or `xclip` or
+  `xsel` on X11
 - A Todoist API token for synchronization; the application also works without
   one in local-only mode
 
@@ -60,10 +65,11 @@ normally and keeps changes locally.
 ## Interface
 
 The left pane contains Inbox, the built-in Today and Upcoming views, favorite
-filters, and projects. Today includes overdue tasks and tasks due today;
-Upcoming includes tasks due today or later. Both views are calculated from the
-local cache and remain available offline. The right pane contains tasks for the
-selected view, and its selection is remembered independently for every view.
+filters, and projects. Today includes overdue tasks and tasks due today.
+Upcoming shows the next seven days, grouped chronologically under date
+headings. Both views are calculated from the local cache and remain available
+offline. The right pane contains tasks for the selected view, and its selection
+is remembered independently for every view.
 
 Projects are organized into spaces `0` through `9`:
 
@@ -75,10 +81,18 @@ Projects are organized into spaces `0` through `9`:
 - `Ctrl+I` adds or removes the selected Inbox, Today, Upcoming, favorite filter,
   or project from the hidden group. `Shift+I` shows or hides that group.
 
+Nested projects are shown directly below their parent and indented by two
+spaces per level.
+
 Tasks are grouped by label by default. `Shift+M` toggles grouping and `Shift+N` toggles
 alphabetical ordering. The modes are independent, so enabling both sorts tasks
 alphabetically inside alphabetical label groups. Disabling both restores
 Todoist order. Both choices are remembered across application restarts.
+Subtasks stay directly below their parent and are indented by two spaces per
+level. A task tree belongs to its top-level parent's label group; subtask labels
+do not split the tree. Alphabetical mode sorts siblings while keeping the tree
+together.
+
 `Shift+C` shows or hides completed tasks; this choice is remembered too. Completed
 tasks are grey and struck through. Press `d` on one to reopen it. Sync imports
 completed tasks from the previous 89 days in addition to retaining the local
@@ -102,7 +116,8 @@ synchronization messages and errors remain visible until the state changes.
 
 With an API token configured, synchronization starts at launch and repeats in
 the background every 60 seconds. These scheduled refreshes are silent unless
-they fail. Press `r` to synchronize immediately.
+they fail. Press `r` to synchronize immediately unless an actual project is
+selected in the focused project pane, where it opens the rename editor.
 
 ## Editing tasks
 
@@ -116,17 +131,23 @@ Buy milk tomorrow at 9 #Shopping @errands p1
 From a filter, Inbox is the fallback project unless the expression names
 another project. The full expression is queued unchanged when offline.
 
+Press `c` on a task to create a subtask beneath it with the same Neovim Quick
+Add editor. Press `>` to indent the selected task beneath its preceding sibling,
+or `<` to promote it one level. These operations work at every nesting depth,
+are available offline, and can be undone and redone.
+
 Optional special-add bindings open the same Quick Add editor but use a
 configured project as the fallback. For example, pressing `w` can default the
 new task to `#week`. A `#Project` typed in the Quick Add expression always
 takes precedence over that fallback.
 
-Press `o` or `e` to edit a task. The first line accepts Todoist Quick Add syntax, so
+Press `e` to edit a task. The first line accepts Todoist Quick Add syntax, so
 dates, projects, labels, and priorities can be written naturally while editing.
 Metadata not mentioned in the expression is preserved. Remaining lines are the
 task description. Edits are stored offline and parsed by Todoist during the
-next synchronization. Press `t` to edit only the due date using Todoist natural
-language, such as `tod`, `tomorrow at 9`, or `every Friday`.
+next synchronization. Press `t` from the task list or an open task-details
+window to edit only the due date using Todoist natural language, such as `tod`,
+`tomorrow at 9`, or `every Friday`.
 
 All editors start in Insert mode with the cursor at the useful editing
 position. `Enter` saves in Insert or Normal mode; any other successful write
@@ -143,12 +164,48 @@ search projects and move the selected task. In either picker:
 
 Press `f` to search every task in the local cache, including cached completed
 tasks. Search uses the same prefix and `Esc` selection behavior. `Enter` opens
-the selected task's details, and `o` or `e` edits it in Neovim. Both keys also
-work from the regular task-details dialog.
+the selected task's details, and `e` edits it in Neovim. The same key also works
+from the regular task-details dialog.
+
+## Managing filters
+
+Press `Shift+F` to search every cached filter, including filters that are not
+favorites. Type a name prefix or press `Esc` once to select with `j`/`k`;
+`Enter` opens the filter details. Press `e` there to edit the filter in
+Neovim. Frozen filters are shown as read-only.
+
+Press `Ctrl+F` to add a personal filter. Filter creation and editing use exactly
+three lines:
+
+```text
+Filter title
+(today | overdue) & #Work
+favorite = true
+```
+
+The title and Todoist filter query must be non-empty, and the third line accepts
+only `true` or `false`. When adding a filter, use the arrow keys to move between
+the three pre-created lines; as in the other editors, `Enter` saves. Changes are
+applied locally first and queued for
+background synchronization. Non-favorite filters remain searchable but are not
+shown in the project column.
+
+## Managing projects
+
+With the project pane focused, press `r` on a project to rename it in Neovim.
+Inbox, Today, Upcoming, and filters cannot be renamed. Press `Shift+P` to add a
+new root-level personal project. Project creation and renaming are applied
+locally first, remain available offline, and synchronize in the background.
+
+Press `Ctrl+j` or `Ctrl+k` to move a project down or up among projects with the
+same parent and in the same todoist-tui group. The complete sibling order is
+kept locally, including currently hidden projects, and queued for Todoist so
+the resulting order also appears in other Todoist clients.
 
 ## Default keybindings
 
-Press `?` to see the active bindings and configuration path.
+Press `?` to see the active bindings and configuration path. Scroll the help
+window with `j`/`k` (or the configured down/up bindings).
 
 | Key | Action |
 | --- | --- |
@@ -158,14 +215,23 @@ Press `?` to see the active bindings and configuration path.
 | `Shift+K` | Move up five projects or tasks |
 | `h` / `l` | Focus projects / tasks |
 | `Enter` | Enter the task pane or show task details |
+| `p` | Search all projects, including hidden projects, and jump to one |
 | `f` | Search all locally cached tasks |
+| `Shift+F` | Search all cached filters |
+| `Ctrl+F` | Add a personal filter |
+| `r` in project pane | Rename the selected project |
+| `Shift+P` | Add a personal project |
+| `Ctrl+j` / `Ctrl+k` | Move the selected project down/up within its group and sync the order |
+| `y` | Copy the selected project/filter or task title to the clipboard |
 | `q` / `a` | Add a task with Quick Add |
-| `o` / `e` | Edit title and description |
+| `c` | Add a subtask to the selected task |
+| `e` | Edit title and description |
 | `d` | Complete or reopen the selected task |
 | `u` | Undo the last task change |
 | `Ctrl+R` | Redo the last undone change |
 | `t` | Edit the due date |
 | `v` | Move the task to another project |
+| `>` / `<` | Indent beneath the preceding sibling / promote one level |
 | `@` | Search and toggle a label |
 | `Shift+M` | Toggle label grouping |
 | `Shift+N` | Toggle alphabetical ordering |
@@ -175,13 +241,13 @@ Press `?` to see the active bindings and configuration path.
 | `Ctrl+0` … `Ctrl+9` | Assign/remove a project space override |
 | `Shift+I` | Show/hide the hidden group |
 | `Ctrl+I` | Add/remove the selected navigation item from the hidden group |
-| `r` | Start background synchronization |
+| `r` otherwise | Start background synchronization |
 | `?` | Open help |
 | `Shift+Q` | Quit |
 
 `Esc` cancels prefix entry and controls picker mode. Help and task details
-close with `Enter`, `Esc`, or `q`. Keys entered in Neovim belong to Neovim and
-never trigger application bindings.
+close with `Enter`, `Esc`, or `q`. The help window scrolls with `j`/`k`. Keys
+entered in Neovim belong to Neovim and never trigger application bindings.
 
 ## Configuration
 
@@ -203,6 +269,16 @@ down = ["j", "down", "ctrl+n"]
 up = ["k", "up", "ctrl+p"]
 add_task = ["a"]
 quit = ["ctrl+c"]
+```
+
+Wrapped-line navigation is enabled by default in embedded Neovim. When `j` or
+`k` has no existing Normal-mode mapping, todoist-tui adds a buffer-local
+fallback to `gj` or `gk`. Existing mappings from Vimscript or `init.lua` are
+preserved. Disable these fallbacks entirely with:
+
+```toml
+[editor]
+visual_line_navigation = false
 ```
 
 Special-add bindings are empty by default. Map a single key to a local Todoist

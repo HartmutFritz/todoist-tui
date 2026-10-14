@@ -17,10 +17,21 @@ pub enum Action {
     FocusNavigation,
     FocusTasks,
     Confirm,
+    SearchProjects,
     SearchTasks,
+    SearchFilters,
+    AddFilter,
+    RenameProject,
+    AddProject,
+    MoveProjectDown,
+    MoveProjectUp,
+    CopyTitle,
     EditTask,
     CompleteTask,
     MoveTask,
+    AddChildTask,
+    IndentTask,
+    OutdentTask,
     EditDue,
     AddTask,
     Quit,
@@ -52,7 +63,7 @@ pub enum Action {
 }
 
 impl Action {
-    const ALL: [Self; 38] = [
+    const ALL: [Self; 49] = [
         Self::Down,
         Self::Up,
         Self::DownFive,
@@ -60,10 +71,21 @@ impl Action {
         Self::FocusNavigation,
         Self::FocusTasks,
         Self::Confirm,
+        Self::SearchProjects,
         Self::SearchTasks,
+        Self::SearchFilters,
+        Self::AddFilter,
+        Self::RenameProject,
+        Self::AddProject,
+        Self::MoveProjectDown,
+        Self::MoveProjectUp,
+        Self::CopyTitle,
         Self::EditTask,
         Self::CompleteTask,
         Self::MoveTask,
+        Self::AddChildTask,
+        Self::IndentTask,
+        Self::OutdentTask,
         Self::EditDue,
         Self::AddTask,
         Self::Quit,
@@ -125,6 +147,21 @@ struct FileConfig {
     keybindings: BindingConfig,
     special_add: BTreeMap<String, String>,
     project_jumps: BTreeMap<String, String>,
+    editor: EditorConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct EditorConfig {
+    visual_line_navigation: bool,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            visual_line_navigation: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -137,10 +174,21 @@ struct BindingConfig {
     focus_navigation: Vec<String>,
     focus_tasks: Vec<String>,
     confirm: Vec<String>,
+    search_projects: Vec<String>,
     search_tasks: Vec<String>,
+    search_filters: Vec<String>,
+    add_filter: Vec<String>,
+    rename_project: Vec<String>,
+    add_project: Vec<String>,
+    move_project_down: Vec<String>,
+    move_project_up: Vec<String>,
+    copy_title: Vec<String>,
     edit_task: Vec<String>,
     complete_task: Vec<String>,
     move_task: Vec<String>,
+    add_child_task: Vec<String>,
+    indent_task: Vec<String>,
+    outdent_task: Vec<String>,
     edit_due: Vec<String>,
     add_task: Vec<String>,
     quit: Vec<String>,
@@ -184,10 +232,21 @@ impl Default for BindingConfig {
             focus_navigation: strings(&["h"]),
             focus_tasks: strings(&["l"]),
             confirm: strings(&["enter"]),
+            search_projects: strings(&["p"]),
             search_tasks: strings(&["f"]),
-            edit_task: strings(&["o", "e"]),
+            search_filters: strings(&["shift+f"]),
+            add_filter: strings(&["ctrl+f"]),
+            rename_project: strings(&["r"]),
+            add_project: strings(&["shift+p"]),
+            move_project_down: strings(&["ctrl+j"]),
+            move_project_up: strings(&["ctrl+k"]),
+            copy_title: strings(&["y"]),
+            edit_task: strings(&["e"]),
             complete_task: strings(&["d"]),
             move_task: strings(&["v"]),
+            add_child_task: strings(&["c"]),
+            indent_task: strings(&[">"]),
+            outdent_task: strings(&["<"]),
             edit_due: strings(&["t"]),
             add_task: strings(&["q", "a"]),
             quit: strings(&["shift+q"]),
@@ -223,19 +282,28 @@ impl Default for BindingConfig {
 }
 
 impl KeyBindings {
+    #[cfg(test)]
     pub fn load(path: &Path, required: bool) -> Result<Self> {
+        Self::load_with_editor_options(path, required).map(|(bindings, _)| bindings)
+    }
+
+    pub fn load_with_editor_options(path: &Path, required: bool) -> Result<(Self, bool)> {
         if !path.exists() {
             if required {
                 bail!("configuration file does not exist: {}", path.display());
             }
-            return Self::from_file_config(FileConfig::default());
+            let config = FileConfig::default();
+            let visual_line_navigation = config.editor.visual_line_navigation;
+            return Ok((Self::from_file_config(config)?, visual_line_navigation));
         }
         let source = fs::read_to_string(path)
             .with_context(|| format!("read configuration {}", path.display()))?;
         let config: FileConfig = toml::from_str(&source)
             .with_context(|| format!("parse configuration {}", path.display()))?;
-        Self::from_file_config(config)
-            .with_context(|| format!("validate configuration in {}", path.display()))
+        let visual_line_navigation = config.editor.visual_line_navigation;
+        let bindings = Self::from_file_config(config)
+            .with_context(|| format!("validate configuration in {}", path.display()))?;
+        Ok((bindings, visual_line_navigation))
     }
 
     #[cfg(test)]
@@ -334,10 +402,21 @@ impl KeyBindings {
             (Action::FocusNavigation, config.focus_navigation),
             (Action::FocusTasks, config.focus_tasks),
             (Action::Confirm, config.confirm),
+            (Action::SearchProjects, config.search_projects),
             (Action::SearchTasks, config.search_tasks),
+            (Action::SearchFilters, config.search_filters),
+            (Action::AddFilter, config.add_filter),
+            (Action::RenameProject, config.rename_project),
+            (Action::AddProject, config.add_project),
+            (Action::MoveProjectDown, config.move_project_down),
+            (Action::MoveProjectUp, config.move_project_up),
+            (Action::CopyTitle, config.copy_title),
             (Action::EditTask, config.edit_task),
             (Action::CompleteTask, config.complete_task),
             (Action::MoveTask, config.move_task),
+            (Action::AddChildTask, config.add_child_task),
+            (Action::IndentTask, config.indent_task),
+            (Action::OutdentTask, config.outdent_task),
             (Action::EditDue, config.edit_due),
             (Action::AddTask, config.add_task),
             (Action::Quit, config.quit),
@@ -404,7 +483,7 @@ impl KeyBindings {
         bindings.validate_first_sequence()?;
         bindings.validate_main_collisions()?;
         for action in Action::ALL {
-            if action == Action::Cancel {
+            if matches!(action, Action::Cancel | Action::RenameProject) {
                 continue;
             }
             for sequence in &bindings.parsed[&action] {
@@ -489,6 +568,13 @@ impl KeyBindings {
                     continue;
                 }
                 if let Some((other, _)) = seen.iter().find(|(_, stroke)| **stroke == sequence[0]) {
+                    if matches!(
+                        (*other, action),
+                        (Action::Sync, Action::RenameProject)
+                            | (Action::RenameProject, Action::Sync)
+                    ) {
+                        continue;
+                    }
                     bail!(
                         "'{}' and '{}' both use {}",
                         other.name(),
@@ -513,10 +599,21 @@ impl Action {
             Self::FocusNavigation => "focus_navigation",
             Self::FocusTasks => "focus_tasks",
             Self::Confirm => "confirm",
+            Self::SearchProjects => "search_projects",
             Self::SearchTasks => "search_tasks",
+            Self::SearchFilters => "search_filters",
+            Self::AddFilter => "add_filter",
+            Self::RenameProject => "rename_project",
+            Self::AddProject => "add_project",
+            Self::MoveProjectDown => "move_project_down",
+            Self::MoveProjectUp => "move_project_up",
+            Self::CopyTitle => "copy_title",
             Self::EditTask => "edit_task",
             Self::CompleteTask => "complete_task",
             Self::MoveTask => "move_task",
+            Self::AddChildTask => "add_child_task",
+            Self::IndentTask => "indent_task",
+            Self::OutdentTask => "outdent_task",
             Self::EditDue => "edit_due",
             Self::AddTask => "add_task",
             Self::Quit => "quit",
@@ -708,6 +805,20 @@ mod tests {
     }
 
     #[test]
+    fn visual_line_navigation_defaults_on_and_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_path = dir.path().join("default.toml");
+        fs::write(&default_path, "[keybindings]\ndown = ['x']\n").unwrap();
+        let (_, enabled) = KeyBindings::load_with_editor_options(&default_path, true).unwrap();
+        assert!(enabled);
+
+        let disabled_path = dir.path().join("disabled.toml");
+        fs::write(&disabled_path, "[editor]\nvisual_line_navigation = false\n").unwrap();
+        let (_, enabled) = KeyBindings::load_with_editor_options(&disabled_path, true).unwrap();
+        assert!(!enabled);
+    }
+
+    #[test]
     fn recognizes_configured_first_sequence_after_jump() {
         let bindings = KeyBindings::defaults();
         assert!(bindings.follows_jump(
@@ -733,14 +844,71 @@ mod tests {
     }
 
     #[test]
-    fn task_edit_defaults_to_o_and_e() {
+    fn project_search_defaults_to_p() {
+        assert!(KeyBindings::defaults().matches(
+            Action::SearchProjects,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn project_reordering_defaults_to_control_j_and_control_k() {
         let bindings = KeyBindings::defaults();
-        for key in ['o', 'e'] {
-            assert!(bindings.matches(
-                Action::EditTask,
-                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
-            ));
-        }
+        assert!(bindings.matches(
+            Action::MoveProjectDown,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)
+        ));
+        assert!(bindings.matches(
+            Action::MoveProjectUp,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)
+        ));
+    }
+
+    #[test]
+    fn filter_search_and_add_use_shift_f_and_control_f() {
+        let bindings = KeyBindings::defaults();
+        assert!(bindings.matches(
+            Action::SearchFilters,
+            KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT)
+        ));
+        assert!(bindings.matches(
+            Action::AddFilter,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        ));
+    }
+
+    #[test]
+    fn project_rename_shares_r_with_sync_and_add_uses_shift_p() {
+        let bindings = KeyBindings::defaults();
+        let r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(bindings.matches(Action::RenameProject, r));
+        assert!(bindings.matches(Action::Sync, r));
+        assert_eq!(bindings.main_action(r), Some(Action::Sync));
+        assert!(bindings.matches(
+            Action::AddProject,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)
+        ));
+    }
+
+    #[test]
+    fn copy_title_defaults_to_y() {
+        assert!(KeyBindings::defaults().matches(
+            Action::CopyTitle,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn task_edit_defaults_to_e_only() {
+        let bindings = KeyBindings::defaults();
+        assert!(bindings.matches(
+            Action::EditTask,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)
+        ));
+        assert!(!bindings.matches(
+            Action::EditTask,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)
+        ));
     }
 
     #[test]
@@ -799,6 +967,23 @@ mod tests {
         assert!(bindings.matches(
             Action::Sync,
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn task_hierarchy_actions_use_c_and_angle_brackets() {
+        let bindings = KeyBindings::defaults();
+        assert!(bindings.matches(
+            Action::AddChildTask,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
+        ));
+        assert!(bindings.matches(
+            Action::IndentTask,
+            KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT)
+        ));
+        assert!(bindings.matches(
+            Action::OutdentTask,
+            KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT)
         ));
     }
 

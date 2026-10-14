@@ -6,6 +6,11 @@
 # space, arrows, home, end, pageup, pagedown, tab, backtab, insert, delete,
 # backspace, and f1 through f255.
 
+[editor]
+# In Normal mode, make an otherwise-unmapped j/k move by visual wrapped lines.
+# Existing user mappings are always preserved.
+visual_line_navigation = true
+
 # Optional direct Quick Add shortcuts. No special-add keys are enabled by
 # default. The project name may be written with or without its leading #.
 # An explicit #Project in the Quick Add text takes precedence.
@@ -28,10 +33,21 @@ up_five = ["shift+k"]
 focus_navigation = ["h"]
 focus_tasks = ["l"]
 confirm = ["enter"]
+search_projects = ["p"]
 search_tasks = ["f"]
-edit_task = ["o", "e"]
+search_filters = ["shift+f"]
+add_filter = ["ctrl+f"]
+rename_project = ["r"]
+add_project = ["shift+p"]
+move_project_down = ["ctrl+j"]
+move_project_up = ["ctrl+k"]
+copy_title = ["y"]
+edit_task = ["e"]
 complete_task = ["d"]
 move_task = ["v"]
+add_child_task = ["c"]
+indent_task = [">"]
+outdent_task = ["<"]
 edit_due = ["t"]
 add_task = ["q", "a"]
 quit = ["shift+q"]

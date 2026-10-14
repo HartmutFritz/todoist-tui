@@ -86,6 +86,7 @@ impl TodoistClient {
                 expression,
                 project_id,
                 project_name,
+                parent_id,
             } => {
                 let is_inbox = store
                     .project(project_id)?
@@ -113,6 +114,18 @@ impl TodoistClient {
                         json!({"id": task.id, "project_id": project_id}),
                     )?;
                     task.project_id.clone_from(project_id);
+                }
+                if let Some(parent_id) = parent_id {
+                    let resolved_parent = store
+                        .resolve_task_id(parent_id)?
+                        .unwrap_or_else(|| parent_id.clone());
+                    self.command_with_uuid(
+                        &uuid::Uuid::new_v4().to_string(),
+                        "item_move",
+                        json!({"id": task.id, "parent_id": resolved_parent}),
+                    )?;
+                    task.project_id.clone_from(project_id);
+                    task.parent_id = Some(resolved_parent);
                 }
                 store.replace_task_id(&entry.entity_id, &task)?;
             }
@@ -160,6 +173,27 @@ impl TodoistClient {
                 "item_move",
                 json!({"id": entry.entity_id, "project_id": project_id}),
             )?,
+            Operation::MoveTaskParent { parent_id } => {
+                if let Some(parent_id) = parent_id {
+                    let resolved_parent = store
+                        .resolve_task_id(parent_id)?
+                        .unwrap_or_else(|| parent_id.clone());
+                    self.command(
+                        entry,
+                        "item_move",
+                        task_parent_move_args(&entry.entity_id, Some(&resolved_parent), ""),
+                    )?;
+                } else {
+                    let task = store
+                        .task(&entry.entity_id)?
+                        .context("outdented task no longer exists")?;
+                    self.command(
+                        entry,
+                        "item_move",
+                        task_parent_move_args(&entry.entity_id, None, &task.project_id),
+                    )?;
+                }
+            }
             Operation::CompleteTask => {
                 self.command(entry, "item_close", json!({"id": entry.entity_id}))?
             }
@@ -169,8 +203,114 @@ impl TodoistClient {
             Operation::DeleteTask => {
                 self.command(entry, "item_delete", json!({"id": entry.entity_id}))?
             }
+            Operation::AddFilter {
+                name,
+                query,
+                is_favorite,
+            } => self.add_filter(store, entry, name, query, *is_favorite)?,
+            Operation::UpdateFilter {
+                name,
+                query,
+                is_favorite,
+                is_workspace,
+            } => self.command(
+                entry,
+                if *is_workspace {
+                    "workspace_filter_update"
+                } else {
+                    "filter_update"
+                },
+                json!({
+                    "id": entry.entity_id,
+                    "name": name,
+                    "query": query,
+                    "is_favorite": is_favorite
+                }),
+            )?,
+            Operation::AddProject { name } => self.add_project(store, entry, name)?,
+            Operation::UpdateProject { name } => self.command(
+                entry,
+                "project_update",
+                json!({"id": entry.entity_id, "name": name}),
+            )?,
+            Operation::ReorderProjects { projects } => {
+                self.command(entry, "project_reorder", project_reorder_args(projects))?
+            }
         }
         store.finish_outbox(entry.seq)?;
+        Ok(())
+    }
+
+    fn add_filter(
+        &self,
+        store: &Store,
+        entry: &OutboxEntry,
+        name: &str,
+        query: &str,
+        is_favorite: bool,
+    ) -> Result<()> {
+        let command = json!([{
+            "type": "filter_add",
+            "temp_id": entry.uuid,
+            "uuid": entry.uuid,
+            "args": {"name": name, "query": query, "is_favorite": is_favorite}
+        }]);
+        let response = Self::check(
+            self.auth(self.http.post(format!("{}/sync", self.base)))
+                .form(&[("commands", command.to_string())])
+                .send()?,
+        )?;
+        let value: Value = response.json().context("decode filter-add response")?;
+        let status = value
+            .get("sync_status")
+            .and_then(|statuses| statuses.get(&entry.uuid))
+            .context("Todoist filter-add response omitted its status")?;
+        if status != "ok" {
+            bail!("Todoist rejected operation: {}", concise_json(status));
+        }
+        let mapped = value
+            .get("temp_id_mapping")
+            .and_then(|mapping| mapping.get(&entry.uuid))
+            .context("Todoist filter-add response omitted the new filter ID")?;
+        let new_id = match mapped {
+            Value::String(id) => id.clone(),
+            Value::Number(id) => id.to_string(),
+            _ => bail!("Todoist returned an invalid filter ID"),
+        };
+        store.replace_filter_id(&entry.entity_id, &new_id)?;
+        Ok(())
+    }
+
+    fn add_project(&self, store: &Store, entry: &OutboxEntry, name: &str) -> Result<()> {
+        let command = json!([{
+            "type": "project_add",
+            "temp_id": entry.uuid,
+            "uuid": entry.uuid,
+            "args": {"name": name}
+        }]);
+        let response = Self::check(
+            self.auth(self.http.post(format!("{}/sync", self.base)))
+                .form(&[("commands", command.to_string())])
+                .send()?,
+        )?;
+        let value: Value = response.json().context("decode project-add response")?;
+        let status = value
+            .get("sync_status")
+            .and_then(|statuses| statuses.get(&entry.uuid))
+            .context("Todoist project-add response omitted its status")?;
+        if status != "ok" {
+            bail!("Todoist rejected operation: {}", concise_json(status));
+        }
+        let mapped = value
+            .get("temp_id_mapping")
+            .and_then(|mapping| mapping.get(&entry.uuid))
+            .context("Todoist project-add response omitted the new project ID")?;
+        let new_id = match mapped {
+            Value::String(id) => id.clone(),
+            Value::Number(id) => id.to_string(),
+            _ => bail!("Todoist returned an invalid project ID"),
+        };
+        store.replace_project_id(&entry.entity_id, &new_id)?;
         Ok(())
     }
 
@@ -365,6 +505,18 @@ fn due_update_args(task_id: &str, due_string: &str) -> Value {
     json!({"id": task_id, "due": due_value(due.as_ref())})
 }
 
+fn task_parent_move_args(task_id: &str, parent_id: Option<&str>, project_id: &str) -> Value {
+    if let Some(parent_id) = parent_id {
+        json!({"id": task_id, "parent_id": parent_id})
+    } else {
+        json!({"id": task_id, "project_id": project_id})
+    }
+}
+
+fn project_reorder_args(projects: &[crate::model::ProjectOrder]) -> Value {
+    json!({"projects": projects})
+}
+
 fn due_value(due: Option<&Due>) -> Value {
     due.and_then(|due| due.string.as_deref().or_else(|| due.display()))
         .map_or(Value::Null, |value| json!({"string": value}))
@@ -453,6 +605,7 @@ mod tests {
         Task {
             id: "task-1".into(),
             project_id: "inbox".into(),
+            parent_id: None,
             content: "Original".into(),
             description: "Old description".into(),
             labels: vec!["Work".into()],
@@ -470,6 +623,7 @@ mod tests {
         RemoteTask {
             id: "parser-task".into(),
             project_id: "project-2".into(),
+            parent_id: None,
             content: "Buy milk".into(),
             description: String::new(),
             labels: vec![],
@@ -492,6 +646,39 @@ mod tests {
         assert_eq!(
             due_update_args("task-1", ""),
             json!({"id": "task-1", "due": null})
+        );
+    }
+
+    #[test]
+    fn hierarchy_moves_use_parent_ids_and_root_promotions_use_project_ids() {
+        assert_eq!(
+            task_parent_move_args("task", Some("parent"), "project"),
+            json!({"id": "task", "parent_id": "parent"})
+        );
+        assert_eq!(
+            task_parent_move_args("task", None, "project"),
+            json!({"id": "task", "project_id": "project"})
+        );
+    }
+
+    #[test]
+    fn project_reorder_uses_todoists_bulk_order_shape() {
+        let projects = vec![
+            crate::model::ProjectOrder {
+                id: "first".into(),
+                child_order: 0,
+            },
+            crate::model::ProjectOrder {
+                id: "second".into(),
+                child_order: 1,
+            },
+        ];
+        assert_eq!(
+            project_reorder_args(&projects),
+            json!({"projects": [
+                {"id": "first", "child_order": 0},
+                {"id": "second", "child_order": 1}
+            ]})
         );
     }
 

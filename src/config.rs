@@ -12,6 +12,7 @@ pub struct Config {
     pub token: Option<String>,
     pub database_path: PathBuf,
     pub keybindings: KeyBindings,
+    pub visual_line_navigation: bool,
     pub config_path: PathBuf,
 }
 
@@ -36,11 +37,13 @@ impl Config {
                 .join("todoist-tui")
                 .join("config.toml")
         });
-        let keybindings = KeyBindings::load(&config_path, explicit_config.is_some())?;
+        let (keybindings, visual_line_navigation) =
+            KeyBindings::load_with_editor_options(&config_path, explicit_config.is_some())?;
         Ok(Self {
             token,
             database_path,
             keybindings,
+            visual_line_navigation,
             config_path,
         })
     }

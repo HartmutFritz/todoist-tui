@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -8,9 +8,10 @@ use chrono::{Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
+    clipboard,
     editor::{EditorCursorShape, EditorPurpose, EditorResult, EmbeddedEditor},
     keymap::{Action, KeyBindings},
-    model::{NavId, NavRow, Project, Task},
+    model::{Filter, NavId, NavRow, Project, Task},
     store::{Store, TaskViewPreferences},
     sync::{SyncEvent, SyncFailureKind, SyncManager},
 };
@@ -47,8 +48,11 @@ impl SyncStatus {
 }
 
 pub enum Overlay {
-    Help,
+    Help {
+        scroll: usize,
+    },
     Details(Task),
+    FilterDetails(Filter),
     LabelPicker {
         task_id: String,
         query: String,
@@ -58,7 +62,7 @@ pub enum Overlay {
         task_labels: Vec<String>,
     },
     ProjectPicker {
-        task_id: String,
+        purpose: ProjectPickerPurpose,
         query: String,
         cursor: usize,
         mode: PickerMode,
@@ -70,7 +74,19 @@ pub enum Overlay {
         mode: PickerMode,
         tasks: Vec<TaskPickerItem>,
     },
+    FilterPicker {
+        query: String,
+        cursor: usize,
+        mode: PickerMode,
+        filters: Vec<FilterPickerItem>,
+    },
     Editor(EmbeddedEditor),
+}
+
+#[derive(Debug, Clone)]
+pub enum ProjectPickerPurpose {
+    Jump,
+    MoveTask { task_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +110,12 @@ pub struct TaskPickerItem {
     search_name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct FilterPickerItem {
+    pub filter: Filter,
+    search_name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerMode {
     Filtering,
@@ -110,6 +132,7 @@ enum HistoryEntry {
     TaskAdd {
         expression: String,
         project: Project,
+        parent_id: Option<String>,
         task_id: String,
     },
 }
@@ -118,6 +141,9 @@ impl HistoryEntry {
     fn action(&self) -> &'static str {
         match self {
             Self::TaskChange { action, .. } => action,
+            Self::TaskAdd {
+                parent_id: Some(_), ..
+            } => "subtask addition",
             Self::TaskAdd { .. } => "task addition",
         }
     }
@@ -183,6 +209,7 @@ pub struct App {
     sync_follow_up_requested: bool,
     transient_status: Option<(String, Instant)>,
     persistent_status: Option<String>,
+    visual_line_navigation: bool,
 }
 
 impl App {
@@ -240,6 +267,7 @@ impl App {
             sync_follow_up_requested: false,
             transient_status: None,
             persistent_status,
+            visual_line_navigation: true,
         };
         app.force_tasks()?;
         if has_token && app.start_sync_run() {
@@ -248,6 +276,10 @@ impl App {
             app.set_persistent_status("Syncing…");
         }
         Ok(app)
+    }
+
+    pub fn set_editor_visual_line_navigation(&mut self, enabled: bool) {
+        self.visual_line_navigation = enabled;
     }
 
     pub fn selected_nav(&self) -> Option<&NavId> {
@@ -361,6 +393,14 @@ impl App {
             return self.handle_prefix(key);
         }
 
+        if self.focus == Focus::Navigation
+            && self.keybindings.matches(Action::RenameProject, key)
+            && matches!(self.selected_nav(), Some(NavId::Project(_)))
+        {
+            self.open_rename_project()?;
+            return Ok(());
+        }
+
         if let Some(project) = self.keybindings.special_add_project(key).map(str::to_owned) {
             self.open_special_add(&project)?;
             return Ok(());
@@ -375,8 +415,15 @@ impl App {
         }
         match action {
             Action::EditLabels => self.open_labels()?,
+            Action::SearchProjects => self.open_project_search()?,
             Action::SearchTasks => self.open_task_search()?,
-            Action::Help => self.overlay = Some(Overlay::Help),
+            Action::SearchFilters => self.open_filter_search()?,
+            Action::AddFilter => self.open_add_filter()?,
+            Action::AddProject => self.open_add_project()?,
+            Action::MoveProjectDown => self.move_selected_project(true)?,
+            Action::MoveProjectUp => self.move_selected_project(false)?,
+            Action::CopyTitle => self.copy_selected_title()?,
+            Action::Help => self.overlay = Some(Overlay::Help { scroll: 0 }),
             Action::Quit => self.quit = true,
             Action::Sync => self.start_sync(),
             Action::Undo => self.undo()?,
@@ -398,11 +445,15 @@ impl App {
             Action::First => self.move_first()?,
             Action::Jump => self.prefix = Some(String::new()),
             Action::AddTask => self.open_add()?,
+            Action::AddChildTask => self.open_add_child()?,
             Action::EditTask => self.open_edit()?,
             Action::EditDue => self.open_due()?,
             Action::CompleteTask => self.complete()?,
             Action::MoveTask => self.open_project_picker()?,
+            Action::IndentTask => self.change_task_depth(true)?,
+            Action::OutdentTask => self.change_task_depth(false)?,
             Action::Cancel
+            | Action::RenameProject
             | Action::CloseDialog
             | Action::Space0
             | Action::Space1
@@ -420,16 +471,36 @@ impl App {
 
     fn handle_overlay(&mut self, key: KeyEvent) -> Result<()> {
         match self.overlay.as_mut() {
+            Some(Overlay::Help { .. }) if self.keybindings.matches(Action::CloseDialog, key) => {
+                self.overlay = None;
+            }
+            Some(Overlay::Help { scroll }) if self.keybindings.matches(Action::Down, key) => {
+                *scroll = scroll.saturating_add(1);
+            }
+            Some(Overlay::Help { scroll }) if self.keybindings.matches(Action::Up, key) => {
+                *scroll = scroll.saturating_sub(1);
+            }
+            Some(Overlay::Help { .. }) => {}
             Some(Overlay::Details(task)) if self.keybindings.matches(Action::EditTask, key) => {
                 let task_id = task.id.clone();
                 self.open_task_editor(&task_id)?;
             }
-            Some(Overlay::Help | Overlay::Details(_))
+            Some(Overlay::Details(task)) if self.keybindings.matches(Action::EditDue, key) => {
+                let task_id = task.id.clone();
+                self.open_due_editor(&task_id)?;
+            }
+            Some(Overlay::FilterDetails(filter))
+                if self.keybindings.matches(Action::EditTask, key) =>
+            {
+                let filter_id = filter.id.clone();
+                self.open_filter_editor(&filter_id)?;
+            }
+            Some(Overlay::Details(_) | Overlay::FilterDetails(_))
                 if self.keybindings.matches(Action::CloseDialog, key) =>
             {
                 self.overlay = None;
             }
-            Some(Overlay::Help | Overlay::Details(_)) => {}
+            Some(Overlay::Details(_) | Overlay::FilterDetails(_)) => {}
             Some(Overlay::LabelPicker {
                 task_id,
                 query,
@@ -497,7 +568,7 @@ impl App {
                 }
             }
             Some(Overlay::ProjectPicker {
-                task_id,
+                purpose,
                 query,
                 cursor,
                 mode,
@@ -505,8 +576,12 @@ impl App {
             }) => {
                 if self.keybindings.matches(Action::Cancel, key) {
                     if mode.cancel() {
+                        let message = match purpose {
+                            ProjectPickerPurpose::Jump => "Project search cancelled",
+                            ProjectPickerPurpose::MoveTask { .. } => "Task move cancelled",
+                        };
                         self.overlay = None;
-                        self.status = "Task move cancelled".into();
+                        self.status = message.into();
                     }
                 } else if self.keybindings.matches(Action::Confirm, key) {
                     let matches = filtered_project_indices(projects, query);
@@ -515,9 +590,14 @@ impl App {
                         .and_then(|index| projects.get(*index))
                         .cloned()
                     {
-                        let id = task_id.clone();
+                        let purpose = purpose.clone();
                         self.overlay = None;
-                        self.apply_task_move(&id, &project)?;
+                        match purpose {
+                            ProjectPickerPurpose::Jump => self.jump_to_project(&project)?,
+                            ProjectPickerPurpose::MoveTask { task_id } => {
+                                self.apply_task_move(&task_id, &project)?;
+                            }
+                        }
                     } else {
                         self.status = "No project matches that prefix".into();
                     }
@@ -575,6 +655,55 @@ impl App {
                         *cursor = cursor.saturating_sub(1);
                     } else if self.keybindings.matches(Action::Down, key) {
                         let count = filtered_task_indices(tasks, query).len();
+                        if *cursor + 1 < count {
+                            *cursor += 1;
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Backspace if !query.is_empty() => {
+                            query.pop();
+                            *cursor = 0;
+                        }
+                        KeyCode::Char(character)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            query.push(character);
+                            *cursor = 0;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(Overlay::FilterPicker {
+                query,
+                cursor,
+                mode,
+                filters,
+            }) => {
+                if self.keybindings.matches(Action::Cancel, key) {
+                    if mode.cancel() {
+                        self.overlay = None;
+                        self.status = "Filter search cancelled".into();
+                    }
+                } else if self.keybindings.matches(Action::Confirm, key) {
+                    let matches = filtered_filter_indices(filters, query);
+                    if let Some(filter) = matches
+                        .get((*cursor).min(matches.len().saturating_sub(1)))
+                        .and_then(|index| filters.get(*index))
+                        .map(|item| item.filter.clone())
+                    {
+                        self.overlay = Some(Overlay::FilterDetails(filter));
+                    } else {
+                        self.status = "No filter matches that prefix".into();
+                    }
+                } else if *mode == PickerMode::Selecting {
+                    if self.keybindings.matches(Action::Up, key) {
+                        *cursor = cursor.saturating_sub(1);
+                    } else if self.keybindings.matches(Action::Down, key) {
+                        let count = filtered_filter_indices(filters, query).len();
                         if *cursor + 1 < count {
                             *cursor += 1;
                         }
@@ -810,10 +939,12 @@ impl App {
 
     fn load_tasks(&mut self, nav: NavId) -> Result<()> {
         let mut tasks = self.store.tasks_for_view(&nav, self.show_completed_tasks)?;
+        let group_by_date = nav == NavId::Upcoming;
         order_tasks(
             &mut tasks,
-            self.group_tasks_by_label,
+            self.group_tasks_by_label && !group_by_date,
             self.sort_tasks_alphabetically,
+            group_by_date,
         );
         let remembered = self.remembered_tasks.get(&nav).cloned();
         let resolved = remembered
@@ -841,7 +972,17 @@ impl App {
     }
 
     fn refresh_nav(&mut self) -> Result<()> {
-        let selected = self.selected_nav().cloned();
+        let selected = match self.selected_nav().cloned() {
+            Some(NavId::Filter(id)) => self
+                .store
+                .filter(&id)?
+                .map(|filter| NavId::Filter(filter.id)),
+            Some(NavId::Project(id)) => self
+                .store
+                .project(&id)?
+                .map(|project| NavId::Project(project.id)),
+            selected => selected,
+        };
         self.nav_rows = self.store.nav_rows(self.show_hidden_projects)?;
         self.nav_search = build_nav_search(&self.nav_rows, &self.keybindings);
         self.nav_cursor = selected
@@ -878,6 +1019,36 @@ impl App {
         }
     }
 
+    fn copy_selected_title(&mut self) -> Result<()> {
+        self.copy_selected_title_with(clipboard::copy)
+    }
+
+    fn copy_selected_title_with(&mut self, copy: impl FnOnce(&str) -> Result<()>) -> Result<()> {
+        let (title, success_message) = match self.focus {
+            Focus::Navigation => {
+                let Some(NavRow::Item { name, .. }) = self.nav_rows.get(self.nav_cursor) else {
+                    self.status = "Select a project or filter before copying".into();
+                    return Ok(());
+                };
+                (name.clone(), "Project or filter title copied")
+            }
+            Focus::Tasks => {
+                self.force_tasks()?;
+                let Some(task) = self.selected_task() else {
+                    self.status = "Select a task before copying".into();
+                    return Ok(());
+                };
+                (task.content.clone(), "Task title copied")
+            }
+        };
+
+        self.status = match copy(&title) {
+            Ok(()) => success_message.into(),
+            Err(error) => error.to_string(),
+        };
+        Ok(())
+    }
+
     fn open_task_search(&mut self) -> Result<()> {
         let tasks = self
             .store
@@ -899,6 +1070,105 @@ impl App {
             mode: PickerMode::Filtering,
             tasks,
         });
+        Ok(())
+    }
+
+    fn open_project_search(&mut self) -> Result<()> {
+        let projects = self
+            .store
+            .projects()?
+            .into_iter()
+            .map(|project| ProjectPickerItem {
+                search_name: project.name.to_lowercase(),
+                id: project.id,
+                name: project.name,
+            })
+            .collect::<Vec<_>>();
+        if projects.is_empty() {
+            self.status = "No projects are available to search".into();
+            return Ok(());
+        }
+        self.overlay = Some(Overlay::ProjectPicker {
+            purpose: ProjectPickerPurpose::Jump,
+            query: String::new(),
+            cursor: 0,
+            mode: PickerMode::Filtering,
+            projects,
+        });
+        Ok(())
+    }
+
+    fn open_filter_search(&mut self) -> Result<()> {
+        let filters = self
+            .store
+            .filters()?
+            .into_iter()
+            .map(|filter| FilterPickerItem {
+                search_name: filter.name.to_lowercase(),
+                filter,
+            })
+            .collect::<Vec<_>>();
+        if filters.is_empty() {
+            self.status = "No filters are available to search".into();
+            return Ok(());
+        }
+        self.overlay = Some(Overlay::FilterPicker {
+            query: String::new(),
+            cursor: 0,
+            mode: PickerMode::Filtering,
+            filters,
+        });
+        Ok(())
+    }
+
+    fn open_add_filter(&mut self) -> Result<()> {
+        self.pending_add_target = None;
+        self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
+            EditorPurpose::AddFilter,
+            None,
+            "\n\nfavorite = true",
+            10,
+            76,
+            self.visual_line_navigation,
+        )?));
+        Ok(())
+    }
+
+    fn open_add_project(&mut self) -> Result<()> {
+        self.pending_add_target = None;
+        self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
+            EditorPurpose::AddProject,
+            None,
+            "",
+            8,
+            70,
+            self.visual_line_navigation,
+        )?));
+        Ok(())
+    }
+
+    fn open_rename_project(&mut self) -> Result<()> {
+        let Some(NavId::Project(project_id)) = self.selected_nav().cloned() else {
+            self.status = "Select a project before renaming it".into();
+            return Ok(());
+        };
+        let Some(project) = self.store.project(&project_id)? else {
+            self.status = "Project is no longer available".into();
+            return Ok(());
+        };
+        if project.is_inbox {
+            self.status = "Inbox cannot be renamed".into();
+            return Ok(());
+        }
+        self.pending_add_target = None;
+        self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
+            EditorPurpose::RenameProject,
+            Some(project.id),
+            &project.name,
+            8,
+            70,
+            self.visual_line_navigation,
+        )?));
         Ok(())
     }
 
@@ -957,6 +1227,7 @@ impl App {
             "",
             12,
             70,
+            self.visual_line_navigation,
         )?));
         Ok(())
     }
@@ -966,9 +1237,43 @@ impl App {
             self.status = format!("Special-add project '#{project_name}' is not available locally");
             return Ok(());
         };
-        let editor = EmbeddedEditor::open(EditorPurpose::Add, None, "", 12, 70)?;
+        let editor = EmbeddedEditor::open(
+            EditorPurpose::Add,
+            None,
+            "",
+            12,
+            70,
+            self.visual_line_navigation,
+        )?;
         self.pending_add_target = Some(project);
         self.overlay = Some(Overlay::Editor(editor));
+        Ok(())
+    }
+
+    fn open_add_child(&mut self) -> Result<()> {
+        if self.focus != Focus::Tasks {
+            self.status = "Select a task before adding a subtask".into();
+            return Ok(());
+        }
+        self.force_tasks()?;
+        let Some(parent) = self.selected_task() else {
+            self.status = "Select a task before adding a subtask".into();
+            return Ok(());
+        };
+        if parent.checked {
+            self.status = "Cannot add a subtask to a completed task".into();
+            return Ok(());
+        }
+        let parent_id = parent.id.clone();
+        self.pending_add_target = None;
+        self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
+            EditorPurpose::AddChild,
+            Some(parent_id),
+            "",
+            12,
+            70,
+            self.visual_line_navigation,
+        )?));
         Ok(())
     }
 
@@ -1002,6 +1307,33 @@ impl App {
             &initial,
             16,
             76,
+            self.visual_line_navigation,
+        )?));
+        Ok(())
+    }
+
+    fn open_filter_editor(&mut self, filter_id: &str) -> Result<()> {
+        let Some(filter) = self.store.filter(filter_id)? else {
+            self.overlay = None;
+            self.status = "Filter is no longer available".into();
+            return Ok(());
+        };
+        if filter.is_frozen {
+            self.overlay = Some(Overlay::FilterDetails(filter));
+            self.status = "This filter is read-only".into();
+            return Ok(());
+        }
+        let initial = format!(
+            "{}\n{}\nfavorite = {}",
+            filter.name, filter.query, filter.is_favorite
+        );
+        self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
+            EditorPurpose::EditFilter,
+            Some(filter.id),
+            &initial,
+            10,
+            76,
+            self.visual_line_navigation,
         )?));
         Ok(())
     }
@@ -1012,20 +1344,32 @@ impl App {
             return Ok(());
         }
         self.force_tasks()?;
-        if let Some(task) = self.selected_task() {
-            let initial = task
-                .due
-                .as_ref()
-                .and_then(|d| d.string.clone())
-                .unwrap_or_default();
-            self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
-                EditorPurpose::Due,
-                Some(task.id.clone()),
-                &initial,
-                8,
-                64,
-            )?));
+        if let Some(task_id) = self.selected_task().map(|task| task.id.clone()) {
+            self.open_due_editor(&task_id)?;
         }
+        Ok(())
+    }
+
+    fn open_due_editor(&mut self, task_id: &str) -> Result<()> {
+        let Some(task) = self.store.task(task_id)? else {
+            self.overlay = None;
+            self.status = "Task is no longer available".into();
+            return Ok(());
+        };
+        let initial = task
+            .due
+            .as_ref()
+            .and_then(|due| due.string.clone())
+            .unwrap_or_default();
+        self.pending_add_target = None;
+        self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
+            EditorPurpose::Due,
+            Some(task.id),
+            &initial,
+            8,
+            64,
+            self.visual_line_navigation,
+        )?));
         Ok(())
     }
 
@@ -1058,12 +1402,38 @@ impl App {
             return Ok(());
         }
         self.overlay = Some(Overlay::ProjectPicker {
-            task_id: task.id,
+            purpose: ProjectPickerPurpose::MoveTask { task_id: task.id },
             query: String::new(),
             cursor: 0,
             mode: PickerMode::Filtering,
             projects,
         });
+        Ok(())
+    }
+
+    fn jump_to_project(&mut self, project: &ProjectPickerItem) -> Result<()> {
+        let target = NavId::Project(project.id.clone());
+        self.refresh_nav()?;
+        let mut index = self
+            .nav_rows
+            .iter()
+            .position(|row| matches!(row, NavRow::Item { id, .. } if id == &target));
+        if index.is_none() && !self.show_hidden_projects {
+            self.show_hidden_projects = true;
+            self.refresh_nav()?;
+            index = self
+                .nav_rows
+                .iter()
+                .position(|row| matches!(row, NavRow::Item { id, .. } if id == &target));
+        }
+        let Some(index) = index else {
+            self.status = format!("Project ‘{}’ is no longer available", project.name);
+            return Ok(());
+        };
+        self.select_nav(index);
+        self.force_tasks()?;
+        self.focus = Focus::Tasks;
+        self.status = format!("Jumped to {}", project.name);
         Ok(())
     }
 
@@ -1095,6 +1465,68 @@ impl App {
         }
         self.focus = Focus::Tasks;
         self.status = format!("Task moved to {} · pending sync", project.name);
+        self.mark_pending_and_sync();
+        Ok(())
+    }
+
+    fn change_task_depth(&mut self, indent: bool) -> Result<()> {
+        if self.focus != Focus::Tasks {
+            self.status = "Select a task before changing its hierarchy".into();
+            return Ok(());
+        }
+        self.force_tasks()?;
+        let Some(index) = self.task_cursor else {
+            self.status = "Select a task before changing its hierarchy".into();
+            return Ok(());
+        };
+        let task = self.tasks[index].clone();
+        if task.checked {
+            self.status = "Cannot change the hierarchy of a completed task".into();
+            return Ok(());
+        }
+
+        let new_parent_id = if indent {
+            let candidate = self.tasks[..index].iter().rev().find(|candidate| {
+                !candidate.checked
+                    && candidate.project_id == task.project_id
+                    && candidate.parent_id == task.parent_id
+            });
+            let Some(candidate) = candidate else {
+                self.status = "Cannot indent: no preceding sibling can become the parent".into();
+                return Ok(());
+            };
+            Some(candidate.id.clone())
+        } else {
+            let Some(parent_id) = task.parent_id.as_deref() else {
+                self.status = "Cannot outdent: task is already at the top level".into();
+                return Ok(());
+            };
+            let Some(parent) = self.store.task(parent_id)? else {
+                self.status = "Cannot outdent: parent task is no longer available".into();
+                return Ok(());
+            };
+            parent.parent_id
+        };
+
+        let task_id = task.id.clone();
+        self.store
+            .set_task_parent(&task_id, new_parent_id.as_deref())?;
+        self.record_task_change(
+            task,
+            &task_id,
+            if indent {
+                "task indent"
+            } else {
+                "task outdent"
+            },
+        )?;
+        self.refresh_after_action(Some(&task_id))?;
+        self.focus = Focus::Tasks;
+        self.status = if indent {
+            "Task indented · pending sync".into()
+        } else {
+            "Task outdented · pending sync".into()
+        };
         self.mark_pending_and_sync();
         Ok(())
     }
@@ -1131,6 +1563,7 @@ impl App {
                 self.record_history(HistoryEntry::TaskAdd {
                     expression: expression.to_owned(),
                     project,
+                    parent_id: None,
                     task_id: id.clone(),
                 });
                 self.refresh_after_action(Some(&id))?;
@@ -1142,6 +1575,35 @@ impl App {
                 } else {
                     "Task added · pending sync".into()
                 };
+                self.mark_pending_and_sync();
+            }
+            EditorPurpose::AddChild => {
+                let expression = result.text.trim();
+                if expression.is_empty() {
+                    self.status = "Empty subtask was not added".into();
+                    return Ok(());
+                }
+                let parent_id = result.task_id.context("missing parent task")?;
+                let parent = self
+                    .store
+                    .task(&parent_id)?
+                    .context("parent task is no longer available")?;
+                let project = self
+                    .store
+                    .project(&parent.project_id)?
+                    .context("parent task project is no longer available")?;
+                let id = self
+                    .store
+                    .add_child_task(expression, &project, &parent.id)?;
+                self.record_history(HistoryEntry::TaskAdd {
+                    expression: expression.to_owned(),
+                    project,
+                    parent_id: Some(parent.id),
+                    task_id: id.clone(),
+                });
+                self.refresh_after_action(Some(&id))?;
+                self.focus = Focus::Tasks;
+                self.status = "Subtask added · pending sync".into();
                 self.mark_pending_and_sync();
             }
             EditorPurpose::Edit => {
@@ -1174,6 +1636,73 @@ impl App {
                 self.record_task_change(before, &id, "due-date change")?;
                 self.refresh_after_action(Some(&id))?;
                 self.status = "Due date updated · pending sync".into();
+                self.mark_pending_and_sync();
+            }
+            EditorPurpose::AddFilter => {
+                let (name, query, is_favorite) = match parse_filter_editor(&result.text) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        self.status = message;
+                        return Ok(());
+                    }
+                };
+                self.store.add_filter(&name, &query, is_favorite)?;
+                self.refresh_nav()?;
+                self.status = format!("Filter ‘{name}’ added · pending sync");
+                self.mark_pending_and_sync();
+            }
+            EditorPurpose::EditFilter => {
+                let id = result.task_id.context("missing edited filter")?;
+                let (name, query, is_favorite) = match parse_filter_editor(&result.text) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        self.status = message;
+                        return Ok(());
+                    }
+                };
+                self.store.update_filter(&id, &name, &query, is_favorite)?;
+                self.refresh_nav()?;
+                self.status = format!("Filter ‘{name}’ updated · pending sync");
+                self.mark_pending_and_sync();
+            }
+            EditorPurpose::AddProject => {
+                let name = match parse_project_editor(&result.text) {
+                    Ok(name) => name,
+                    Err(message) => {
+                        self.status = message;
+                        return Ok(());
+                    }
+                };
+                let id = self.store.add_project(&name)?;
+                self.refresh_nav()?;
+                if let Some(index) = self.nav_rows.iter().position(
+                    |row| matches!(row, NavRow::Item { id: NavId::Project(row_id), .. } if row_id == &id),
+                ) {
+                    self.select_nav(index);
+                    self.force_tasks()?;
+                }
+                self.focus = Focus::Navigation;
+                self.status = format!("Project ‘{name}’ added · pending sync");
+                self.mark_pending_and_sync();
+            }
+            EditorPurpose::RenameProject => {
+                let project_id = result.task_id.context("missing renamed project")?;
+                let name = match parse_project_editor(&result.text) {
+                    Ok(name) => name,
+                    Err(message) => {
+                        self.status = message;
+                        return Ok(());
+                    }
+                };
+                let id = self.store.rename_project(&project_id, &name)?;
+                self.refresh_nav()?;
+                if let Some(index) = self.nav_rows.iter().position(
+                    |row| matches!(row, NavRow::Item { id: NavId::Project(row_id), .. } if row_id == &id),
+                ) {
+                    self.select_nav(index);
+                }
+                self.focus = Focus::Navigation;
+                self.status = format!("Project renamed to ‘{name}’ · pending sync");
                 self.mark_pending_and_sync();
             }
         }
@@ -1322,6 +1851,7 @@ impl App {
             HistoryEntry::TaskAdd {
                 expression,
                 project,
+                parent_id,
                 task_id,
             } => {
                 let destination = if let Some(project) = self.store.project(&project.id)? {
@@ -1335,7 +1865,17 @@ impl App {
                     None
                 };
                 let destination = destination.context("task destination no longer exists")?;
-                *task_id = self.store.add_task(expression, &destination)?;
+                *task_id = if let Some(stored_parent_id) = parent_id.as_deref() {
+                    let parent = self
+                        .store
+                        .task(stored_parent_id)?
+                        .context("subtask parent no longer exists")?;
+                    *parent_id = Some(parent.id.clone());
+                    self.store
+                        .add_child_task(expression, &destination, &parent.id)?
+                } else {
+                    self.store.add_task(expression, &destination)?
+                };
                 *project = destination;
                 Ok(Some(task_id.clone()))
             }
@@ -1372,6 +1912,41 @@ impl App {
             }
             Err(error) => self.status = error.to_string(),
         }
+        Ok(())
+    }
+
+    fn move_selected_project(&mut self, down: bool) -> Result<()> {
+        if self.focus != Focus::Navigation {
+            self.status = "Focus the project pane before reordering projects".into();
+            return Ok(());
+        }
+        let Some(NavId::Project(id)) = self.selected_nav().cloned() else {
+            self.status = "Only projects can be reordered".into();
+            return Ok(());
+        };
+        let Some(project) = self.store.project(&id)? else {
+            self.status = "Project is no longer available".into();
+            return Ok(());
+        };
+        if project.is_inbox {
+            self.status = "Inbox order is fixed".into();
+            return Ok(());
+        }
+        if !self.store.move_project(&id, down)? {
+            self.status = format!(
+                "{} is already {} in this project group",
+                project.name,
+                if down { "last" } else { "first" }
+            );
+            return Ok(());
+        }
+        self.refresh_nav()?;
+        self.status = format!(
+            "{} moved {} · pending sync",
+            project.name,
+            if down { "down" } else { "up" }
+        );
+        self.mark_pending_and_sync();
         Ok(())
     }
 
@@ -1612,11 +2187,34 @@ fn remap_history_task_ids(entries: &mut [HistoryEntry], old_ids: &[String], new_
                 if old_ids.contains(&after.id) {
                     after.id = new_id.to_owned();
                 }
+                if before
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|parent| old_ids.contains(parent))
+                {
+                    before.parent_id = Some(new_id.to_owned());
+                }
+                if after
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|parent| old_ids.contains(parent))
+                {
+                    after.parent_id = Some(new_id.to_owned());
+                }
             }
-            HistoryEntry::TaskAdd { task_id, .. } if old_ids.contains(task_id) => {
-                *task_id = new_id.to_owned();
+            HistoryEntry::TaskAdd {
+                task_id, parent_id, ..
+            } => {
+                if old_ids.contains(task_id) {
+                    *task_id = new_id.to_owned();
+                }
+                if parent_id
+                    .as_ref()
+                    .is_some_and(|parent| old_ids.contains(parent))
+                {
+                    *parent_id = Some(new_id.to_owned());
+                }
             }
-            HistoryEntry::TaskAdd { .. } => {}
         }
     }
 }
@@ -1677,24 +2275,162 @@ pub fn filtered_task_indices(tasks: &[TaskPickerItem], query: &str) -> Vec<usize
         .collect()
 }
 
-fn order_tasks(tasks: &mut [Task], group_by_label: bool, alphabetically: bool) {
-    match (group_by_label, alphabetically) {
-        (false, false) => {}
-        (false, true) => {
-            tasks.sort_by_cached_key(|task| (task.checked, task.content.to_lowercase()))
-        }
-        (true, false) => {
-            tasks.sort_by_cached_key(|task| {
-                (task.display_group().map(str::to_lowercase), task.checked)
-            });
-        }
-        (true, true) => tasks.sort_by_cached_key(|task| {
+pub fn filtered_filter_indices(filters: &[FilterPickerItem], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    filters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, filter)| filter.search_name.starts_with(&query).then_some(index))
+        .collect()
+}
+
+fn parse_filter_editor(text: &str) -> std::result::Result<(String, String, bool), String> {
+    let normalized = text.trim_end_matches(['\r', '\n']);
+    let lines = normalized
+        .split('\n')
+        .map(|line| line.trim_end_matches('\r'))
+        .collect::<Vec<_>>();
+    if lines.len() != 3 {
+        return Err(
+            "Filter edit requires exactly three lines: title, query, favorite = true/false".into(),
+        );
+    }
+    let name = lines[0].trim();
+    let query = lines[1].trim();
+    if name.is_empty() {
+        return Err("Filter title cannot be empty".into());
+    }
+    if query.is_empty() {
+        return Err("Filter query cannot be empty".into());
+    }
+    let Some((key, value)) = lines[2].split_once('=') else {
+        return Err("Third line must be ‘favorite = true’ or ‘favorite = false’".into());
+    };
+    if !key.trim().eq_ignore_ascii_case("favorite") {
+        return Err("Third line must begin with ‘favorite =’".into());
+    }
+    let is_favorite = match value.trim().to_ascii_lowercase().as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return Err("Favorite value must be true or false".into()),
+    };
+    Ok((name.to_owned(), query.to_owned(), is_favorite))
+}
+
+fn parse_project_editor(text: &str) -> std::result::Result<String, String> {
+    let normalized = text.trim_end_matches(['\r', '\n']);
+    if normalized.contains('\r') || normalized.contains('\n') {
+        return Err("Project name must fit on one line".into());
+    }
+    let name = normalized.trim();
+    if name.is_empty() {
+        return Err("Project name cannot be empty".into());
+    }
+    Ok(name.to_owned())
+}
+
+fn order_tasks(
+    tasks: &mut Vec<Task>,
+    group_by_label: bool,
+    alphabetically: bool,
+    group_by_date: bool,
+) {
+    let original = std::mem::take(tasks);
+    let ids = original
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<HashSet<_>>();
+    let original_order = original
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    let metadata = original
+        .iter()
+        .map(|task| {
             (
-                task.display_group().map(str::to_lowercase),
-                task.checked,
-                task.content.to_lowercase(),
+                task.id.clone(),
+                (
+                    task.display_group().map(str::to_lowercase),
+                    task.checked,
+                    task.content.to_lowercase(),
+                    task.due.as_ref().and_then(crate::model::Due::concrete_date),
+                    task.child_order,
+                ),
             )
-        }),
+        })
+        .collect::<HashMap<_, _>>();
+    let mut roots = Vec::new();
+    let mut children = HashMap::<String, Vec<String>>::new();
+    for task in &original {
+        match task.parent_id.as_deref() {
+            Some(parent_id) if parent_id != task.id && ids.contains(parent_id) => children
+                .entry(parent_id.to_owned())
+                .or_default()
+                .push(task.id.clone()),
+            _ => roots.push(task.id.clone()),
+        }
+    }
+
+    if group_by_date {
+        roots.sort_by_cached_key(|id| {
+            let (_, checked, content, date, child_order) = &metadata[id];
+            (
+                *date,
+                *checked,
+                alphabetically.then(|| content.clone()),
+                *child_order,
+            )
+        });
+    } else {
+        match (group_by_label, alphabetically) {
+            (false, false) => {}
+            (false, true) => roots.sort_by_cached_key(|id| {
+                let (_, checked, content, _, _) = &metadata[id];
+                (*checked, content.clone())
+            }),
+            (true, false) => roots.sort_by_cached_key(|id| {
+                let (group, checked, _, _, _) = &metadata[id];
+                (group.clone(), *checked)
+            }),
+            (true, true) => roots.sort_by_cached_key(|id| {
+                let (group, checked, content, _, _) = &metadata[id];
+                (group.clone(), *checked, content.clone())
+            }),
+        }
+    }
+    if alphabetically {
+        for siblings in children.values_mut() {
+            siblings.sort_by_cached_key(|id| metadata[id].2.clone());
+        }
+    }
+
+    let mut remaining = original
+        .into_iter()
+        .map(|task| (task.id.clone(), task))
+        .collect::<HashMap<_, _>>();
+    for root in roots {
+        append_task_tree(&root, &mut remaining, &children, tasks);
+    }
+    // Preserve every task even if remote data contains a parent cycle.
+    for id in original_order {
+        append_task_tree(&id, &mut remaining, &children, tasks);
+    }
+}
+
+fn append_task_tree(
+    id: &str,
+    remaining: &mut HashMap<String, Task>,
+    children: &HashMap<String, Vec<String>>,
+    ordered: &mut Vec<Task>,
+) {
+    let Some(task) = remaining.remove(id) else {
+        return;
+    };
+    ordered.push(task);
+    if let Some(child_ids) = children.get(id) {
+        for child_id in child_ids {
+            append_task_tree(child_id, remaining, children, ordered);
+        }
     }
 }
 
@@ -1726,6 +2462,7 @@ mod tests {
         Task {
             id: id.into(),
             project_id: "inbox".into(),
+            parent_id: None,
             content: content.into(),
             description: String::new(),
             labels: labels.iter().map(|label| (*label).into()).collect(),
@@ -1835,9 +2572,69 @@ mod tests {
             Some(Overlay::Details(task)) if task.id == expected_id
         ));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
             .unwrap();
         assert!(matches!(app.overlay, Some(Overlay::Editor(_))));
+    }
+
+    #[test]
+    fn task_details_can_open_the_due_date_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        let task_id = store.add_task("Task with a date", &inbox).unwrap();
+        let task = store.task(&task_id).unwrap().unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.overlay = Some(Overlay::Details(task));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(matches!(
+            app.overlay.as_ref(),
+            Some(Overlay::Editor(editor)) if editor.purpose() == EditorPurpose::Due
+        ));
+    }
+
+    #[test]
+    fn copy_title_uses_the_selection_in_the_focused_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        store.add_task("Copy this task", &inbox).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+
+        let mut copied = String::new();
+        app.copy_selected_title_with(|title| {
+            copied = title.to_owned();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(copied, "Inbox");
+        assert_eq!(app.status, "Project or filter title copied");
+
+        app.enter_tasks().unwrap();
+        app.copy_selected_title_with(|title| {
+            copied = title.to_owned();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(copied, "Copy this task");
+        assert_eq!(app.status, "Task title copied");
     }
 
     #[test]
@@ -1850,23 +2647,66 @@ mod tests {
         ];
 
         let mut normal = original.clone();
-        order_tasks(&mut normal, false, false);
+        order_tasks(&mut normal, false, false, false);
         assert_eq!(task_ids(&normal), ["z", "work-b", "home-a", "work-a"]);
 
         let mut alphabetical = original.clone();
-        order_tasks(&mut alphabetical, false, true);
+        order_tasks(&mut alphabetical, false, true, false);
         assert_eq!(task_ids(&alphabetical), ["home-a", "work-a", "work-b", "z"]);
 
         let mut grouped = original.clone();
-        order_tasks(&mut grouped, true, false);
+        order_tasks(&mut grouped, true, false, false);
         assert_eq!(task_ids(&grouped), ["z", "home-a", "work-b", "work-a"]);
 
         let mut grouped_alphabetical = original;
-        order_tasks(&mut grouped_alphabetical, true, true);
+        order_tasks(&mut grouped_alphabetical, true, true, false);
         assert_eq!(
             task_ids(&grouped_alphabetical),
             ["z", "home-a", "work-a", "work-b"]
         );
+    }
+
+    #[test]
+    fn task_hierarchy_stays_together_and_only_siblings_sort_alphabetically() {
+        let mut parent = task("parent", "Packing", &["Travel"]);
+        parent.child_order = 0;
+        let mut child_z = task("child-z", "Zebra item", &["Ignored"]);
+        child_z.parent_id = Some(parent.id.clone());
+        child_z.child_order = 2;
+        let mut other = task("other", "Appointments", &["Home"]);
+        other.child_order = 1;
+        let mut child_a = task("child-a", "Adapter", &["Also ignored"]);
+        child_a.parent_id = Some(parent.id.clone());
+        child_a.child_order = 3;
+
+        let mut tasks = vec![parent, other, child_z, child_a];
+        order_tasks(&mut tasks, true, true, false);
+
+        assert_eq!(task_ids(&tasks), ["other", "parent", "child-a", "child-z"]);
+        assert_eq!(tasks[2].parent_id.as_deref(), Some("parent"));
+        assert_eq!(tasks[3].parent_id.as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn upcoming_order_is_chronological_and_alphabetical_within_each_date() {
+        let today = Local::now().date_naive();
+        let mut late = task("late", "Later day", &[]);
+        late.due = Some(crate::model::Due {
+            date: Some((today + chrono::Duration::days(1)).format("%F").to_string()),
+            ..crate::model::Due::default()
+        });
+        let mut zulu = task("zulu", "Zulu", &[]);
+        zulu.due = Some(crate::model::Due {
+            date: Some(today.format("%F").to_string()),
+            ..crate::model::Due::default()
+        });
+        let mut alpha = task("alpha", "Alpha", &[]);
+        alpha.due = zulu.due.clone();
+        let mut tasks = vec![late, zulu, alpha];
+
+        order_tasks(&mut tasks, false, true, true);
+
+        assert_eq!(task_ids(&tasks), ["alpha", "zulu", "late"]);
     }
 
     #[test]
@@ -1888,6 +2728,7 @@ mod tests {
                     name: format!("Project {index}"),
                     count: 0,
                     is_inbox: index == 0,
+                    depth: 0,
                 };
                 if index == 3 {
                     vec![NavRow::Separator, item]
@@ -2110,6 +2951,113 @@ mod tests {
     }
 
     #[test]
+    fn child_task_addition_can_be_undone_and_redone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        let parent_id = store.add_task("Parent", &inbox).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::AddChild,
+            task_id: Some(parent_id.clone()),
+            accepted: true,
+            text: "Child".into(),
+        })
+        .unwrap();
+        let child_id = app.selected_task().unwrap().id.clone();
+        assert_eq!(
+            store.task(&child_id).unwrap().unwrap().parent_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(store.task(&child_id).unwrap().is_none());
+        assert_eq!(app.status, "Undid subtask addition · pending sync");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap();
+        let redone = app.selected_task().unwrap();
+        assert_eq!(redone.content, "Child");
+        assert_eq!(redone.parent_id.as_deref(), Some(parent_id.as_str()));
+    }
+
+    #[test]
+    fn indent_and_outdent_support_arbitrary_task_depths_and_warn_at_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        let first_id = store.add_task("First", &inbox).unwrap();
+        let second_id = store.add_task("Second", &inbox).unwrap();
+        let third_id = store.add_task("Third", &inbox).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            store
+                .task(&second_id)
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some(first_id.as_str())
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_task().unwrap().id, third_id);
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            store.task(&third_id).unwrap().unwrap().parent_id.as_deref(),
+            Some(second_id.as_str())
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            app.status,
+            "Cannot indent: no preceding sibling can become the parent"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            store.task(&third_id).unwrap().unwrap().parent_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(store.task(&third_id).unwrap().unwrap().parent_id, None);
+        app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            app.status,
+            "Cannot outdent: task is already at the top level"
+        );
+    }
+
+    #[test]
     fn special_add_uses_its_configured_fallback_project() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
@@ -2182,12 +3130,212 @@ mod tests {
     }
 
     #[test]
+    fn filter_picker_searches_all_names_and_filter_editor_is_strict() {
+        let filters = ["Today and overdue", "Waiting", "Work"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| FilterPickerItem {
+                filter: Filter {
+                    id: index.to_string(),
+                    name: name.into(),
+                    query: "today".into(),
+                    item_order: index as i64,
+                    is_favorite: index == 0,
+                    workspace_id: None,
+                    is_frozen: false,
+                },
+                search_name: name.to_lowercase(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(filtered_filter_indices(&filters, "wa"), [1]);
+        assert_eq!(filtered_filter_indices(&filters, "WORK"), [2]);
+
+        assert_eq!(
+            parse_filter_editor("My filter\n(today | overdue) & #Work\nFAVORITE = False\n"),
+            Ok((
+                "My filter".into(),
+                "(today | overdue) & #Work".into(),
+                false
+            ))
+        );
+        assert!(parse_filter_editor("Missing query\n\nfavorite = true").is_err());
+        assert!(parse_filter_editor("Title\ntoday\nfavorite = perhaps").is_err());
+    }
+
+    #[test]
+    fn filter_add_edit_and_search_are_available_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::AddFilter,
+            task_id: None,
+            accepted: true,
+            text: "Focus\ntoday & p1\nfavorite = true".into(),
+        })
+        .unwrap();
+        let added = store.filters().unwrap().remove(0);
+        assert!(app.nav_rows.iter().any(
+            |row| matches!(row, NavRow::Item { id: NavId::Filter(id), .. } if id == &added.id)
+        ));
+
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::EditFilter,
+            task_id: Some(added.id.clone()),
+            accepted: true,
+            text: "Later\ntomorrow\nfavorite = false".into(),
+        })
+        .unwrap();
+        let updated = store.filter(&added.id).unwrap().unwrap();
+        assert_eq!(updated.name, "Later");
+        assert!(!updated.is_favorite);
+        assert!(!app.nav_rows.iter().any(
+            |row| matches!(row, NavRow::Item { id: NavId::Filter(id), .. } if id == &added.id)
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(matches!(app.overlay, Some(Overlay::FilterPicker { .. })));
+    }
+
+    #[test]
+    fn project_add_and_rename_are_available_offline() {
+        assert_eq!(
+            parse_project_editor("  Project name  \n"),
+            Ok("Project name".into())
+        );
+        assert!(parse_project_editor("First\nSecond").is_err());
+        assert!(parse_project_editor("   ").is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::AddProject,
+            task_id: None,
+            accepted: true,
+            text: "New project".into(),
+        })
+        .unwrap();
+        let project = store.project_named("New project").unwrap().unwrap();
+        assert_eq!(
+            app.selected_nav(),
+            Some(&NavId::Project(project.id.clone()))
+        );
+        assert_eq!(app.focus, Focus::Navigation);
+
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::RenameProject,
+            task_id: Some(project.id.clone()),
+            accepted: true,
+            text: "Renamed project".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            store.project(&project.id).unwrap().unwrap().name,
+            "Renamed project"
+        );
+        assert_eq!(app.selected_nav_name(), "Renamed project");
+    }
+
+    #[test]
     fn project_picker_requires_two_cancels_to_close() {
         let mut mode = PickerMode::Filtering;
 
         assert!(!mode.cancel());
         assert_eq!(mode, PickerMode::Selecting);
         assert!(mode.cancel());
+    }
+
+    #[test]
+    fn project_search_finds_hidden_projects_and_focuses_their_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let hidden_id = store.add_project("Hidden destination").unwrap();
+        assert!(store.toggle_project_hidden(&hidden_id).unwrap());
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+
+        assert!(!app.show_hidden_projects);
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "hidden".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.show_hidden_projects);
+        assert_eq!(app.selected_nav(), Some(&NavId::Project(hidden_id)));
+        assert_eq!(app.focus, Focus::Tasks);
+        assert_eq!(app.status, "Jumped to Hidden destination");
+    }
+
+    #[test]
+    fn project_reordering_keeps_the_moved_project_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let first_id = store.add_project("First").unwrap();
+        store.add_project("Second").unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        let first_index = app
+            .nav_rows
+            .iter()
+            .position(
+                |row| matches!(row, NavRow::Item { id: NavId::Project(id), .. } if id == &first_id),
+            )
+            .unwrap();
+        app.select_nav(first_index);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(app.selected_nav(), Some(&NavId::Project(first_id)));
+        assert_eq!(app.status, "First moved down · pending sync");
+        let project_names = app
+            .nav_rows
+            .iter()
+            .filter_map(|row| match row {
+                NavRow::Item {
+                    id: NavId::Project(_),
+                    name,
+                    is_inbox: false,
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(project_names, ["Second", "First"]);
     }
 
     #[test]
@@ -2251,6 +3399,37 @@ mod tests {
         app.transient_status.as_mut().unwrap().1 = Instant::now();
         assert!(app.expire_or_track_status());
         assert!(app.status.is_empty());
+    }
+
+    #[test]
+    fn help_scrolls_with_navigation_keys_and_closes_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(matches!(app.overlay, Some(Overlay::Help { scroll: 0 })));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.overlay, Some(Overlay::Help { scroll: 1 })));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.overlay, Some(Overlay::Help { scroll: 0 })));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.overlay.is_none());
     }
 
     #[test]

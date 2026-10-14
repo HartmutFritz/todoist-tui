@@ -39,6 +39,9 @@ pub struct Filter {
     pub name: String,
     pub query: String,
     pub item_order: i64,
+    pub is_favorite: bool,
+    pub workspace_id: Option<String>,
+    pub is_frozen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -94,6 +97,7 @@ impl Due {
 pub struct Task {
     pub id: String,
     pub project_id: String,
+    pub parent_id: Option<String>,
     pub content: String,
     pub description: String,
     pub labels: Vec<String>,
@@ -127,6 +131,7 @@ pub enum NavRow {
         name: String,
         count: usize,
         is_inbox: bool,
+        depth: usize,
     },
     Separator,
 }
@@ -138,6 +143,8 @@ pub enum Operation {
         expression: String,
         project_id: String,
         project_name: String,
+        #[serde(default)]
+        parent_id: Option<String>,
     },
     UpdateTask {
         content: String,
@@ -159,9 +166,38 @@ pub enum Operation {
     MoveTask {
         project_id: String,
     },
+    MoveTaskParent {
+        parent_id: Option<String>,
+    },
     CompleteTask,
     UncompleteTask,
     DeleteTask,
+    AddFilter {
+        name: String,
+        query: String,
+        is_favorite: bool,
+    },
+    UpdateFilter {
+        name: String,
+        query: String,
+        is_favorite: bool,
+        is_workspace: bool,
+    },
+    AddProject {
+        name: String,
+    },
+    UpdateProject {
+        name: String,
+    },
+    ReorderProjects {
+        projects: Vec<ProjectOrder>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectOrder {
+    pub id: String,
+    pub child_order: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +237,8 @@ pub struct RemoteTask {
     pub id: String,
     #[serde(deserialize_with = "string_id")]
     pub project_id: String,
+    #[serde(default, deserialize_with = "optional_string_id")]
+    pub parent_id: Option<String>,
     pub content: String,
     #[serde(default)]
     pub description: String,
@@ -232,10 +270,14 @@ pub struct RemoteFilter {
     pub id: String,
     pub name: String,
     pub query: String,
+    #[serde(default, deserialize_with = "optional_string_id")]
+    pub workspace_id: Option<String>,
     #[serde(default, alias = "order")]
     pub item_order: i64,
     #[serde(default)]
     pub is_favorite: bool,
+    #[serde(default)]
+    pub is_frozen: bool,
     #[serde(default)]
     pub is_deleted: bool,
 }
@@ -286,6 +328,7 @@ mod tests {
         let task = Task {
             id: "1".into(),
             project_id: "p".into(),
+            parent_id: None,
             content: String::new(),
             description: String::new(),
             labels: vec!["Zoo".into(), "alpha".into()],
@@ -295,6 +338,21 @@ mod tests {
             checked: false,
         };
         assert_eq!(task.display_group(), Some("alpha"));
+    }
+
+    #[test]
+    fn legacy_quick_add_operations_default_to_no_parent() {
+        let operation: Operation = serde_json::from_str(
+            r##"{"kind":"quick_add","expression":"Task","project_id":"inbox","project_name":"Inbox"}"##,
+        )
+        .unwrap();
+        assert!(matches!(
+            operation,
+            Operation::QuickAdd {
+                parent_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]

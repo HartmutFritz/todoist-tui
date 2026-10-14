@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod config;
 mod editor;
 mod keymap;
@@ -53,6 +54,7 @@ fn main() -> Result<()> {
     let store = Store::open(&config.database_path)?;
     let sync = SyncManager::new(store.clone(), config.token)?;
     let mut app = App::new(store, sync, config.keybindings, config.config_path)?;
+    app.set_editor_visual_line_navigation(config.visual_line_navigation);
 
     enable_raw_mode()?;
     // Install the guard immediately after raw mode succeeds so every later
