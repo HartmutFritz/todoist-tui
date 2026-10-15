@@ -66,6 +66,9 @@ impl Due {
 
     pub(crate) fn list_display_on(&self, today: NaiveDate) -> Option<String> {
         let value = self.display()?;
+        if value.trim().eq_ignore_ascii_case("tod") || value.trim().eq_ignore_ascii_case("today") {
+            return Some("Tod".to_owned());
+        }
         let Some(date_text) = value.get(..10) else {
             return Some(value.to_owned());
         };
@@ -73,9 +76,11 @@ impl Due {
             return Some(value.to_owned());
         };
         let days_from_today = date.signed_duration_since(today).num_days();
-        let mut formatted = if date.year() != today.year() {
+        let mut formatted = if days_from_today == 0 {
+            "Tod".to_owned()
+        } else if date.year() != today.year() {
             date.format("%b %-d, %Y").to_string()
-        } else if (0..=6).contains(&days_from_today) {
+        } else if (1..=6).contains(&days_from_today) {
             date.format("%a").to_string()
         } else {
             date.format("%b %-d").to_string()
@@ -402,13 +407,28 @@ mod tests {
     }
 
     #[test]
-    fn due_list_display_uses_weekdays_then_compact_dates() {
+    fn due_list_display_uses_today_weekdays_then_compact_dates() {
         let today = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
         let today_due = Due {
             date: Some("2026-10-12".into()),
             ..Due::default()
         };
-        assert_eq!(today_due.list_display_on(today), Some("Mon".into()));
+        assert_eq!(today_due.list_display_on(today), Some("Tod".into()));
+
+        let today_with_time = Due {
+            datetime: Some("2026-10-12T09:30:00".into()),
+            ..Due::default()
+        };
+        assert_eq!(
+            today_with_time.list_display_on(today),
+            Some("Tod 09:30".into())
+        );
+
+        let pending_today = Due {
+            string: Some("tod".into()),
+            ..Due::default()
+        };
+        assert_eq!(pending_today.list_display_on(today), Some("Tod".into()));
 
         let six_days_away = Due {
             date: Some("2026-10-18".into()),

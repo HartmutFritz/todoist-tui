@@ -487,12 +487,13 @@ impl TodoistClient {
     }
 
     fn filtered_tasks(&self, query: &str) -> Result<Vec<RemoteTask>> {
+        let query = assignment_negation_compat_query(query);
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
             let mut request = self
                 .auth(self.http.get(format!("{}/tasks/filter", self.base)))
-                .query(&[("query", query), ("limit", "200")]);
+                .query(&[("query", query.as_str()), ("limit", "200")]);
             if let Some(value) = cursor.as_deref() {
                 request = request.query(&[("cursor", value)]);
             }
@@ -505,6 +506,34 @@ impl TodoistClient {
         }
         Ok(all)
     }
+}
+
+fn assignment_negation_compat_query(query: &str) -> String {
+    const PREDICATE: &str = "!assigned to:";
+    let lowercase = query.to_ascii_lowercase();
+    let mut rewritten = String::with_capacity(query.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = lowercase[cursor..].find(PREDICATE) {
+        let start = cursor + relative_start;
+        let value_start = start + PREDICATE.len();
+        let value_end = query[value_start..]
+            .find(['&', '|', ')', ','])
+            .map_or(query.len(), |offset| value_start + offset);
+        let trimmed_end = query[value_start..value_end].trim_end().len() + value_start;
+        if query[value_start..trimmed_end].trim().is_empty() {
+            rewritten.push_str(&query[cursor..value_start]);
+            cursor = value_start;
+            continue;
+        }
+        rewritten.push_str(&query[cursor..start]);
+        rewritten.push_str("(!assigned | ");
+        rewritten.push_str(&query[start..trimmed_end]);
+        rewritten.push(')');
+        rewritten.push_str(&query[trimmed_end..value_end]);
+        cursor = value_end;
+    }
+    rewritten.push_str(&query[cursor..]);
+    rewritten
 }
 
 fn due_update_args(task_id: &str, due_string: &str) -> Value {
@@ -658,6 +687,20 @@ mod tests {
         assert_eq!(
             due_update_args("task-1", ""),
             json!({"id": "task-1", "due": null})
+        );
+    }
+
+    #[test]
+    fn filter_assignment_negation_includes_unassigned_tasks() {
+        assert_eq!(
+            assignment_negation_compat_query(
+                "#today | ((today | overdue) & !assigned to: Lea) | (p1 & !assigned to:Lea)"
+            ),
+            "#today | ((today | overdue) & (!assigned | !assigned to: Lea)) | (p1 & (!assigned | !assigned to:Lea))"
+        );
+        assert_eq!(
+            assignment_negation_compat_query("assigned to: me | today"),
+            "assigned to: me | today"
         );
     }
 

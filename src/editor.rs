@@ -32,6 +32,23 @@ pub enum EditorCursorShape {
     Bar = 6,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorCellStyle {
+    pub foreground: vt100::Color,
+    pub background: vt100::Color,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorSpan {
+    pub text: String,
+    pub style: EditorCellStyle,
+}
+
 const DOUBLE_ESCAPE_INTERVAL: Duration = Duration::from_millis(400);
 const FALLBACK_VISUAL_DOWN: &str = "lua if vim.fn.maparg('j', 'n') == '' then vim.keymap.set('n', 'j', 'gj', { buffer = true, silent = true, noremap = true }) end";
 const FALLBACK_VISUAL_UP: &str = "lua if vim.fn.maparg('k', 'n') == '' then vim.keymap.set('n', 'k', 'gk', { buffer = true, silent = true, noremap = true }) end";
@@ -270,10 +287,18 @@ impl EmbeddedEditor {
         Ok(false)
     }
 
+    #[cfg(test)]
     pub fn lines(&self) -> Vec<String> {
         self.parser
             .lock()
             .map(|parser| visible_screen_lines(parser.screen()))
+            .unwrap_or_default()
+    }
+
+    pub fn styled_lines(&self) -> Vec<Vec<EditorSpan>> {
+        self.parser
+            .lock()
+            .map(|parser| visible_screen_styled_lines(parser.screen()))
             .unwrap_or_default()
     }
 
@@ -310,6 +335,7 @@ impl EmbeddedEditor {
     }
 }
 
+#[cfg(test)]
 fn visible_screen_lines(screen: &vt100::Screen) -> Vec<String> {
     let (_, columns) = screen.size();
     // `Screen::contents()` joins terminal rows that were created by soft
@@ -317,6 +343,70 @@ fn visible_screen_lines(screen: &vt100::Screen) -> Vec<String> {
     // line wider than the modal: Ratatui clips its continuation while Neovim's
     // cursor still advances. Preserve every visible terminal row instead.
     screen.rows(0, columns).collect()
+}
+
+fn visible_screen_styled_lines(screen: &vt100::Screen) -> Vec<Vec<EditorSpan>> {
+    let (rows, columns) = screen.size();
+    (0..rows)
+        .map(|row| {
+            let mut spans: Vec<EditorSpan> = Vec::new();
+            for column in 0..columns {
+                let Some(cell) = screen.cell(row, column) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let style = EditorCellStyle {
+                    foreground: cell.fgcolor(),
+                    background: cell.bgcolor(),
+                    bold: cell.bold(),
+                    dim: cell.dim(),
+                    italic: cell.italic(),
+                    underline: cell.underline(),
+                    inverse: cell.inverse(),
+                };
+                let text = if cell.has_contents() {
+                    cell.contents()
+                } else {
+                    " "
+                };
+                if let Some(previous) = spans.last_mut().filter(|span| span.style == style) {
+                    previous.text.push_str(text);
+                } else {
+                    spans.push(EditorSpan {
+                        text: text.to_owned(),
+                        style,
+                    });
+                }
+            }
+            while let Some(last) = spans.last_mut() {
+                if last.style != default_editor_cell_style() {
+                    break;
+                }
+                let trimmed = last.text.trim_end_matches(' ').len();
+                last.text.truncate(trimmed);
+                if last.text.is_empty() {
+                    spans.pop();
+                } else {
+                    break;
+                }
+            }
+            spans
+        })
+        .collect()
+}
+
+fn default_editor_cell_style() -> EditorCellStyle {
+    EditorCellStyle {
+        foreground: vt100::Color::Default,
+        background: vt100::Color::Default,
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        inverse: false,
+    }
 }
 
 impl Drop for EmbeddedEditor {
@@ -431,6 +521,19 @@ mod tests {
 
         assert_eq!(lines[0], "abcde");
         assert_eq!(lines[1], "f");
+    }
+
+    #[test]
+    fn styled_lines_preserve_terminal_selection_backgrounds() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"ab\x1b[48;5;8mcd\x1b[0m");
+
+        let lines = visible_screen_styled_lines(parser.screen());
+
+        assert_eq!(lines[0][0].text, "ab");
+        assert_eq!(lines[0][0].style.background, vt100::Color::Default);
+        assert_eq!(lines[0][1].text, "cd");
+        assert_eq!(lines[0][1].style.background, vt100::Color::Idx(8));
     }
 
     #[test]

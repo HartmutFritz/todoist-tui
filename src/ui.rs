@@ -17,6 +17,7 @@ use crate::{
         ProjectPickerPurpose, SyncStatus, TaskPickerItem, filtered_filter_indices,
         filtered_label_indices, filtered_project_indices, filtered_task_indices,
     },
+    editor::EditorCellStyle,
     keymap::{Action, KeyBindings},
     model::{Filter, NavId, NavRow, Task},
 };
@@ -270,14 +271,23 @@ fn task_lines<'a>(
                 task.due
                     .as_ref()
                     .and_then(|due| due.list_display_on(today))
-                    .map(|due| format!("  {due}"))
+                    .map(|due| {
+                        let color = if due == "Tod" || due.starts_with("Tod ") {
+                            RED_BRIGHT
+                        } else {
+                            SYNC_ORANGE
+                        };
+                        (format!("  {due}"), color)
+                    })
             })
             .flatten();
         let assignee = task.assignee.as_ref().map(|name| format!("  @{name}"));
         let suffix_width = priority
             .as_ref()
             .map_or(0, |(label, _)| UnicodeWidthStr::width(label.as_str()))
-            + due.as_deref().map_or(0, UnicodeWidthStr::width)
+            + due
+                .as_ref()
+                .map_or(0, |(label, _)| UnicodeWidthStr::width(label.as_str()))
             + assignee.as_deref().map_or(0, UnicodeWidthStr::width);
         let indentation = depth.saturating_mul(2);
         let title_width = content_width.saturating_sub(2 + indentation + suffix_width);
@@ -307,11 +317,11 @@ fn task_lines<'a>(
                     .bg(if is_selected { SELECT } else { PANEL }),
             ));
         }
-        if let Some(due) = due {
+        if let Some((due, color)) = due {
             spans.push(Span::styled(
                 due,
                 Style::default()
-                    .fg(if task.checked { MUTED } else { RED_BRIGHT })
+                    .fg(if task.checked { MUTED } else { color })
                     .bg(if is_selected { SELECT } else { PANEL }),
             ));
         }
@@ -525,9 +535,16 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
             frame.render_widget(Clear, area);
             frame.render_widget(panel(title, true), area);
             let lines = editor
-                .lines()
+                .styled_lines()
                 .into_iter()
-                .map(Line::raw)
+                .map(|spans| {
+                    Line::from(
+                        spans
+                            .into_iter()
+                            .map(|span| Span::styled(span.text, editor_cell_style(span.style)))
+                            .collect::<Vec<_>>(),
+                    )
+                })
                 .collect::<Vec<_>>();
             frame.render_widget(
                 Paragraph::new(lines).style(Style::default().fg(TEXT).bg(PANEL)),
@@ -539,6 +556,39 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
             }
         }
         None => {}
+    }
+}
+
+fn editor_cell_style(cell: EditorCellStyle) -> Style {
+    let mut foreground = editor_color(cell.foreground, TEXT);
+    let mut background = editor_color(cell.background, PANEL);
+    if cell.inverse {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+    let mut modifiers = Modifier::empty();
+    if cell.bold {
+        modifiers.insert(Modifier::BOLD);
+    }
+    if cell.dim {
+        modifiers.insert(Modifier::DIM);
+    }
+    if cell.italic {
+        modifiers.insert(Modifier::ITALIC);
+    }
+    if cell.underline {
+        modifiers.insert(Modifier::UNDERLINED);
+    }
+    Style::default()
+        .fg(foreground)
+        .bg(background)
+        .add_modifier(modifiers)
+}
+
+fn editor_color(color: vt100::Color, default: Color) -> Color {
+    match color {
+        vt100::Color::Default => default,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 
@@ -1255,6 +1305,22 @@ mod tests {
     }
 
     #[test]
+    fn embedded_editor_inverse_video_swaps_default_colors() {
+        let style = editor_cell_style(EditorCellStyle {
+            foreground: vt100::Color::Default,
+            background: vt100::Color::Default,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            inverse: true,
+        });
+
+        assert_eq!(style.fg, Some(PANEL));
+        assert_eq!(style.bg, Some(TEXT));
+    }
+
+    #[test]
     fn task_rows_are_compact_and_keep_heading_attached() {
         let tasks = vec![task("First", &["Work"]), task("Second", &["Work"])];
 
@@ -1385,6 +1451,28 @@ mod tests {
         assert_eq!(lines[0].spans[1].content.as_ref(), "Alpha");
         assert_eq!(lines[0].spans[2].content.as_ref(), "  @Ada Lovelace");
         assert_eq!(lines[0].spans[2].style.fg, Some(MUTED));
+    }
+
+    #[test]
+    fn task_due_dates_are_orange_except_for_today() {
+        let today = Local::now().date_naive();
+        let mut today_task = task("Today", &[]);
+        today_task.due = Some(crate::model::Due {
+            date: Some(today.format("%F").to_string()),
+            ..crate::model::Due::default()
+        });
+        let mut tomorrow_task = task("Tomorrow", &[]);
+        tomorrow_task.due = Some(crate::model::Due {
+            date: Some((today + chrono::Duration::days(1)).format("%F").to_string()),
+            ..crate::model::Due::default()
+        });
+        let tasks = [today_task, tomorrow_task];
+
+        let (lines, _) = task_lines(&tasks, None, true, false, false, false, 80);
+
+        assert_eq!(lines[0].spans[2].content.as_ref(), "  Tod");
+        assert_eq!(lines[0].spans[2].style.fg, Some(RED_BRIGHT));
+        assert_eq!(lines[1].spans[2].style.fg, Some(SYNC_ORANGE));
     }
 
     #[test]
