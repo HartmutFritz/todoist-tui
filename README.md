@@ -91,7 +91,10 @@ Todoist order. Both choices are remembered across application restarts.
 Subtasks stay directly below their parent and are indented by two spaces per
 level. A task tree belongs to its top-level parent's label group; subtask labels
 do not split the tree. Alphabetical mode sorts siblings while keeping the tree
-together.
+together. Long task titles wrap at complete-word boundaries; continuation lines
+are indented by one additional character so they remain visually attached to
+the same task. Assigned tasks show the assignee as `@Full Name` on the right;
+assignee names are cached and remain visible offline.
 
 `Shift+C` shows or hides completed tasks; this choice is remembered too. Completed
 tasks are grey and struck through. Press `d` on one to reopen it. Sync imports

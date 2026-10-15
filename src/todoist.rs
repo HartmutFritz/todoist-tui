@@ -8,13 +8,15 @@ use serde_json::{Value, json};
 
 use crate::{
     model::{
-        Due, Operation, OutboxEntry, RemoteFilter, RemoteLabel, RemoteProject, RemoteTask, Task,
+        Due, Operation, OutboxEntry, RemoteCollaborator, RemoteFilter, RemoteLabel, RemoteProject,
+        RemoteTask, Task,
     },
     store::Store,
 };
 
 const API_BASE: &str = "https://api.todoist.com/api/v1";
-const SYNC_RESOURCES: &str = r#"["projects","items","labels","filters","workspace_filters"]"#;
+const SYNC_RESOURCES: &str =
+    r#"["projects","items","labels","filters","workspace_filters","collaborators","user"]"#;
 
 #[derive(Debug, Deserialize)]
 struct SyncResponse {
@@ -28,6 +30,10 @@ struct SyncResponse {
     filters: Vec<RemoteFilter>,
     #[serde(default)]
     workspace_filters: Vec<RemoteFilter>,
+    #[serde(default)]
+    collaborators: Vec<RemoteCollaborator>,
+    #[serde(default)]
+    user: Option<RemoteCollaborator>,
     sync_token: String,
 }
 
@@ -426,6 +432,10 @@ impl TodoistClient {
             )?;
             let mut sync: SyncResponse = response.json().context("decode sync response")?;
             sync.filters.append(&mut sync.workspace_filters);
+            if let Some(user) = sync.user.take() {
+                sync.collaborators.push(user);
+            }
+            store.merge_collaborators(&sync.collaborators)?;
             store.merge_remote(&sync.projects, &sync.items, &sync.labels, &sync.filters)?;
             store.set_sync_token(&sync.sync_token)?;
             sync_token = sync.sync_token;
@@ -616,6 +626,7 @@ mod tests {
             priority: 2,
             child_order: 7,
             checked: false,
+            assignee: None,
         }
     }
 
@@ -624,6 +635,7 @@ mod tests {
             id: "parser-task".into(),
             project_id: "project-2".into(),
             parent_id: None,
+            responsible_uid: None,
             content: "Buy milk".into(),
             description: String::new(),
             labels: vec![],

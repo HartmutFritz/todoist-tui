@@ -9,7 +9,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
@@ -26,6 +26,7 @@ const PANEL: Color = Color::Rgb(27, 27, 30);
 const RED: Color = Color::Rgb(164, 49, 61);
 const RED_BRIGHT: Color = Color::Rgb(211, 84, 96);
 const SELECT: Color = Color::Rgb(91, 34, 42);
+const INACTIVE_SELECT: Color = Color::Rgb(57, 57, 63);
 const TEXT: Color = Color::Rgb(226, 222, 220);
 const MUTED: Color = Color::Rgb(139, 134, 132);
 const GOLD: Color = Color::Rgb(209, 166, 73);
@@ -76,6 +77,7 @@ fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
 fn draw_navigation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let height = area.height.saturating_sub(2 + LIST_TOP_PADDING) as usize;
     let scroll = app.nav_cursor.saturating_sub(height.saturating_sub(1));
+    let selection_color = navigation_selection_color(app.focus);
     let lines = app
         .nav_rows
         .iter()
@@ -98,7 +100,7 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         if selected {
                             Style::default()
                                 .fg(Color::White)
-                                .bg(SELECT)
+                                .bg(selection_color)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(TEXT)
@@ -107,14 +109,14 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Span::styled(
                         format!("  {count}"),
                         if selected {
-                            Style::default().fg(Color::White).bg(SELECT)
+                            Style::default().fg(Color::White).bg(selection_color)
                         } else {
                             Style::default().fg(MUTED)
                         },
                     ),
                 ])
                 .style(if selected {
-                    Style::default().bg(SELECT)
+                    Style::default().bg(selection_color)
                 } else {
                     Style::default()
                 })
@@ -130,6 +132,13 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .scroll((scroll as u16, 0)),
         area,
     );
+}
+
+fn navigation_selection_color(focus: Focus) -> Color {
+    match focus {
+        Focus::Navigation => SELECT,
+        Focus::Tasks => INACTIVE_SELECT,
+    }
 }
 
 fn draw_tasks(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -264,13 +273,16 @@ fn task_lines<'a>(
                     .map(|due| format!("  {due}"))
             })
             .flatten();
+        let assignee = task.assignee.as_ref().map(|name| format!("  @{name}"));
         let suffix_width = priority
             .as_ref()
             .map_or(0, |(label, _)| UnicodeWidthStr::width(label.as_str()))
-            + due.as_deref().map_or(0, UnicodeWidthStr::width);
+            + due.as_deref().map_or(0, UnicodeWidthStr::width)
+            + assignee.as_deref().map_or(0, UnicodeWidthStr::width);
         let indentation = depth.saturating_mul(2);
         let title_width = content_width.saturating_sub(2 + indentation + suffix_width);
-        let visible_content = complete_words_within(&task.content, title_width);
+        let continuation_width = content_width.saturating_sub(3 + indentation);
+        let wrapped_content = wrap_complete_words(&task.content, title_width, continuation_width);
         let mut spans = vec![Span::styled(
             if is_selected { "▸ " } else { "  " },
             row_style,
@@ -283,7 +295,10 @@ fn task_lines<'a>(
                     .bg(if is_selected { SELECT } else { PANEL }),
             ));
         }
-        spans.push(Span::styled(visible_content, content_style));
+        spans.push(Span::styled(
+            wrapped_content.first().cloned().unwrap_or_default(),
+            content_style,
+        ));
         if let Some((priority, color)) = priority {
             spans.push(Span::styled(
                 priority,
@@ -300,11 +315,30 @@ fn task_lines<'a>(
                     .bg(if is_selected { SELECT } else { PANEL }),
             ));
         }
-        lines.push(Line::from(spans).style(if is_selected {
+        if let Some(assignee) = assignee {
+            spans.push(Span::styled(
+                assignee,
+                Style::default()
+                    .fg(MUTED)
+                    .bg(if is_selected { SELECT } else { PANEL }),
+            ));
+        }
+        let line_style = if is_selected {
             Style::default().bg(SELECT)
         } else {
             Style::default()
-        }));
+        };
+        lines.push(Line::from(spans).style(line_style));
+        let continuation_indent = " ".repeat(3 + indentation);
+        for content in wrapped_content.into_iter().skip(1) {
+            lines.push(
+                Line::from(vec![
+                    Span::styled(continuation_indent.clone(), row_style),
+                    Span::styled(content, content_style),
+                ])
+                .style(line_style),
+            );
+        }
     }
     (lines, positions)
 }
@@ -343,33 +377,55 @@ fn upcoming_date_heading(date: NaiveDate, today: NaiveDate) -> String {
     }
 }
 
-fn complete_words_within(content: &str, max_width: usize) -> &str {
-    if UnicodeWidthStr::width(content) <= max_width {
-        return content;
-    }
+fn wrap_complete_words(
+    content: &str,
+    first_line_width: usize,
+    continuation_width: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut width_limit = first_line_width;
 
-    let mut width = 0;
-    let mut inside_word = false;
-    let mut last_complete_word_end = None;
-    for (index, character) in content.char_indices() {
-        if character.is_whitespace() {
-            if inside_word {
-                last_complete_word_end = Some(index);
-                inside_word = false;
+    for word in content.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+        let separator_width = usize::from(!current.is_empty());
+        if UnicodeWidthStr::width(current.as_str()) + separator_width + word_width <= width_limit {
+            if !current.is_empty() {
+                current.push(' ');
             }
-        } else {
-            inside_word = true;
+            current.push_str(word);
+            continue;
         }
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width + character_width > max_width {
-            return last_complete_word_end
-                .map(|end| content[..end].trim_end())
-                .unwrap_or("");
+
+        if current.is_empty() {
+            // There is no way to display this word without splitting it.
+            // Keep the row intact instead of allowing the terminal to clip a
+            // partial word at the border.
+            break;
         }
-        width += character_width;
+
+        lines.push(std::mem::take(&mut current));
+        width_limit = continuation_width;
+        if word_width > width_limit {
+            break;
+        }
+        current.push_str(word);
     }
 
-    content
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn complete_words_within(content: &str, max_width: usize) -> String {
+    wrap_complete_words(content, max_width, max_width)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -721,6 +777,7 @@ fn draw_details(frame: &mut Frame<'_>, task: &Task, edit_key: &str, due_key: &st
     } else {
         task.labels.join(", ")
     };
+    let assignee = task.assignee.as_deref().unwrap_or("—");
     let (priority_label, priority_color) = priority_display(task.priority);
     let text = Text::from(vec![
         Line::styled(
@@ -743,6 +800,10 @@ fn draw_details(frame: &mut Frame<'_>, task: &Task, edit_key: &str, due_key: &st
         Line::from(vec![
             Span::styled("Labels: ", Style::default().fg(MUTED)),
             Span::raw(labels),
+        ]),
+        Line::from(vec![
+            Span::styled("Assignee: ", Style::default().fg(MUTED)),
+            Span::raw(assignee.to_owned()),
         ]),
         Line::raw(""),
         Line::styled(
@@ -1183,7 +1244,14 @@ mod tests {
             priority: 1,
             child_order: 0,
             checked: false,
+            assignee: None,
         }
+    }
+
+    #[test]
+    fn navigation_selection_is_red_when_focused_and_grey_when_tasks_are_focused() {
+        assert_eq!(navigation_selection_color(Focus::Navigation), SELECT);
+        assert_eq!(navigation_selection_color(Focus::Tasks), INACTIVE_SELECT);
     }
 
     #[test]
@@ -1274,6 +1342,24 @@ mod tests {
         let (lines, _) = task_lines(&tasks, Some(0), true, false, false, false, 15);
 
         assert_eq!(lines[0].spans[1].content.as_ref(), "Alpha beta");
+        assert_eq!(lines[1].spans[0].content.as_ref(), "   ");
+        assert_eq!(lines[1].spans[1].content.as_ref(), "gamma");
+        assert_eq!(lines[1].style.bg, Some(SELECT));
+    }
+
+    #[test]
+    fn wrapped_task_lines_are_indented_and_shift_following_task_positions() {
+        let tasks = [task("Alpha beta gamma delta", &[]), task("Next", &[])];
+
+        let (lines, positions) = task_lines(&tasks, Some(0), true, false, false, false, 12);
+
+        assert_eq!(positions, [0, 3]);
+        assert_eq!(lines[0].spans[1].content.as_ref(), "Alpha beta");
+        assert_eq!(lines[1].spans[0].content.as_ref(), "   ");
+        assert_eq!(lines[1].spans[1].content.as_ref(), "gamma");
+        assert_eq!(lines[2].spans[0].content.as_ref(), "   ");
+        assert_eq!(lines[2].spans[1].content.as_ref(), "delta");
+        assert_eq!(lines[3].spans[1].content.as_ref(), "Next");
     }
 
     #[test]
@@ -1286,6 +1372,19 @@ mod tests {
 
         assert_eq!(lines[0].spans[1].content.as_ref(), "Alpha");
         assert_eq!(lines[0].spans[2].content.as_ref(), "  p1");
+    }
+
+    #[test]
+    fn assigned_tasks_show_the_assignee_and_reserve_title_width() {
+        let mut assigned = task("Alpha beta", &[]);
+        assigned.assignee = Some("Ada Lovelace".into());
+        let tasks = [assigned];
+
+        let (lines, _) = task_lines(&tasks, Some(0), true, false, false, false, 23);
+
+        assert_eq!(lines[0].spans[1].content.as_ref(), "Alpha");
+        assert_eq!(lines[0].spans[2].content.as_ref(), "  @Ada Lovelace");
+        assert_eq!(lines[0].spans[2].style.fg, Some(MUTED));
     }
 
     #[test]
@@ -1308,7 +1407,7 @@ mod tests {
 
     #[test]
     fn oversized_first_word_is_not_rendered_partially() {
-        assert_eq!(complete_words_within("extraordinary", 6), "");
+        assert_eq!(wrap_complete_words("extraordinary", 6, 5), [""]);
     }
 
     #[test]

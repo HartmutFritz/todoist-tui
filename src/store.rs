@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::model::{
     Due, Filter, INBOX_LOCAL_ID, NavId, NavRow, Operation, OutboxEntry, PROJECT_SPACE_COUNT,
-    Project, ProjectOrder, RemoteFilter, RemoteLabel, RemoteProject, RemoteTask, Task,
+    Project, ProjectOrder, RemoteCollaborator, RemoteFilter, RemoteLabel, RemoteProject,
+    RemoteTask, Task,
 };
 
 #[derive(Debug, Clone)]
@@ -58,6 +59,8 @@ impl Store {
 
     fn initialize(&self) -> Result<()> {
         let conn = self.connect()?;
+        let previous_schema_version: i64 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         // Journal mode persists in the database; setting it once avoids a
         // locking pragma on every short-lived read connection.
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -76,7 +79,11 @@ impl Store {
                description TEXT NOT NULL DEFAULT '', labels_json TEXT NOT NULL DEFAULT '[]',
                due_json TEXT, priority INTEGER NOT NULL DEFAULT 1,
                child_order INTEGER NOT NULL DEFAULT 0, checked INTEGER NOT NULL DEFAULT 0,
-               deleted INTEGER NOT NULL DEFAULT 0, parent_id TEXT
+               deleted INTEGER NOT NULL DEFAULT 0, parent_id TEXT,
+               responsible_uid TEXT, assignee_name TEXT
+             );
+             CREATE TABLE IF NOT EXISTS collaborators (
+               id TEXT PRIMARY KEY, full_name TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS labels (
                id TEXT PRIMARY KEY, name TEXT NOT NULL, item_order INTEGER NOT NULL DEFAULT 0,
@@ -165,6 +172,8 @@ impl Store {
             copy_legacy_column(&conn, "tasks", "checked", "completed")?;
         }
         ensure_column(&conn, "tasks", "deleted", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "tasks", "responsible_uid", "TEXT")?;
+        ensure_column(&conn, "tasks", "assignee_name", "TEXT")?;
 
         if ensure_column(&conn, "filters", "item_order", "INTEGER NOT NULL DEFAULT 0")? {
             copy_legacy_column(&conn, "filters", "item_order", "position")?;
@@ -196,9 +205,15 @@ impl Store {
              CREATE INDEX IF NOT EXISTS filter_tasks_filter ON filter_tasks(filter_id);
              CREATE INDEX IF NOT EXISTS outbox_entity ON outbox(entity_id);
              INSERT OR IGNORE INTO projects(id, name, is_inbox) VALUES('inbox', 'Inbox', 1);
-             PRAGMA user_version=7;
+             PRAGMA user_version=8;
              COMMIT;",
         )?;
+        if previous_schema_version < 8 {
+            // Older releases did not request collaborator resources or retain
+            // assignment IDs. An existing incremental token cannot backfill
+            // that data, so make the next pull a one-time full refresh.
+            conn.execute("UPDATE meta SET value='*' WHERE key='sync_token'", [])?;
+        }
         compact_pending_due_updates(&conn)?;
         Ok(())
     }
@@ -433,10 +448,10 @@ impl Store {
         let conn = self.connect()?;
         if matches!(nav, NavId::Today | NavId::Upcoming) {
             let sql = if show_completed {
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
                  FROM tasks WHERE deleted=0 ORDER BY checked,child_order,id"
             } else {
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
                  FROM tasks WHERE checked=0 AND deleted=0 ORDER BY child_order,id"
             };
             let mut stmt = conn.prepare(sql)?;
@@ -471,17 +486,17 @@ impl Store {
         }
         let (sql, id) = match (nav, show_completed) {
             (NavId::Project(id), true) => (
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
                  FROM tasks WHERE project_id=?1 AND deleted=0 ORDER BY checked,child_order,id", id),
             (NavId::Filter(id), true) => (
-                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id
+                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name
                  FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
                  WHERE ft.filter_id=?1 AND t.deleted=0 ORDER BY t.checked,t.child_order,t.id", id),
             (NavId::Project(id), false) => (
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
                  FROM tasks WHERE project_id=?1 AND checked=0 AND deleted=0 ORDER BY child_order,id", id),
             (NavId::Filter(id), false) => (
-                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id
+                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name
                  FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
                  WHERE ft.filter_id=?1 AND t.checked=0 AND t.deleted=0 ORDER BY t.child_order,t.id", id),
             (NavId::Today | NavId::Upcoming, _) => unreachable!(),
@@ -495,12 +510,12 @@ impl Store {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,
-                    t.priority,t.child_order,t.checked,t.parent_id,COALESCE(p.name,'Unknown project')
+                    t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,COALESCE(p.name,'Unknown project')
              FROM tasks t LEFT JOIN projects p ON p.id=t.project_id AND p.deleted=0
              WHERE t.deleted=0
              ORDER BY t.checked,lower(t.content),t.child_order,t.id",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row_to_task(row)?, row.get(10)?)))?;
+        let rows = stmt.query_map([], |row| Ok((row_to_task(row)?, row.get(11)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1172,17 +1187,29 @@ impl Store {
     pub fn replace_task_id(&self, old_id: &str, task: &RemoteTask) -> Result<()> {
         let conn = self.connect()?;
         let tx = conn.unchecked_transaction()?;
+        let assignee_name = if let Some(id) = task.responsible_uid.as_ref() {
+            tx.query_row(
+                "SELECT full_name FROM collaborators WHERE id=?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
         let locally_deleted: bool =
             tx.query_row("SELECT deleted FROM tasks WHERE id=?1", [old_id], |row| {
                 row.get(0)
             })?;
         tx.execute(
             "UPDATE OR REPLACE tasks SET id=?2,project_id=?3,content=?4,description=?5,labels_json=?6,
-             due_json=?7,priority=?8,child_order=?9,checked=?10,deleted=?11,parent_id=?12 WHERE id=?1",
+             due_json=?7,priority=?8,child_order=?9,checked=?10,deleted=?11,parent_id=?12,
+             responsible_uid=?13,assignee_name=?14 WHERE id=?1",
             params![old_id,task.id,task.project_id,task.content,task.description,
                 serde_json::to_string(&task.labels)?,task.due.as_ref().map(serde_json::to_string).transpose()?,
                     task.priority,task.child_order,
-                    task.checked || task.is_completed || task.completed_at.is_some(),locally_deleted,task.parent_id],
+                    task.checked || task.is_completed || task.completed_at.is_some(),locally_deleted,task.parent_id,
+                    task.responsible_uid,assignee_name],
         )?;
         tx.execute(
             "UPDATE outbox SET entity_id=?2 WHERE entity_id=?1",
@@ -1356,6 +1383,24 @@ impl Store {
         Ok(())
     }
 
+    pub fn merge_collaborators(&self, collaborators: &[RemoteCollaborator]) -> Result<()> {
+        let conn = self.connect()?;
+        let tx = conn.unchecked_transaction()?;
+        for collaborator in collaborators {
+            tx.execute(
+                "INSERT INTO collaborators(id,full_name) VALUES(?1,?2)
+                 ON CONFLICT(id) DO UPDATE SET full_name=excluded.full_name",
+                params![collaborator.id, collaborator.full_name],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET assignee_name=?2 WHERE responsible_uid=?1",
+                params![collaborator.id, collaborator.full_name],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn merge_remote(
         &self,
         projects: &[RemoteProject],
@@ -1365,6 +1410,7 @@ impl Store {
     ) -> Result<()> {
         let conn = self.connect()?;
         let tx = conn.unchecked_transaction()?;
+        let collaborator_names = collaborator_names(&tx)?;
         let (pending_tasks, pending_filters, pending_projects) = pending_entity_ids(&tx)?;
         let mut transferred_inbox_hidden = None;
         if let Some(remote_inbox) = projects
@@ -1411,16 +1457,23 @@ impl Store {
             if pending_tasks.contains(&task.id) {
                 continue;
             }
+            let assignee_name = task
+                .responsible_uid
+                .as_ref()
+                .and_then(|id| collaborator_names.get(id))
+                .cloned();
             tx.execute(
-                "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id,responsible_uid,assignee_name)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                  ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,content=excluded.content,
                  description=excluded.description,labels_json=excluded.labels_json,due_json=excluded.due_json,
                  priority=excluded.priority,child_order=excluded.child_order,checked=excluded.checked,
-                 deleted=excluded.deleted,parent_id=excluded.parent_id",
+                 deleted=excluded.deleted,parent_id=excluded.parent_id,
+                 responsible_uid=excluded.responsible_uid,assignee_name=excluded.assignee_name",
                 params![task.id,task.project_id,task.content,task.description,serde_json::to_string(&task.labels)?,
                     task.due.as_ref().map(serde_json::to_string).transpose()?,task.priority,task.child_order,
-                    task.checked || task.is_completed || task.completed_at.is_some(),task.is_deleted,task.parent_id],
+                    task.checked || task.is_completed || task.completed_at.is_some(),task.is_deleted,task.parent_id,
+                    task.responsible_uid,assignee_name],
             )?;
         }
         for label in labels {
@@ -1454,22 +1507,30 @@ impl Store {
     pub fn merge_completed_tasks(&self, tasks: &[RemoteTask]) -> Result<()> {
         let conn = self.connect()?;
         let tx = conn.unchecked_transaction()?;
+        let collaborator_names = collaborator_names(&tx)?;
         for task in tasks {
             // Completed history can contain an earlier occurrence of a task
             // that is currently active (notably recurring tasks). Never let
             // archival history overwrite an active or locally pending row.
+            let assignee_name = task
+                .responsible_uid
+                .as_ref()
+                .and_then(|id| collaborator_names.get(id))
+                .cloned();
             tx.execute(
-                "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10)
+                "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id,responsible_uid,assignee_name)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11,?12)
                  ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,content=excluded.content,
                  description=excluded.description,labels_json=excluded.labels_json,due_json=excluded.due_json,
                  priority=excluded.priority,child_order=excluded.child_order,deleted=excluded.deleted,
-                 parent_id=excluded.parent_id
+                 parent_id=excluded.parent_id,responsible_uid=excluded.responsible_uid,
+                 assignee_name=excluded.assignee_name
                  WHERE tasks.checked=1",
                 params![task.id,task.project_id,task.content,task.description,
                     serde_json::to_string(&task.labels)?,
                     task.due.as_ref().map(serde_json::to_string).transpose()?,
-                    task.priority,task.child_order,task.is_deleted,task.parent_id],
+                    task.priority,task.child_order,task.is_deleted,task.parent_id,
+                    task.responsible_uid,assignee_name],
             )?;
         }
         tx.commit()?;
@@ -1479,6 +1540,7 @@ impl Store {
     pub fn replace_filter_membership(&self, filter_id: &str, tasks: &[RemoteTask]) -> Result<()> {
         let conn = self.connect()?;
         let tx = conn.unchecked_transaction()?;
+        let collaborator_names = collaborator_names(&tx)?;
         let (pending_tasks, _, _) = pending_entity_ids(&tx)?;
         // Refresh active matches while retaining cached membership for tasks
         // completed from this filter, so they remain available in its history.
@@ -1489,16 +1551,23 @@ impl Store {
         )?;
         for task in tasks {
             if !pending_tasks.contains(&task.id) {
+                let assignee_name = task
+                    .responsible_uid
+                    .as_ref()
+                    .and_then(|id| collaborator_names.get(id))
+                    .cloned();
                 tx.execute(
-                    "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                    "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id,responsible_uid,assignee_name)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                      ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,content=excluded.content,
                      description=excluded.description,labels_json=excluded.labels_json,due_json=excluded.due_json,
                      priority=excluded.priority,child_order=excluded.child_order,checked=excluded.checked,
-                     deleted=excluded.deleted,parent_id=excluded.parent_id",
+                     deleted=excluded.deleted,parent_id=excluded.parent_id,
+                     responsible_uid=excluded.responsible_uid,assignee_name=excluded.assignee_name",
                     params![task.id,task.project_id,task.content,task.description,serde_json::to_string(&task.labels)?,
                         task.due.as_ref().map(serde_json::to_string).transpose()?,task.priority,task.child_order,
-                        task.checked || task.is_completed || task.completed_at.is_some(),task.is_deleted,task.parent_id],
+                        task.checked || task.is_completed || task.completed_at.is_some(),task.is_deleted,task.parent_id,
+                        task.responsible_uid,assignee_name],
                 )?;
             }
             if !task.checked && !task.is_deleted {
@@ -1687,12 +1756,18 @@ fn project_from(conn: &Connection, id: &str) -> Result<Option<Project>> {
 fn task_from(conn: &Connection, id: &str) -> Result<Option<Task>> {
     Ok(conn
         .query_row(
-            "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id
+            "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
              FROM tasks WHERE id=?1 AND deleted=0",
             [id],
             row_to_task,
         )
         .optional()?)
+}
+
+fn collaborator_names(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT id,full_name FROM collaborators")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 fn resolve_task_id_from(conn: &Connection, id: &str) -> Result<Option<String>> {
@@ -1837,6 +1912,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         child_order: row.get(7)?,
         checked: row.get(8)?,
         parent_id: row.get(9)?,
+        assignee: row.get(10)?,
     })
 }
 
@@ -2280,6 +2356,22 @@ mod tests {
         assert_eq!(task.labels, ["Work"]);
         assert_eq!(task.due.unwrap().display(), Some("tomorrow"));
         assert_eq!(store.favorite_filters().unwrap()[0].name, "Important");
+    }
+
+    #[test]
+    fn assignee_migration_requests_one_full_refresh() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("todoist-tui.db");
+        let store = Store::open(path.clone()).unwrap();
+        store.set_sync_token("incremental-token").unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        drop(conn);
+
+        let migrated = Store::open(path).unwrap();
+        assert_eq!(migrated.sync_token().unwrap(), "*");
     }
 
     #[test]
@@ -3041,6 +3133,7 @@ mod tests {
             id: "child".into(),
             project_id: "inbox".into(),
             parent_id: Some("parent".into()),
+            responsible_uid: None,
             content: "Child".into(),
             description: String::new(),
             labels: vec![],
@@ -3058,6 +3151,49 @@ mod tests {
         assert_eq!(
             store.task("child").unwrap().unwrap().parent_id.as_deref(),
             Some("parent")
+        );
+    }
+
+    #[test]
+    fn collaborator_names_are_cached_and_refreshed_for_assigned_tasks() {
+        let store = store();
+        store
+            .merge_collaborators(&[RemoteCollaborator {
+                id: "person-1".into(),
+                full_name: "Ada Lovelace".into(),
+            }])
+            .unwrap();
+        let remote = RemoteTask {
+            id: "assigned".into(),
+            project_id: "inbox".into(),
+            parent_id: None,
+            responsible_uid: Some("person-1".into()),
+            content: "Review".into(),
+            description: String::new(),
+            labels: vec![],
+            due: None,
+            priority: 1,
+            child_order: 0,
+            checked: false,
+            is_completed: false,
+            completed_at: None,
+            is_deleted: false,
+        };
+        store.merge_remote(&[], &[remote], &[], &[]).unwrap();
+        assert_eq!(
+            store.task("assigned").unwrap().unwrap().assignee.as_deref(),
+            Some("Ada Lovelace")
+        );
+
+        store
+            .merge_collaborators(&[RemoteCollaborator {
+                id: "person-1".into(),
+                full_name: "Ada Byron".into(),
+            }])
+            .unwrap();
+        assert_eq!(
+            store.task("assigned").unwrap().unwrap().assignee.as_deref(),
+            Some("Ada Byron")
         );
     }
 
@@ -3111,6 +3247,7 @@ mod tests {
             id: "t".into(),
             project_id: "inbox".into(),
             parent_id: None,
+            responsible_uid: None,
             content: "Remote".into(),
             description: String::new(),
             labels: vec![],
@@ -3140,6 +3277,7 @@ mod tests {
             id: "completed-task".into(),
             project_id: "inbox".into(),
             parent_id: None,
+            responsible_uid: None,
             content: "Already done".into(),
             description: String::new(),
             labels: vec![],
@@ -3173,6 +3311,7 @@ mod tests {
             id: "recurring-task".into(),
             project_id: "inbox".into(),
             parent_id: None,
+            responsible_uid: None,
             content: "Daily task".into(),
             description: String::new(),
             labels: vec![],
@@ -3202,6 +3341,7 @@ mod tests {
             id: "t".into(),
             project_id: "inbox".into(),
             parent_id: None,
+            responsible_uid: None,
             content: "Task".into(),
             description: String::new(),
             labels: vec!["Shared".into(), "personal".into()],
@@ -3234,6 +3374,7 @@ mod tests {
             id: "remote-task".into(),
             project_id: inbox.id,
             parent_id: None,
+            responsible_uid: None,
             content: "Milk".into(),
             description: String::new(),
             labels: vec![],
@@ -3269,6 +3410,7 @@ mod tests {
             id: "remote-parent".into(),
             project_id: inbox.id,
             parent_id: None,
+            responsible_uid: None,
             content: "Parent".into(),
             description: String::new(),
             labels: vec![],
@@ -3299,6 +3441,7 @@ mod tests {
             id: "remote-deleted-task".into(),
             project_id: inbox.id,
             parent_id: None,
+            responsible_uid: None,
             content: "Temporary".into(),
             description: String::new(),
             labels: vec![],

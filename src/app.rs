@@ -1566,7 +1566,10 @@ impl App {
                     parent_id: None,
                     task_id: id.clone(),
                 });
-                self.refresh_after_action(Some(&id))?;
+                // Adding must not steal the user's place in the current view.
+                // An empty view still selects the new task naturally because
+                // there is no remembered selection to restore.
+                self.refresh_after_action(None)?;
                 self.focus = Focus::Tasks;
                 self.status = if let Some(name) = special_project_name {
                     format!("Task added to #{name} · pending sync")
@@ -1601,7 +1604,7 @@ impl App {
                     parent_id: Some(parent.id),
                     task_id: id.clone(),
                 });
-                self.refresh_after_action(Some(&id))?;
+                self.refresh_after_action(None)?;
                 self.focus = Focus::Tasks;
                 self.status = "Subtask added · pending sync".into();
                 self.mark_pending_and_sync();
@@ -2470,6 +2473,7 @@ mod tests {
             priority: 1,
             child_order: 0,
             checked: false,
+            assignee: None,
         }
     }
 
@@ -2951,6 +2955,43 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_task_preserves_the_previously_selected_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        store.add_task("First", &inbox).unwrap();
+        let selected_id = store.add_task("Keep selected", &inbox).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        let selected_index = app
+            .tasks
+            .iter()
+            .position(|task| task.id == selected_id)
+            .unwrap();
+        app.set_task_cursor(selected_index);
+
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::Add,
+            task_id: None,
+            accepted: true,
+            text: "New task".into(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            app.selected_task().map(|task| task.id.as_str()),
+            Some(selected_id.as_str())
+        );
+        assert!(app.tasks.iter().any(|task| task.content == "New task"));
+    }
+
+    #[test]
     fn child_task_addition_can_be_undone_and_redone() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
@@ -2972,7 +3013,17 @@ mod tests {
             text: "Child".into(),
         })
         .unwrap();
-        let child_id = app.selected_task().unwrap().id.clone();
+        let child_id = app
+            .tasks
+            .iter()
+            .find(|task| task.content == "Child")
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(
+            app.selected_task().map(|task| task.id.as_str()),
+            Some(parent_id.as_str())
+        );
         assert_eq!(
             store.task(&child_id).unwrap().unwrap().parent_id.as_deref(),
             Some(parent_id.as_str())

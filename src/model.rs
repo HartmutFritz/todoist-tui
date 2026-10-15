@@ -105,6 +105,7 @@ pub struct Task {
     pub priority: u8,
     pub child_order: i64,
     pub checked: bool,
+    pub assignee: Option<String>,
 }
 
 impl Task {
@@ -239,6 +240,12 @@ pub struct RemoteTask {
     pub project_id: String,
     #[serde(default, deserialize_with = "optional_string_id")]
     pub parent_id: Option<String>,
+    #[serde(
+        default,
+        alias = "assignee_id",
+        deserialize_with = "optional_string_id"
+    )]
+    pub responsible_uid: Option<String>,
     pub content: String,
     #[serde(default)]
     pub description: String,
@@ -258,6 +265,13 @@ pub struct RemoteTask {
     pub completed_at: Option<String>,
     #[serde(default)]
     pub is_deleted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteCollaborator {
+    #[serde(deserialize_with = "string_id")]
+    pub id: String,
+    pub full_name: String,
 }
 
 fn default_priority() -> u8 {
@@ -336,6 +350,7 @@ mod tests {
             priority: 1,
             child_order: 0,
             checked: false,
+            assignee: None,
         };
         assert_eq!(task.display_group(), Some("alpha"));
     }
@@ -353,6 +368,21 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn remote_task_accepts_sync_and_rest_assignee_fields() {
+        let sync: RemoteTask = serde_json::from_str(
+            r#"{"id":"1","project_id":"p","content":"Task","responsible_uid":42}"#,
+        )
+        .unwrap();
+        let rest: RemoteTask = serde_json::from_str(
+            r#"{"id":"2","project_id":"p","content":"Task","assignee_id":"84"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(sync.responsible_uid.as_deref(), Some("42"));
+        assert_eq!(rest.responsible_uid.as_deref(), Some("84"));
     }
 
     #[test]

@@ -273,7 +273,7 @@ impl EmbeddedEditor {
     pub fn lines(&self) -> Vec<String> {
         self.parser
             .lock()
-            .map(|p| p.screen().contents().lines().map(str::to_owned).collect())
+            .map(|parser| visible_screen_lines(parser.screen()))
             .unwrap_or_default()
     }
 
@@ -308,6 +308,15 @@ impl EmbeddedEditor {
             text,
         }))
     }
+}
+
+fn visible_screen_lines(screen: &vt100::Screen) -> Vec<String> {
+    let (_, columns) = screen.size();
+    // `Screen::contents()` joins terminal rows that were created by soft
+    // wrapping. The TUI renders physical PTY rows, so joining them produces a
+    // line wider than the modal: Ratatui clips its continuation while Neovim's
+    // cursor still advances. Preserve every visible terminal row instead.
+    screen.rows(0, columns).collect()
 }
 
 impl Drop for EmbeddedEditor {
@@ -412,6 +421,17 @@ fn key_bytes(key: KeyEvent) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn visible_lines_preserve_soft_wrapped_terminal_rows() {
+        let mut parser = vt100::Parser::new(3, 5, 0);
+        parser.process(b"abcdef");
+
+        let lines = visible_screen_lines(parser.screen());
+
+        assert_eq!(lines[0], "abcde");
+        assert_eq!(lines[1], "f");
+    }
 
     #[test]
     fn shifted_letters_are_forwarded_as_uppercase() {
