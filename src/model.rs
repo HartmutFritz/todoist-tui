@@ -147,10 +147,14 @@ pub enum NavRow {
 pub enum Operation {
     QuickAdd {
         expression: String,
+        #[serde(default)]
+        description: String,
         project_id: String,
         project_name: String,
         #[serde(default)]
         parent_id: Option<String>,
+        #[serde(default)]
+        target_order: Option<i64>,
     },
     UpdateTask {
         content: String,
@@ -168,6 +172,9 @@ pub enum Operation {
     },
     UpdateLabels {
         labels: Vec<String>,
+    },
+    UpdatePriority {
+        priority: u8,
     },
     MoveTask {
         project_id: String,
@@ -198,10 +205,19 @@ pub enum Operation {
     ReorderProjects {
         projects: Vec<ProjectOrder>,
     },
+    ReorderTasks {
+        tasks: Vec<TaskOrder>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectOrder {
+    pub id: String,
+    pub child_order: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskOrder {
     pub id: String,
     pub child_order: i64,
 }
@@ -370,8 +386,10 @@ mod tests {
             operation,
             Operation::QuickAdd {
                 parent_id: None,
+                target_order: None,
+                ref description,
                 ..
-            }
+            } if description.is_empty()
         ));
     }
 

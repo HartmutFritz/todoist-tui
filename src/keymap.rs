@@ -28,12 +28,16 @@ pub enum Action {
     CopyTitle,
     EditTask,
     CompleteTask,
+    DeleteTask,
     MoveTask,
     AddChildTask,
     IndentTask,
     OutdentTask,
     EditDue,
-    AddTask,
+    RemoveDue,
+    ShowError,
+    AddTaskTop,
+    AddTaskBottom,
     Quit,
     First,
     Last,
@@ -63,7 +67,7 @@ pub enum Action {
 }
 
 impl Action {
-    const ALL: [Self; 49] = [
+    const ALL: [Self; 53] = [
         Self::Down,
         Self::Up,
         Self::DownFive,
@@ -82,12 +86,16 @@ impl Action {
         Self::CopyTitle,
         Self::EditTask,
         Self::CompleteTask,
+        Self::DeleteTask,
         Self::MoveTask,
         Self::AddChildTask,
         Self::IndentTask,
         Self::OutdentTask,
         Self::EditDue,
-        Self::AddTask,
+        Self::RemoveDue,
+        Self::ShowError,
+        Self::AddTaskTop,
+        Self::AddTaskBottom,
         Self::Quit,
         Self::First,
         Self::Last,
@@ -185,12 +193,20 @@ struct BindingConfig {
     copy_title: Vec<String>,
     edit_task: Vec<String>,
     complete_task: Vec<String>,
+    delete_task: Vec<String>,
     move_task: Vec<String>,
     add_child_task: Vec<String>,
     indent_task: Vec<String>,
     outdent_task: Vec<String>,
     edit_due: Vec<String>,
-    add_task: Vec<String>,
+    remove_due: Vec<String>,
+    show_error: Vec<String>,
+    add_task_top: Vec<String>,
+    add_task_bottom: Vec<String>,
+    // Compatibility with the former single add action. When present, these
+    // bindings retain the old bottom-append behavior and replace both new
+    // add bindings.
+    add_task: Option<Vec<String>>,
     quit: Vec<String>,
     first: Vec<String>,
     last: Vec<String>,
@@ -227,8 +243,8 @@ impl Default for BindingConfig {
         Self {
             down: strings(&["j", "down"]),
             up: strings(&["k", "up"]),
-            down_five: strings(&["shift+j"]),
-            up_five: strings(&["shift+k"]),
+            down_five: Vec::new(),
+            up_five: Vec::new(),
             focus_navigation: strings(&["h"]),
             focus_tasks: strings(&["l"]),
             confirm: strings(&["enter"]),
@@ -238,17 +254,22 @@ impl Default for BindingConfig {
             add_filter: strings(&["ctrl+f"]),
             rename_project: strings(&["r"]),
             add_project: strings(&["shift+p"]),
-            move_project_down: strings(&["ctrl+j"]),
-            move_project_up: strings(&["ctrl+k"]),
+            move_project_down: strings(&["shift+j"]),
+            move_project_up: strings(&["shift+k"]),
             copy_title: strings(&["y"]),
             edit_task: strings(&["e"]),
             complete_task: strings(&["d"]),
+            delete_task: strings(&["shift+d"]),
             move_task: strings(&["v"]),
             add_child_task: strings(&["c"]),
             indent_task: strings(&[">"]),
             outdent_task: strings(&["<"]),
             edit_due: strings(&["t"]),
-            add_task: strings(&["q", "a"]),
+            remove_due: strings(&["shift+t"]),
+            show_error: strings(&["shift+e"]),
+            add_task_top: strings(&["a"]),
+            add_task_bottom: strings(&["q"]),
+            add_task: None,
             quit: strings(&["shift+q"]),
             first: strings(&["g g"]),
             last: strings(&["shift+g"]),
@@ -257,8 +278,8 @@ impl Default for BindingConfig {
             sync: strings(&["r"]),
             undo: strings(&["u"]),
             redo: strings(&["ctrl+r"]),
-            toggle_label_grouping: strings(&["shift+m"]),
-            toggle_alphabetical_sort: strings(&["shift+n"]),
+            toggle_label_grouping: strings(&["shift+l"]),
+            toggle_alphabetical_sort: strings(&["shift+a"]),
             toggle_completed_tasks: strings(&["shift+c"]),
             toggle_hidden_projects: strings(&["shift+i"]),
             toggle_project_hidden: strings(&["ctrl+i"]),
@@ -394,6 +415,10 @@ impl KeyBindings {
     ) -> Result<Self> {
         drop(config.toggle_team);
         drop(config.toggle_third);
+        let (add_task_top, add_task_bottom) = match config.add_task {
+            Some(legacy) => (Vec::new(), legacy),
+            None => (config.add_task_top, config.add_task_bottom),
+        };
         let entries = [
             (Action::Down, config.down),
             (Action::Up, config.up),
@@ -413,12 +438,16 @@ impl KeyBindings {
             (Action::CopyTitle, config.copy_title),
             (Action::EditTask, config.edit_task),
             (Action::CompleteTask, config.complete_task),
+            (Action::DeleteTask, config.delete_task),
             (Action::MoveTask, config.move_task),
             (Action::AddChildTask, config.add_child_task),
             (Action::IndentTask, config.indent_task),
             (Action::OutdentTask, config.outdent_task),
             (Action::EditDue, config.edit_due),
-            (Action::AddTask, config.add_task),
+            (Action::RemoveDue, config.remove_due),
+            (Action::ShowError, config.show_error),
+            (Action::AddTaskTop, add_task_top),
+            (Action::AddTaskBottom, add_task_bottom),
             (Action::Quit, config.quit),
             (Action::First, config.first),
             (Action::Last, config.last),
@@ -610,12 +639,16 @@ impl Action {
             Self::CopyTitle => "copy_title",
             Self::EditTask => "edit_task",
             Self::CompleteTask => "complete_task",
+            Self::DeleteTask => "delete_task",
             Self::MoveTask => "move_task",
             Self::AddChildTask => "add_child_task",
             Self::IndentTask => "indent_task",
             Self::OutdentTask => "outdent_task",
             Self::EditDue => "edit_due",
-            Self::AddTask => "add_task",
+            Self::RemoveDue => "remove_due",
+            Self::ShowError => "show_error",
+            Self::AddTaskTop => "add_task_top",
+            Self::AddTaskBottom => "add_task_bottom",
             Self::Quit => "quit",
             Self::First => "first",
             Self::Last => "last",
@@ -852,15 +885,23 @@ mod tests {
     }
 
     #[test]
-    fn project_reordering_defaults_to_control_j_and_control_k() {
+    fn contextual_reordering_defaults_to_shift_j_and_shift_k() {
         let bindings = KeyBindings::defaults();
         assert!(bindings.matches(
             Action::MoveProjectDown,
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)
+            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT)
         ));
         assert!(bindings.matches(
             Action::MoveProjectUp,
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT)
+        ));
+        assert!(!bindings.matches(
+            Action::DownFive,
+            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT)
+        ));
+        assert!(!bindings.matches(
+            Action::UpFive,
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT)
         ));
     }
 
@@ -929,12 +970,22 @@ mod tests {
         let bindings = KeyBindings::defaults();
         assert!(bindings.matches(
             Action::ToggleLabelGrouping,
-            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT)
         ));
         assert!(bindings.matches(
             Action::ToggleAlphabeticalSort,
-            KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)
         ));
+        assert!(
+            bindings
+                .main_action(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT))
+                .is_none()
+        );
+        assert!(
+            bindings
+                .main_action(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT))
+                .is_none()
+        );
         assert!(bindings.matches(
             Action::ToggleCompletedTasks,
             KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)
@@ -942,16 +993,65 @@ mod tests {
     }
 
     #[test]
-    fn five_row_navigation_completion_and_undo_use_new_defaults() {
+    fn delete_remove_due_and_error_details_use_shifted_defaults() {
         let bindings = KeyBindings::defaults();
         assert!(bindings.matches(
-            Action::UpFive,
-            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT)
+            Action::DeleteTask,
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)
         ));
         assert!(bindings.matches(
-            Action::DownFive,
-            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT)
+            Action::RemoveDue,
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)
         ));
+        assert!(bindings.matches(
+            Action::ShowError,
+            KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT)
+        ));
+    }
+
+    #[test]
+    fn task_add_defaults_distinguish_top_and_bottom() {
+        let bindings = KeyBindings::defaults();
+        assert!(bindings.matches(
+            Action::AddTaskTop,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+        ));
+        assert!(bindings.matches(
+            Action::AddTaskBottom,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn task_add_placement_bindings_are_independently_configurable() {
+        let file: FileConfig =
+            toml::from_str("[keybindings]\nadd_task_top = ['x']\nadd_task_bottom = ['z']\n")
+                .unwrap();
+        let bindings = KeyBindings::from_config(file.keybindings).unwrap();
+        assert!(bindings.matches(
+            Action::AddTaskTop,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+        ));
+        assert!(bindings.matches(
+            Action::AddTaskBottom,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)
+        ));
+
+        let legacy: FileConfig = toml::from_str("[keybindings]\nadd_task = ['x']\n").unwrap();
+        let bindings = KeyBindings::from_config(legacy.keybindings).unwrap();
+        assert!(bindings.matches(
+            Action::AddTaskBottom,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+        ));
+        assert!(!bindings.matches(
+            Action::AddTaskTop,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn completion_and_undo_use_their_defaults() {
+        let bindings = KeyBindings::defaults();
         assert!(bindings.matches(
             Action::CompleteTask,
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)

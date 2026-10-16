@@ -51,6 +51,10 @@ pub enum Overlay {
     Help {
         scroll: usize,
     },
+    ErrorDetails {
+        message: String,
+        scroll: usize,
+    },
     Details(Task),
     FilterDetails(Filter),
     LabelPicker {
@@ -122,29 +126,43 @@ pub enum PickerMode {
     Selecting,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum AddPlacement {
+    #[default]
+    Natural,
+    Top,
+    Bottom,
+}
+
 #[derive(Debug, Clone)]
 enum HistoryEntry {
-    TaskChange {
+    Change {
         before: Box<Task>,
         after: Box<Task>,
         action: &'static str,
     },
-    TaskAdd {
+    Add {
         expression: String,
+        description: String,
         project: Project,
         parent_id: Option<String>,
         task_id: String,
+        placement: AddPlacement,
+    },
+    Delete {
+        tasks: Vec<Task>,
     },
 }
 
 impl HistoryEntry {
     fn action(&self) -> &'static str {
         match self {
-            Self::TaskChange { action, .. } => action,
-            Self::TaskAdd {
+            Self::Change { action, .. } => action,
+            Self::Add {
                 parent_id: Some(_), ..
             } => "subtask addition",
-            Self::TaskAdd { .. } => "task addition",
+            Self::Add { .. } => "task addition",
+            Self::Delete { .. } => "task deletion",
         }
     }
 }
@@ -201,6 +219,7 @@ pub struct App {
     rendered_nav: Option<NavId>,
     pending_render: Option<(NavId, Instant)>,
     pending_add_target: Option<Project>,
+    pending_add_placement: AddPlacement,
     undo_stack: Vec<HistoryEntry>,
     redo_stack: Vec<HistoryEntry>,
     view_date: NaiveDate,
@@ -259,6 +278,7 @@ impl App {
             rendered_nav: None,
             pending_render: None,
             pending_add_target: None,
+            pending_add_placement: AddPlacement::Natural,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             view_date: Local::now().date_naive(),
@@ -382,6 +402,7 @@ impl App {
             if editor.send_key(key)? {
                 self.overlay = None;
                 self.pending_add_target = None;
+                self.pending_add_placement = AddPlacement::Natural;
                 self.status = "Edit cancelled".into();
             }
             return Ok(());
@@ -420,8 +441,8 @@ impl App {
             Action::SearchFilters => self.open_filter_search()?,
             Action::AddFilter => self.open_add_filter()?,
             Action::AddProject => self.open_add_project()?,
-            Action::MoveProjectDown => self.move_selected_project(true)?,
-            Action::MoveProjectUp => self.move_selected_project(false)?,
+            Action::MoveProjectDown => self.move_selected_item(true)?,
+            Action::MoveProjectUp => self.move_selected_item(false)?,
             Action::CopyTitle => self.copy_selected_title()?,
             Action::Help => self.overlay = Some(Overlay::Help { scroll: 0 }),
             Action::Quit => self.quit = true,
@@ -444,11 +465,15 @@ impl App {
             Action::Last => self.move_last()?,
             Action::First => self.move_first()?,
             Action::Jump => self.prefix = Some(String::new()),
-            Action::AddTask => self.open_add()?,
+            Action::AddTaskTop => self.open_add(AddPlacement::Top)?,
+            Action::AddTaskBottom => self.open_add(AddPlacement::Bottom)?,
             Action::AddChildTask => self.open_add_child()?,
             Action::EditTask => self.open_edit()?,
             Action::EditDue => self.open_due()?,
+            Action::RemoveDue => self.remove_selected_due()?,
+            Action::ShowError => self.show_error_details(),
             Action::CompleteTask => self.complete()?,
+            Action::DeleteTask => self.delete_selected_task()?,
             Action::MoveTask => self.open_project_picker()?,
             Action::IndentTask => self.change_task_depth(true)?,
             Action::OutdentTask => self.change_task_depth(false)?,
@@ -481,6 +506,22 @@ impl App {
                 *scroll = scroll.saturating_sub(1);
             }
             Some(Overlay::Help { .. }) => {}
+            Some(Overlay::ErrorDetails { .. })
+                if self.keybindings.matches(Action::CloseDialog, key) =>
+            {
+                self.overlay = None;
+            }
+            Some(Overlay::ErrorDetails { scroll, .. })
+                if self.keybindings.matches(Action::Down, key) =>
+            {
+                *scroll = scroll.saturating_add(1);
+            }
+            Some(Overlay::ErrorDetails { scroll, .. })
+                if self.keybindings.matches(Action::Up, key) =>
+            {
+                *scroll = scroll.saturating_sub(1);
+            }
+            Some(Overlay::ErrorDetails { .. }) => {}
             Some(Overlay::Details(task)) if self.keybindings.matches(Action::EditTask, key) => {
                 let task_id = task.id.clone();
                 self.open_task_editor(&task_id)?;
@@ -488,6 +529,16 @@ impl App {
             Some(Overlay::Details(task)) if self.keybindings.matches(Action::EditDue, key) => {
                 let task_id = task.id.clone();
                 self.open_due_editor(&task_id)?;
+            }
+            Some(Overlay::Details(task)) if self.keybindings.matches(Action::RemoveDue, key) => {
+                let task_id = task.id.clone();
+                self.overlay = None;
+                self.remove_due(&task_id)?;
+            }
+            Some(Overlay::Details(task)) if self.keybindings.matches(Action::DeleteTask, key) => {
+                let task_id = task.id.clone();
+                self.overlay = None;
+                self.delete_task(&task_id)?;
             }
             Some(Overlay::FilterDetails(filter))
                 if self.keybindings.matches(Action::EditTask, key) =>
@@ -1123,6 +1174,7 @@ impl App {
 
     fn open_add_filter(&mut self) -> Result<()> {
         self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
         self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
             EditorPurpose::AddFilter,
             None,
@@ -1136,6 +1188,7 @@ impl App {
 
     fn open_add_project(&mut self) -> Result<()> {
         self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
         self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
             EditorPurpose::AddProject,
             None,
@@ -1161,6 +1214,7 @@ impl App {
             return Ok(());
         }
         self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
         self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
             EditorPurpose::RenameProject,
             Some(project.id),
@@ -1214,22 +1268,32 @@ impl App {
         Ok(())
     }
 
-    fn open_add(&mut self) -> Result<()> {
+    fn open_add(&mut self, requested: AddPlacement) -> Result<()> {
         self.force_tasks()?;
         if self.add_target_project()?.is_none() {
             self.status = "No Inbox or selected project is available".into();
             return Ok(());
         }
         self.pending_add_target = None;
+        self.pending_add_placement = self.effective_add_placement(requested);
         self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
             EditorPurpose::Add,
             None,
-            "",
+            "\n\n",
             12,
             70,
             self.visual_line_navigation,
         )?));
         Ok(())
+    }
+
+    fn effective_add_placement(&self, requested: AddPlacement) -> AddPlacement {
+        if !self.sort_tasks_alphabetically && matches!(self.selected_nav(), Some(NavId::Project(_)))
+        {
+            requested
+        } else {
+            AddPlacement::Natural
+        }
     }
 
     fn open_special_add(&mut self, project_name: &str) -> Result<()> {
@@ -1240,12 +1304,13 @@ impl App {
         let editor = EmbeddedEditor::open(
             EditorPurpose::Add,
             None,
-            "",
+            "\n\n",
             12,
             70,
             self.visual_line_navigation,
         )?;
         self.pending_add_target = Some(project);
+        self.pending_add_placement = AddPlacement::Natural;
         self.overlay = Some(Overlay::Editor(editor));
         Ok(())
     }
@@ -1266,10 +1331,11 @@ impl App {
         }
         let parent_id = parent.id.clone();
         self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
         self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
             EditorPurpose::AddChild,
             Some(parent_id),
-            "",
+            "\n\n",
             12,
             70,
             self.visual_line_navigation,
@@ -1279,6 +1345,7 @@ impl App {
 
     fn open_edit(&mut self) -> Result<()> {
         self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
         if self.focus != Focus::Tasks {
             return Ok(());
         }
@@ -1296,11 +1363,15 @@ impl App {
             return Ok(());
         };
         let initial = if task.description.is_empty() {
-            task.content.clone()
+            // Keep a real empty buffer line available for the description.
+            // A single trailing newline is only the file's final EOL in
+            // Neovim, so two are needed to create the editable blank line.
+            format!("{}\n\n", task.content)
         } else {
             format!("{}\n{}", task.content, task.description)
         };
         self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
         self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
             EditorPurpose::Edit,
             Some(task.id),
@@ -1340,6 +1411,7 @@ impl App {
 
     fn open_due(&mut self) -> Result<()> {
         self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
         if self.focus != Focus::Tasks {
             return Ok(());
         }
@@ -1362,6 +1434,7 @@ impl App {
             .and_then(|due| due.string.clone())
             .unwrap_or_default();
         self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
         self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
             EditorPurpose::Due,
             Some(task.id),
@@ -1534,18 +1607,21 @@ impl App {
     fn apply_editor_result(&mut self, result: EditorResult) -> Result<()> {
         if !result.accepted {
             self.pending_add_target = None;
+            self.pending_add_placement = AddPlacement::Natural;
             self.status = "Edit cancelled".into();
             return Ok(());
         }
         match result.purpose {
             EditorPurpose::Add => {
-                let expression = result.text.trim();
+                let (expression, description) = split_task_editor_text(&result.text);
                 if expression.is_empty() {
                     self.pending_add_target = None;
+                    self.pending_add_placement = AddPlacement::Natural;
                     self.status = "Empty task was not added".into();
                     return Ok(());
                 }
                 let special_project = self.pending_add_target.take();
+                let placement = std::mem::take(&mut self.pending_add_placement);
                 let special_project_name =
                     special_project.as_ref().map(|project| project.name.clone());
                 let from_virtual_view = special_project.is_none()
@@ -1559,12 +1635,29 @@ impl App {
                     self.add_target_project()?
                         .context("selected project and Inbox disappeared")?
                 };
-                let id = self.store.add_task(expression, &project)?;
-                self.record_history(HistoryEntry::TaskAdd {
+                let id = match placement {
+                    AddPlacement::Natural => {
+                        self.store
+                            .add_task_with_description(expression, &description, &project)?
+                    }
+                    AddPlacement::Top => self.store.add_task_at_top_with_description(
+                        expression,
+                        &description,
+                        &project,
+                    )?,
+                    AddPlacement::Bottom => self.store.add_task_at_bottom_with_description(
+                        expression,
+                        &description,
+                        &project,
+                    )?,
+                };
+                self.record_history(HistoryEntry::Add {
                     expression: expression.to_owned(),
+                    description,
                     project,
                     parent_id: None,
                     task_id: id.clone(),
+                    placement,
                 });
                 // Adding must not steal the user's place in the current view.
                 // An empty view still selects the new task naturally because
@@ -1581,7 +1674,7 @@ impl App {
                 self.mark_pending_and_sync();
             }
             EditorPurpose::AddChild => {
-                let expression = result.text.trim();
+                let (expression, description) = split_task_editor_text(&result.text);
                 if expression.is_empty() {
                     self.status = "Empty subtask was not added".into();
                     return Ok(());
@@ -1595,14 +1688,19 @@ impl App {
                     .store
                     .project(&parent.project_id)?
                     .context("parent task project is no longer available")?;
-                let id = self
-                    .store
-                    .add_child_task(expression, &project, &parent.id)?;
-                self.record_history(HistoryEntry::TaskAdd {
+                let id = self.store.add_child_task_with_description(
+                    expression,
+                    &description,
+                    &project,
+                    &parent.id,
+                )?;
+                self.record_history(HistoryEntry::Add {
                     expression: expression.to_owned(),
+                    description,
                     project,
                     parent_id: Some(parent.id),
                     task_id: id.clone(),
+                    placement: AddPlacement::Natural,
                 });
                 self.refresh_after_action(None)?;
                 self.focus = Focus::Tasks;
@@ -1611,14 +1709,11 @@ impl App {
             }
             EditorPurpose::Edit => {
                 let id = result.task_id.context("missing edited task")?;
-                let normalized = result.text.trim_end_matches(['\r', '\n']);
-                let mut lines = normalized.lines();
-                let title = lines.next().unwrap_or("").trim();
+                let (title, description) = split_task_editor_text(&result.text);
                 if title.is_empty() {
                     self.status = "Empty title: edit not applied".into();
                     return Ok(());
                 }
-                let description = lines.collect::<Vec<_>>().join("\n");
                 let before = self
                     .store
                     .task(&id)?
@@ -1762,6 +1857,83 @@ impl App {
         Ok(())
     }
 
+    fn delete_selected_task(&mut self) -> Result<()> {
+        if self.focus != Focus::Tasks {
+            return Ok(());
+        }
+        self.force_tasks()?;
+        let Some(task_id) = self.selected_task().map(|task| task.id.clone()) else {
+            return Ok(());
+        };
+        self.delete_task(&task_id)
+    }
+
+    fn delete_task(&mut self, task_id: &str) -> Result<()> {
+        let current_index = self.tasks.iter().position(|task| task.id == task_id);
+        let next_task = current_index
+            .and_then(|index| self.tasks.get(index + 1))
+            .map(|task| task.id.clone())
+            .or_else(|| {
+                current_index
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| self.tasks.get(index))
+                    .map(|task| task.id.clone())
+            });
+        let deleted = self.store.delete_task_tree(task_id)?;
+        self.record_history(HistoryEntry::Delete { tasks: deleted });
+        let nav = self.selected_nav().cloned();
+        self.refresh_nav()?;
+        if let Some(nav) = nav {
+            if let Some(next_task) = next_task {
+                self.remembered_tasks.insert(nav.clone(), next_task);
+            } else {
+                self.remembered_tasks.remove(&nav);
+            }
+            self.load_tasks(nav)?;
+        }
+        self.focus = Focus::Tasks;
+        self.status = "Task deleted · pending sync".into();
+        self.mark_pending_and_sync();
+        Ok(())
+    }
+
+    fn remove_selected_due(&mut self) -> Result<()> {
+        if self.focus != Focus::Tasks {
+            return Ok(());
+        }
+        self.force_tasks()?;
+        let Some(task_id) = self.selected_task().map(|task| task.id.clone()) else {
+            return Ok(());
+        };
+        self.remove_due(&task_id)
+    }
+
+    fn remove_due(&mut self, task_id: &str) -> Result<()> {
+        let before = self
+            .store
+            .task(task_id)?
+            .context("dated task no longer exists")?;
+        if before.due.is_none() {
+            self.status = "Task has no due date".into();
+            return Ok(());
+        }
+        self.store.update_due(task_id, "")?;
+        self.record_task_change(before, task_id, "due-date removal")?;
+        self.refresh_after_action(Some(task_id))?;
+        self.focus = Focus::Tasks;
+        self.status = "Due date removed · pending sync".into();
+        self.mark_pending_and_sync();
+        Ok(())
+    }
+
+    fn show_error_details(&mut self) {
+        if let Some(message) = self.sync_issue.clone() {
+            self.overlay = Some(Overlay::ErrorDetails { message, scroll: 0 });
+        } else {
+            self.status = "No synchronization error to show".into();
+        }
+    }
+
     fn record_task_change(
         &mut self,
         before: Task,
@@ -1773,7 +1945,7 @@ impl App {
             .task(task_id)?
             .context("changed task no longer exists")?;
         if before != after {
-            self.record_history(HistoryEntry::TaskChange {
+            self.record_history(HistoryEntry::Change {
                 before: Box::new(before),
                 after: Box::new(after),
                 action,
@@ -1814,14 +1986,14 @@ impl App {
         };
         let action = entry.action();
         let replaced_ids = match &entry {
-            HistoryEntry::TaskAdd { task_id, .. } => {
+            HistoryEntry::Add { task_id, .. } => {
                 let mut ids = vec![task_id.clone()];
                 if let Some(resolved) = self.store.resolve_task_id(task_id)? {
                     ids.push(resolved);
                 }
                 ids
             }
-            HistoryEntry::TaskChange { .. } => Vec::new(),
+            HistoryEntry::Change { .. } | HistoryEntry::Delete { .. } => Vec::new(),
         };
         let preferred = match self.apply_history_entry(&mut entry, false) {
             Ok(preferred) => preferred,
@@ -1830,7 +2002,7 @@ impl App {
                 return Err(error);
             }
         };
-        if let HistoryEntry::TaskAdd { task_id, .. } = &entry {
+        if let HistoryEntry::Add { task_id, .. } = &entry {
             remap_history_task_ids(&mut self.undo_stack, &replaced_ids, task_id);
             remap_history_task_ids(&mut self.redo_stack, &replaced_ids, task_id);
         }
@@ -1843,19 +2015,21 @@ impl App {
 
     fn apply_history_entry(&self, entry: &mut HistoryEntry, undo: bool) -> Result<Option<String>> {
         match entry {
-            HistoryEntry::TaskChange { before, after, .. } => self
+            HistoryEntry::Change { before, after, .. } => self
                 .store
                 .apply_task_snapshot(if undo { before } else { after })
                 .map(Some),
-            HistoryEntry::TaskAdd { task_id, .. } if undo => {
+            HistoryEntry::Add { task_id, .. } if undo => {
                 self.store.delete_task(task_id)?;
                 Ok(None)
             }
-            HistoryEntry::TaskAdd {
+            HistoryEntry::Add {
                 expression,
+                description,
                 project,
                 parent_id,
                 task_id,
+                placement,
             } => {
                 let destination = if let Some(project) = self.store.project(&project.id)? {
                     Some(project)
@@ -1874,13 +2048,46 @@ impl App {
                         .task(stored_parent_id)?
                         .context("subtask parent no longer exists")?;
                     *parent_id = Some(parent.id.clone());
-                    self.store
-                        .add_child_task(expression, &destination, &parent.id)?
+                    self.store.add_child_task_with_description(
+                        expression,
+                        description,
+                        &destination,
+                        &parent.id,
+                    )?
                 } else {
-                    self.store.add_task(expression, &destination)?
+                    match placement {
+                        AddPlacement::Natural => self.store.add_task_with_description(
+                            expression,
+                            description,
+                            &destination,
+                        )?,
+                        AddPlacement::Top => self.store.add_task_at_top_with_description(
+                            expression,
+                            description,
+                            &destination,
+                        )?,
+                        AddPlacement::Bottom => self.store.add_task_at_bottom_with_description(
+                            expression,
+                            description,
+                            &destination,
+                        )?,
+                    }
                 };
                 *project = destination;
                 Ok(Some(task_id.clone()))
+            }
+            HistoryEntry::Delete { tasks } if undo => {
+                *tasks = self.store.restore_deleted_tasks(tasks)?;
+                Ok(tasks.first().map(|task| task.id.clone()))
+            }
+            HistoryEntry::Delete { tasks } => {
+                let root_id = tasks
+                    .first()
+                    .context("deleted task history is empty")?
+                    .id
+                    .clone();
+                *tasks = self.store.delete_task_tree(&root_id)?;
+                Ok(None)
             }
         }
     }
@@ -1918,11 +2125,14 @@ impl App {
         Ok(())
     }
 
-    fn move_selected_project(&mut self, down: bool) -> Result<()> {
-        if self.focus != Focus::Navigation {
-            self.status = "Focus the project pane before reordering projects".into();
-            return Ok(());
+    fn move_selected_item(&mut self, down: bool) -> Result<()> {
+        match self.focus {
+            Focus::Navigation => self.move_selected_project(down),
+            Focus::Tasks => self.move_selected_task(down),
         }
+    }
+
+    fn move_selected_project(&mut self, down: bool) -> Result<()> {
         let Some(NavId::Project(id)) = self.selected_nav().cloned() else {
             self.status = "Only projects can be reordered".into();
             return Ok(());
@@ -1947,6 +2157,79 @@ impl App {
         self.status = format!(
             "{} moved {} · pending sync",
             project.name,
+            if down { "down" } else { "up" }
+        );
+        self.mark_pending_and_sync();
+        Ok(())
+    }
+
+    fn move_selected_task(&mut self, down: bool) -> Result<()> {
+        self.force_tasks()?;
+        let Some(selected) = self.selected_task().cloned() else {
+            self.status = "No task selected".into();
+            return Ok(());
+        };
+        if selected.checked {
+            self.status = "Completed tasks cannot be reordered".into();
+            return Ok(());
+        }
+        if self.sort_tasks_alphabetically {
+            self.status = "Disable alphabetical sorting before reordering tasks".into();
+            return Ok(());
+        }
+
+        let selected_group = selected.display_group().map(str::to_lowercase);
+        let selected_date = selected
+            .due
+            .as_ref()
+            .and_then(crate::model::Due::concrete_date);
+        let upcoming = matches!(self.selected_nav(), Some(NavId::Upcoming));
+        let candidates = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                if task.checked
+                    || task.project_id != selected.project_id
+                    || task.parent_id != selected.parent_id
+                {
+                    return false;
+                }
+                if selected.parent_id.is_some() {
+                    return true;
+                }
+                if upcoming {
+                    return task.due.as_ref().and_then(crate::model::Due::concrete_date)
+                        == selected_date;
+                }
+                !self.group_tasks_by_label
+                    || task.display_group().map(str::to_lowercase) == selected_group
+            })
+            .collect::<Vec<_>>();
+        let Some(position) = candidates.iter().position(|task| task.id == selected.id) else {
+            self.status = "Selected task is not in the current order".into();
+            return Ok(());
+        };
+        let target_position = if down {
+            position
+                .checked_add(1)
+                .filter(|position| *position < candidates.len())
+        } else {
+            position.checked_sub(1)
+        };
+        let Some(target) = target_position.and_then(|position| candidates.get(position)) else {
+            self.status = format!(
+                "{} is already {} in this task group",
+                selected.content,
+                if down { "last" } else { "first" }
+            );
+            return Ok(());
+        };
+        let target_id = target.id.clone();
+        self.store.reorder_task(&selected.id, &target_id)?;
+        self.refresh_after_action(Some(&selected.id))?;
+        self.status = format!(
+            "{} moved {} · pending sync",
+            selected.content,
             if down { "down" } else { "up" }
         );
         self.mark_pending_and_sync();
@@ -2183,7 +2466,7 @@ fn push_history(stack: &mut Vec<HistoryEntry>, entry: HistoryEntry) {
 fn remap_history_task_ids(entries: &mut [HistoryEntry], old_ids: &[String], new_id: &str) {
     for entry in entries {
         match entry {
-            HistoryEntry::TaskChange { before, after, .. } => {
+            HistoryEntry::Change { before, after, .. } => {
                 if old_ids.contains(&before.id) {
                     before.id = new_id.to_owned();
                 }
@@ -2205,7 +2488,7 @@ fn remap_history_task_ids(entries: &mut [HistoryEntry], old_ids: &[String], new_
                     after.parent_id = Some(new_id.to_owned());
                 }
             }
-            HistoryEntry::TaskAdd {
+            HistoryEntry::Add {
                 task_id, parent_id, ..
             } => {
                 if old_ids.contains(task_id) {
@@ -2216,6 +2499,20 @@ fn remap_history_task_ids(entries: &mut [HistoryEntry], old_ids: &[String], new_
                     .is_some_and(|parent| old_ids.contains(parent))
                 {
                     *parent_id = Some(new_id.to_owned());
+                }
+            }
+            HistoryEntry::Delete { tasks } => {
+                for task in tasks {
+                    if old_ids.contains(&task.id) {
+                        task.id = new_id.to_owned();
+                    }
+                    if task
+                        .parent_id
+                        .as_ref()
+                        .is_some_and(|parent| old_ids.contains(parent))
+                    {
+                        task.parent_id = Some(new_id.to_owned());
+                    }
                 }
             }
         }
@@ -2318,6 +2615,15 @@ fn parse_filter_editor(text: &str) -> std::result::Result<(String, String, bool)
         _ => return Err("Favorite value must be true or false".into()),
     };
     Ok((name.to_owned(), query.to_owned(), is_favorite))
+}
+
+fn split_task_editor_text(text: &str) -> (&str, String) {
+    let normalized = text.trim_end_matches(['\r', '\n']);
+    let (title, description) = normalized.split_once('\n').unwrap_or((normalized, ""));
+    (
+        title.trim_end_matches('\r').trim(),
+        description.replace("\r\n", "\n"),
+    )
 }
 
 fn parse_project_editor(text: &str) -> std::result::Result<String, String> {
@@ -2460,6 +2766,7 @@ fn toggled_labels(labels: &[String], selected: &str) -> (Vec<String>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Operation;
 
     fn task(id: &str, content: &str, labels: &[&str]) -> Task {
         Task {
@@ -2714,7 +3021,7 @@ mod tests {
     }
 
     #[test]
-    fn five_row_navigation_moves_and_clamps_in_both_panes() {
+    fn configurable_five_row_navigation_moves_and_clamps_in_both_panes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
         let sync = SyncManager::new(store.clone(), None).unwrap();
@@ -2743,14 +3050,12 @@ mod tests {
             .collect();
         app.nav_cursor = 0;
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))
-            .unwrap();
+        app.move_down_by(5).unwrap();
         assert_eq!(
             app.selected_nav().cloned(),
             Some(NavId::Project("project-5".into()))
         );
-        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
-            .unwrap();
+        app.move_up_by(5).unwrap();
         assert_eq!(
             app.selected_nav().cloned(),
             Some(NavId::Project("project-0".into()))
@@ -2761,17 +3066,13 @@ mod tests {
             .map(|index| task(&index.to_string(), &format!("Task {index}"), &[]))
             .collect();
         app.task_cursor = Some(0);
-        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))
-            .unwrap();
+        app.move_down_by(5).unwrap();
         assert_eq!(app.task_cursor, Some(5));
-        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))
-            .unwrap();
+        app.move_down_by(5).unwrap();
         assert_eq!(app.task_cursor, Some(7));
-        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
-            .unwrap();
+        app.move_up_by(5).unwrap();
         assert_eq!(app.task_cursor, Some(2));
-        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
-            .unwrap();
+        app.move_up_by(5).unwrap();
         assert_eq!(app.task_cursor, Some(0));
     }
 
@@ -2790,9 +3091,9 @@ mod tests {
             assert!(!app.sort_tasks_alphabetically);
             assert!(!app.show_completed_tasks);
 
-            app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT))
+            app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT))
                 .unwrap();
-            app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT))
+            app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
                 .unwrap();
             app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
                 .unwrap();
@@ -2902,6 +3203,100 @@ mod tests {
     }
 
     #[test]
+    fn manual_add_placement_applies_inside_label_groups_but_not_sorted_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.effective_add_placement(AddPlacement::Top),
+            AddPlacement::Top
+        );
+        assert_eq!(
+            app.effective_add_placement(AddPlacement::Bottom),
+            AddPlacement::Bottom
+        );
+        app.group_tasks_by_label = false;
+        assert_eq!(
+            app.effective_add_placement(AddPlacement::Top),
+            AddPlacement::Top
+        );
+        assert_eq!(
+            app.effective_add_placement(AddPlacement::Bottom),
+            AddPlacement::Bottom
+        );
+        app.sort_tasks_alphabetically = true;
+        assert_eq!(
+            app.effective_add_placement(AddPlacement::Top),
+            AddPlacement::Natural
+        );
+
+        app.sort_tasks_alphabetically = false;
+        app.nav_cursor = app
+            .nav_rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    NavRow::Item {
+                        id: NavId::Today,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            app.effective_add_placement(AddPlacement::Top),
+            AddPlacement::Natural
+        );
+    }
+
+    #[test]
+    fn redo_preserves_top_addition_placement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        store.add_task("Existing", &inbox).unwrap();
+        let top_id = store.add_task_at_top("Top", &inbox).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.record_history(HistoryEntry::Add {
+            expression: "Top".into(),
+            description: String::new(),
+            project: inbox.clone(),
+            parent_id: None,
+            task_id: top_id,
+            placement: AddPlacement::Top,
+        });
+
+        app.undo().unwrap();
+        app.redo().unwrap();
+
+        assert_eq!(
+            store
+                .tasks_for(&NavId::Project(inbox.id))
+                .unwrap()
+                .iter()
+                .map(|task| task.content.as_str())
+                .collect::<Vec<_>>(),
+            ["Top", "Existing"]
+        );
+    }
+
+    #[test]
     fn added_task_can_be_undone_and_redone() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
@@ -2917,10 +3312,20 @@ mod tests {
             purpose: EditorPurpose::Add,
             task_id: None,
             accepted: true,
-            text: "Pack passport".into(),
+            text: "Pack passport\nPut it beside the door".into(),
         })
         .unwrap();
         assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].content, "Pack passport");
+        assert_eq!(app.tasks[0].description, "Put it beside the door");
+        assert!(app.store.outbox().unwrap().iter().any(|entry| matches!(
+            &entry.operation,
+            Operation::QuickAdd {
+                expression,
+                description,
+                ..
+            } if expression == "Pack passport" && description == "Put it beside the door"
+        )));
         let original_id = app.tasks[0].id.clone();
         app.apply_editor_result(EditorResult {
             purpose: EditorPurpose::Edit,
@@ -2945,6 +3350,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.tasks.len(), 1);
         assert_eq!(app.tasks[0].content, "Pack passport");
+        assert_eq!(app.tasks[0].description, "Put it beside the door");
         assert_ne!(app.tasks[0].id, original_id);
         assert_eq!(app.status, "Redid task addition · pending sync");
 
@@ -3039,6 +3445,116 @@ mod tests {
         let redone = app.selected_task().unwrap();
         assert_eq!(redone.content, "Child");
         assert_eq!(redone.parent_id.as_deref(), Some(parent_id.as_str()));
+    }
+
+    #[test]
+    fn task_tree_deletion_can_be_undone_and_redone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        let parent_id = store.add_task("Parent", &inbox).unwrap();
+        store.add_child_task("Child", &inbox, &parent_id).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.focus = Focus::Tasks;
+        let parent_index = app
+            .tasks
+            .iter()
+            .position(|task| task.id == parent_id)
+            .unwrap();
+        app.set_task_cursor(parent_index);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.tasks.is_empty());
+        assert!(
+            store
+                .outbox()
+                .unwrap()
+                .iter()
+                .any(|entry| matches!(entry.operation, Operation::DeleteTask))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.tasks.len(), 2);
+        assert_eq!(app.tasks[1].parent_id.as_deref(), Some(parent_id.as_str()));
+        assert!(
+            !store
+                .outbox()
+                .unwrap()
+                .iter()
+                .any(|entry| matches!(entry.operation, Operation::DeleteTask))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(app.tasks.is_empty());
+        assert_eq!(app.status, "Redid task deletion · pending sync");
+    }
+
+    #[test]
+    fn due_date_removal_can_be_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        let task_id = store.add_task("Dated", &inbox).unwrap();
+        store.update_due(&task_id, "tomorrow").unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.focus = Focus::Tasks;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.selected_task().unwrap().due.is_none());
+        assert_eq!(app.status, "Due date removed · pending sync");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.selected_task()
+                .unwrap()
+                .due
+                .as_ref()
+                .and_then(|due| due.string.as_deref()),
+            Some("tomorrow")
+        );
+    }
+
+    #[test]
+    fn shifted_e_opens_the_complete_sync_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        let message = "Sync error: complete diagnostic payload".to_owned();
+        app.sync_issue = Some(message.clone());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT))
+            .unwrap();
+
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::ErrorDetails { message: ref shown, scroll: 0 }) if shown == &message
+        ));
     }
 
     #[test]
@@ -3368,7 +3884,7 @@ mod tests {
             .unwrap();
         app.select_nav(first_index);
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))
             .unwrap();
 
         assert_eq!(app.selected_nav(), Some(&NavId::Project(first_id)));
@@ -3387,6 +3903,43 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(project_names, ["Second", "First"]);
+    }
+
+    #[test]
+    fn contextual_reordering_moves_tasks_when_tasks_have_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        let first_id = store.add_task("First", &inbox).unwrap();
+        store.add_task("Second", &inbox).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.focus = Focus::Tasks;
+        let first_index = app
+            .tasks
+            .iter()
+            .position(|task| task.id == first_id)
+            .unwrap();
+        app.set_task_cursor(first_index);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))
+            .unwrap();
+
+        assert_eq!(app.selected_task().unwrap().id, first_id);
+        assert_eq!(
+            app.tasks
+                .iter()
+                .map(|task| task.content.as_str())
+                .collect::<Vec<_>>(),
+            ["Second", "First"]
+        );
+        assert_eq!(app.status, "First moved down · pending sync");
     }
 
     #[test]

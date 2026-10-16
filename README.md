@@ -84,7 +84,7 @@ Projects are organized into spaces `0` through `9`:
 Nested projects are shown directly below their parent and indented by two
 spaces per level.
 
-Tasks are grouped by label by default. `Shift+M` toggles grouping and `Shift+N` toggles
+Tasks are grouped by label by default. `L` toggles grouping and `A` toggles
 alphabetical ordering. The modes are independent, so enabling both sorts tasks
 alphabetically inside alphabetical label groups. Disabling both restores
 Todoist order. Both choices are remembered across application restarts.
@@ -124,12 +124,19 @@ selected in the focused project pane, where it opens the rename editor.
 
 ## Editing tasks
 
-Press `q` or `a` to add a task. A compact Neovim window opens in Insert mode
-and accepts a Todoist Quick Add expression:
+Press `a` to add a task at the top or `q` to add it at the bottom when using
+Todoist order. With label grouping enabled, this means the top or bottom of the
+task's label group. Alphabetical ordering and grouped virtual views determine
+placement themselves. Both keys open a compact Neovim window in Insert mode
+that accepts a Todoist Quick Add expression:
 
 ```text
 Buy milk tomorrow at 9 #Shopping @errands p1
 ```
+
+The first line is the Quick Add expression. Move down to the precreated second
+line to enter the task description; any further lines also remain part of the
+description.
 
 From a filter, Inbox is the fallback project unless the expression names
 another project. The full expression is queued unchanged when offline.
@@ -147,10 +154,16 @@ takes precedence over that fallback.
 Press `e` to edit a task. The first line accepts Todoist Quick Add syntax, so
 dates, projects, labels, and priorities can be written naturally while editing.
 Metadata not mentioned in the expression is preserved. Remaining lines are the
-task description. Edits are stored offline and parsed by Todoist during the
+task description. When a task has no description yet, an empty description
+line is already present: press the Down arrow in Insert mode, type the
+description, and press `Enter` to save. Edits are stored offline and parsed by Todoist during the
 next synchronization. Press `t` from the task list or an open task-details
 window to edit only the due date using Todoist natural language, such as `tod`,
 `tomorrow at 9`, or `every Friday`.
+
+Press `T` to remove the selected task's due date immediately. Press `D` to
+delete the selected task and its subtasks. Deletion participates in undo and
+redo, so `u` restores the deleted task tree and `Ctrl+R` deletes it again.
 
 All editors start in Insert mode with the cursor at the useful editing
 position. `Enter` saves in Insert or Normal mode; any other successful write
@@ -200,10 +213,16 @@ Inbox, Today, Upcoming, and filters cannot be renamed. Press `Shift+P` to add a
 new root-level personal project. Project creation and renaming are applied
 locally first, remain available offline, and synchronize in the background.
 
-Press `Ctrl+j` or `Ctrl+k` to move a project down or up among projects with the
+Press `Shift+J` or `Shift+K` to move a project down or up among projects with the
 same parent and in the same todoist-tui group. The complete sibling order is
 kept locally, including currently hidden projects, and queued for Todoist so
 the resulting order also appears in other Todoist clients.
+
+With the task pane focused, the same keys move an active task down or up among
+eligible siblings and synchronize that order to Todoist. Label-grouped root
+tasks remain within their label group, and Upcoming root tasks remain within
+their date group. Disable alphabetical sorting before manually reordering
+tasks, since alphabetical mode determines their visible order.
 
 ## Default keybindings
 
@@ -214,8 +233,6 @@ window with `j`/`k` (or the configured down/up bindings).
 | --- | --- |
 | `j` / `Down` | Move down |
 | `k` / `Up` | Move up |
-| `Shift+J` | Move down five projects or tasks |
-| `Shift+K` | Move up five projects or tasks |
 | `h` / `l` | Focus projects / tasks |
 | `Enter` | Enter the task pane or show task details |
 | `p` | Search all projects, including hidden projects, and jump to one |
@@ -224,20 +241,24 @@ window with `j`/`k` (or the configured down/up bindings).
 | `Ctrl+F` | Add a personal filter |
 | `r` in project pane | Rename the selected project |
 | `Shift+P` | Add a personal project |
-| `Ctrl+j` / `Ctrl+k` | Move the selected project down/up within its group and sync the order |
+| `Shift+J` / `Shift+K` | Move the selected project or task down/up among eligible siblings and sync the order |
 | `y` | Copy the selected project/filter or task title to the clipboard |
-| `q` / `a` | Add a task with Quick Add |
+| `a` | Add a task at the top with Quick Add when using normal task order |
+| `q` | Add a task at the bottom with Quick Add when using normal task order |
 | `c` | Add a subtask to the selected task |
 | `e` | Edit title and description |
 | `d` | Complete or reopen the selected task |
+| `D` | Delete the selected task and its subtasks |
 | `u` | Undo the last task change |
 | `Ctrl+R` | Redo the last undone change |
 | `t` | Edit the due date |
+| `T` | Remove the due date |
+| `E` | Show the complete synchronization error |
 | `v` | Move the task to another project |
 | `>` / `<` | Indent beneath the preceding sibling / promote one level |
 | `@` | Search and toggle a label |
-| `Shift+M` | Toggle label grouping |
-| `Shift+N` | Toggle alphabetical ordering |
+| `L` | Toggle label grouping |
+| `A` | Toggle alphabetical ordering |
 | `Shift+C` | Show/hide completed tasks |
 | `gg` / `Shift+G` | First / last row |
 | `g` + at least two characters | Jump to a project or favorite filter |
@@ -270,7 +291,8 @@ change; omitted actions retain their defaults:
 [keybindings]
 down = ["j", "down", "ctrl+n"]
 up = ["k", "up", "ctrl+p"]
-add_task = ["a"]
+add_task_top = ["a"]
+add_task_bottom = ["q"]
 quit = ["ctrl+c"]
 ```
 

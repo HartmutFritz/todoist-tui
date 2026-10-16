@@ -90,9 +90,11 @@ impl TodoistClient {
         match &entry.operation {
             Operation::QuickAdd {
                 expression,
+                description,
                 project_id,
                 project_name,
                 parent_id,
+                target_order,
             } => {
                 let is_inbox = store
                     .project(project_id)?
@@ -132,6 +134,22 @@ impl TodoistClient {
                     )?;
                     task.project_id.clone_from(project_id);
                     task.parent_id = Some(resolved_parent);
+                }
+                if let Some(target_order) = target_order {
+                    self.command_with_uuid(
+                        &uuid::Uuid::new_v4().to_string(),
+                        "item_reorder",
+                        json!({"items": [{"id": task.id, "child_order": target_order}]}),
+                    )?;
+                    task.child_order = *target_order;
+                }
+                if !description.is_empty() {
+                    self.command_with_uuid(
+                        &uuid::Uuid::new_v4().to_string(),
+                        "item_update",
+                        json!({"id": task.id, "description": description}),
+                    )?;
+                    task.description.clone_from(description);
                 }
                 store.replace_task_id(&entry.entity_id, &task)?;
             }
@@ -173,6 +191,11 @@ impl TodoistClient {
                 json!({
                     "id": entry.entity_id, "labels": labels
                 }),
+            )?,
+            Operation::UpdatePriority { priority } => self.command(
+                entry,
+                "item_update",
+                json!({"id": entry.entity_id, "priority": priority}),
             )?,
             Operation::MoveTask { project_id } => self.command(
                 entry,
@@ -241,6 +264,9 @@ impl TodoistClient {
             )?,
             Operation::ReorderProjects { projects } => {
                 self.command(entry, "project_reorder", project_reorder_args(projects))?
+            }
+            Operation::ReorderTasks { tasks } => {
+                self.command(entry, "item_reorder", json!({"items": tasks}))?
             }
         }
         store.finish_outbox(entry.seq)?;

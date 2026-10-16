@@ -796,6 +796,62 @@ mod tests {
     }
 
     #[test]
+    fn task_edit_can_fill_the_precreated_description_line() {
+        let mut editor = EmbeddedEditor::open_inner(
+            EditorPurpose::Edit,
+            Some("task-1".into()),
+            "milk\n\n",
+            8,
+            50,
+            false,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        editor
+            .send_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        for character in "two bottles".chars() {
+            editor
+                .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        editor
+            .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let result = wait_for_result(&mut editor);
+        assert!(result.accepted);
+        assert_eq!(result.text.trim(), "milk\ntwo bottles");
+    }
+
+    #[test]
+    fn task_add_can_fill_the_precreated_description_line() {
+        let mut editor =
+            EmbeddedEditor::open_inner(EditorPurpose::Add, None, "\n\n", 8, 50, false).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        for character in "milk".chars() {
+            editor
+                .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        editor
+            .send_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        for character in "two bottles".chars() {
+            editor
+                .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        editor
+            .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let result = wait_for_result(&mut editor);
+        assert!(result.accepted);
+        assert_eq!(result.text.trim(), "milk\ntwo bottles");
+    }
+
+    #[test]
     fn enter_in_normal_mode_accepts_a_task_edit() {
         let mut editor = EmbeddedEditor::open_inner(
             EditorPurpose::Edit,

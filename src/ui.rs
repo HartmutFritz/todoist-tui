@@ -487,11 +487,16 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
     let config_path = app.config_path.to_string_lossy().into_owned();
     match app.overlay.as_mut() {
         Some(Overlay::Help { scroll }) => draw_help(frame, keybindings, &config_path, scroll),
+        Some(Overlay::ErrorDetails { message, scroll }) => {
+            draw_error_details(frame, message, *scroll)
+        }
         Some(Overlay::Details(task)) => draw_details(
             frame,
             task,
             keybindings.display(Action::EditTask),
             keybindings.display(Action::EditDue),
+            keybindings.display(Action::RemoveDue),
+            keybindings.display(Action::DeleteTask),
         ),
         Some(Overlay::FilterDetails(filter)) => {
             draw_filter_details(frame, filter, keybindings.display(Action::EditTask))
@@ -557,6 +562,20 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
         }
         None => {}
     }
+}
+
+fn draw_error_details(frame: &mut Frame<'_>, message: &str, scroll: usize) {
+    let area = centered(frame.area(), 86, 16, 96, 82);
+    let block = panel(" Error details — j/k scroll; Enter/Esc/q closes ", true)
+        .padding(Padding::new(2, 2, 1, 1));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(message)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .block(block),
+        area,
+    );
 }
 
 fn editor_cell_style(cell: EditorCellStyle) -> Style {
@@ -653,7 +672,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
                 keys.display(Action::MoveProjectDown),
                 keys.display(Action::MoveProjectUp)
             ),
-            "move selected project down / up in its group",
+            "move selected project or task down / up among siblings",
         ),
         (
             keys.display(Action::CopyTitle).into(),
@@ -672,8 +691,12 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
             "jump after at least two name characters",
         ),
         (
-            keys.display(Action::AddTask).into(),
-            "add task with Quick Add in Neovim",
+            keys.display(Action::AddTaskTop).into(),
+            "add task at top in manual order",
+        ),
+        (
+            keys.display(Action::AddTaskBottom).into(),
+            "add task at bottom in manual order",
         ),
         (
             keys.display(Action::AddChildTask).into(),
@@ -686,6 +709,10 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         (
             keys.display(Action::CompleteTask).into(),
             "complete / reopen selected task",
+        ),
+        (
+            keys.display(Action::DeleteTask).into(),
+            "delete selected task and its subtasks",
         ),
         (keys.display(Action::Undo).into(), "undo last task change"),
         (keys.display(Action::Redo).into(), "redo last undone change"),
@@ -706,6 +733,10 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
             "edit natural-language due date",
         ),
         (
+            keys.display(Action::RemoveDue).into(),
+            "remove task due date",
+        ),
+        (
             keys.display(Action::EditLabels).into(),
             "search and toggle a task label",
         ),
@@ -724,6 +755,10 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         (
             keys.display(Action::Sync).into(),
             "synchronize in background",
+        ),
+        (
+            keys.display(Action::ShowError).into(),
+            "show complete synchronization error",
         ),
         (
             keys.display(Action::ToggleHiddenProjects).into(),
@@ -760,6 +795,10 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         let action = Action::for_space(space as u8).expect("space range is valid");
         help.push((keys.display(action).into(), meaning));
     }
+    help.retain(|(key, _)| {
+        key.chars()
+            .any(|character| character != '—' && character != '/' && !character.is_whitespace())
+    });
     let mut lines = help
         .into_iter()
         .map(|(key, meaning)| {
@@ -819,7 +858,14 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
     );
 }
 
-fn draw_details(frame: &mut Frame<'_>, task: &Task, edit_key: &str, due_key: &str) {
+fn draw_details(
+    frame: &mut Frame<'_>,
+    task: &Task,
+    edit_key: &str,
+    due_key: &str,
+    remove_due_key: &str,
+    delete_key: &str,
+) {
     let area = centered(frame.area(), 72, 18, 94, 82);
     let due = task.due.as_ref().and_then(|d| d.display()).unwrap_or("—");
     let labels = if task.labels.is_empty() {
@@ -870,7 +916,9 @@ fn draw_details(frame: &mut Frame<'_>, task: &Task, edit_key: &str, due_key: &st
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             panel(
-                format!(" Task details — {edit_key} edits; {due_key} changes date "),
+                format!(
+                    " Task details — {edit_key} edit; {due_key} date; {remove_due_key} clear; {delete_key} delete "
+                ),
                 true,
             )
             .padding(Padding::new(2, 2, 1, 1)),
