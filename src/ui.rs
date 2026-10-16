@@ -530,10 +530,11 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
         }) => draw_filter_picker(frame, query, *cursor, *mode, filters),
         Some(Overlay::Editor(editor)) => {
             let area = centered(frame.area(), 82, 18, 94, 70);
-            let title = if editor.edits_filter() {
-                " Neovim — arrows change fields; Enter accepts; :cq cancels "
-            } else {
-                " Neovim — Enter accepts; :cq cancels "
+            let title = match (editor.edits_filter(), editor.save_on_enter_in_insert()) {
+                (true, true) => " Neovim — arrows: fields; Enter saves; :cq cancels ",
+                (true, false) => " Neovim — arrows: fields; Normal Enter saves; :cq cancels ",
+                (false, true) => " Neovim — Enter saves; Shift+Enter newline; :cq cancels ",
+                (false, false) => " Neovim — Normal Enter saves; Shift+Enter newline; :cq cancels ",
             };
             let inner = panel(title, true).inner(area);
             editor.resize(inner.height, inner.width);
@@ -867,7 +868,11 @@ fn draw_details(
     delete_key: &str,
 ) {
     let area = centered(frame.area(), 72, 18, 94, 82);
-    let due = task.due.as_ref().and_then(|d| d.display()).unwrap_or("—");
+    let due = task
+        .due
+        .as_ref()
+        .and_then(|d| d.readable_display())
+        .unwrap_or_else(|| "—".into());
     let labels = if task.labels.is_empty() {
         "—".into()
     } else {

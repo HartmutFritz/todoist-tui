@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     clipboard,
-    editor::{EditorCursorShape, EditorPurpose, EditorResult, EmbeddedEditor},
+    editor::{EditorCursorShape, EditorOptions, EditorPurpose, EditorResult, EmbeddedEditor},
     keymap::{Action, KeyBindings},
     model::{Filter, NavId, NavRow, Project, Task},
     store::{Store, TaskViewPreferences},
@@ -137,8 +137,8 @@ enum AddPlacement {
 #[derive(Debug, Clone)]
 enum HistoryEntry {
     Change {
-        before: Box<Task>,
-        after: Box<Task>,
+        before: Vec<Task>,
+        after: Vec<Task>,
         action: &'static str,
     },
     Add {
@@ -228,7 +228,7 @@ pub struct App {
     sync_follow_up_requested: bool,
     transient_status: Option<(String, Instant)>,
     persistent_status: Option<String>,
-    visual_line_navigation: bool,
+    editor_options: EditorOptions,
 }
 
 impl App {
@@ -287,7 +287,7 @@ impl App {
             sync_follow_up_requested: false,
             transient_status: None,
             persistent_status,
-            visual_line_navigation: true,
+            editor_options: EditorOptions::default(),
         };
         app.force_tasks()?;
         if has_token && app.start_sync_run() {
@@ -298,8 +298,8 @@ impl App {
         Ok(app)
     }
 
-    pub fn set_editor_visual_line_navigation(&mut self, enabled: bool) {
-        self.visual_line_navigation = enabled;
+    pub fn set_editor_options(&mut self, options: EditorOptions) {
+        self.editor_options = options;
     }
 
     pub fn selected_nav(&self) -> Option<&NavId> {
@@ -335,7 +335,8 @@ impl App {
         }
         if self.sync.has_token()
             && !self.sync.is_running()
-            && self.last_sync_started.elapsed() >= SYNC_INTERVAL
+            && self.sync.retry_after().is_zero()
+            && (self.last_sync_started.elapsed() >= SYNC_INTERVAL || self.sync.retry_due())
         {
             // Scheduled refreshes are deliberately silent. Their results are
             // rendered when they arrive, while failures remain visible.
@@ -392,7 +393,13 @@ impl App {
             timeout = timeout.min(deadline.saturating_duration_since(now));
         }
         if self.sync.has_token() && !self.sync.is_running() {
-            timeout = timeout.min(SYNC_INTERVAL.saturating_sub(self.last_sync_started.elapsed()));
+            let retry = self.sync.retry_after();
+            let scheduled = SYNC_INTERVAL.saturating_sub(self.last_sync_started.elapsed());
+            timeout = timeout.min(if retry.is_zero() {
+                scheduled
+            } else {
+                retry.max(scheduled)
+            });
         }
         timeout
     }
@@ -1181,7 +1188,7 @@ impl App {
             "\n\nfavorite = true",
             10,
             76,
-            self.visual_line_navigation,
+            self.editor_options,
         )?));
         Ok(())
     }
@@ -1195,7 +1202,7 @@ impl App {
             "",
             8,
             70,
-            self.visual_line_navigation,
+            self.editor_options,
         )?));
         Ok(())
     }
@@ -1221,7 +1228,7 @@ impl App {
             &project.name,
             8,
             70,
-            self.visual_line_navigation,
+            self.editor_options,
         )?));
         Ok(())
     }
@@ -1282,7 +1289,7 @@ impl App {
             "\n\n",
             12,
             70,
-            self.visual_line_navigation,
+            self.editor_options,
         )?));
         Ok(())
     }
@@ -1307,7 +1314,7 @@ impl App {
             "\n\n",
             12,
             70,
-            self.visual_line_navigation,
+            self.editor_options,
         )?;
         self.pending_add_target = Some(project);
         self.pending_add_placement = AddPlacement::Natural;
@@ -1338,7 +1345,7 @@ impl App {
             "\n\n",
             12,
             70,
-            self.visual_line_navigation,
+            self.editor_options,
         )?));
         Ok(())
     }
@@ -1378,7 +1385,7 @@ impl App {
             &initial,
             16,
             76,
-            self.visual_line_navigation,
+            self.editor_options,
         )?));
         Ok(())
     }
@@ -1404,7 +1411,7 @@ impl App {
             &initial,
             10,
             76,
-            self.visual_line_navigation,
+            self.editor_options,
         )?));
         Ok(())
     }
@@ -1441,7 +1448,7 @@ impl App {
             &initial,
             8,
             64,
-            self.visual_line_navigation,
+            self.editor_options,
         )?));
         Ok(())
     }
@@ -1517,8 +1524,11 @@ impl App {
             .store
             .task(task_id)?
             .context("moved task no longer exists")?;
+        let tree_before = self
+            .store
+            .tasks_for_view(&NavId::Project(before.project_id.clone()), true)?;
         self.store.move_task(task_id, &project.id)?;
-        self.record_task_change(before, task_id, "task move")?;
+        self.record_tree_change(tree_before, "task move", task_id)?;
         self.refresh_nav()?;
         if let Some(nav) = nav {
             match &nav {
@@ -1818,20 +1828,23 @@ impl App {
         let before = self.tasks[index].clone();
         let id = before.id.clone();
         let completed = !before.checked;
+        let tree_before = self
+            .store
+            .tasks_for_view(&NavId::Project(before.project_id.clone()), true)?;
         let task_below = if completed {
             None
         } else {
             self.tasks.get(index + 1).map(|task| task.id.clone())
         };
         self.store.set_task_completed(&id, completed)?;
-        self.record_task_change(
-            before,
-            &id,
+        self.record_tree_change(
+            tree_before,
             if completed {
                 "task completion"
             } else {
                 "task reopening"
             },
+            &id,
         )?;
         let nav = self.selected_nav().cloned();
         self.refresh_nav()?;
@@ -1946,8 +1959,38 @@ impl App {
             .context("changed task no longer exists")?;
         if before != after {
             self.record_history(HistoryEntry::Change {
-                before: Box::new(before),
-                after: Box::new(after),
+                before: vec![before],
+                after: vec![after],
+                action,
+            });
+        }
+        Ok(())
+    }
+
+    fn record_tree_change(
+        &mut self,
+        mut snapshots: Vec<Task>,
+        action: &'static str,
+        root_id: &str,
+    ) -> Result<()> {
+        snapshots.sort_by_key(|task| task.id != root_id);
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for snapshot in snapshots {
+            if let Some(current) = self.store.task(&snapshot.id)?
+                && (current != snapshot
+                    || (snapshot.id == root_id
+                        && action == "task completion"
+                        && snapshot.due.as_ref().is_some_and(|due| due.is_recurring)))
+            {
+                before.push(snapshot);
+                after.push(current);
+            }
+        }
+        if !before.is_empty() {
+            self.record_history(HistoryEntry::Change {
+                before,
+                after,
                 action,
             });
         }
@@ -2015,10 +2058,31 @@ impl App {
 
     fn apply_history_entry(&self, entry: &mut HistoryEntry, undo: bool) -> Result<Option<String>> {
         match entry {
-            HistoryEntry::Change { before, after, .. } => self
-                .store
-                .apply_task_snapshot(if undo { before } else { after })
-                .map(Some),
+            HistoryEntry::Change {
+                before,
+                after,
+                action,
+            } => {
+                let targets = if undo { before } else { after };
+                if !undo
+                    && *action == "task edit"
+                    && let Some(target) = targets.first()
+                {
+                    self.store
+                        .edit_task(&target.id, &target.content, &target.description)?;
+                    return Ok(Some(
+                        self.store
+                            .task(&target.id)?
+                            .context("edited task no longer exists")?
+                            .id,
+                    ));
+                }
+                let ids = self.store.apply_task_snapshots(
+                    targets,
+                    (*action == "task completion").then_some(undo),
+                )?;
+                Ok(ids.first().cloned())
+            }
             HistoryEntry::Add { task_id, .. } if undo => {
                 self.store.delete_task(task_id)?;
                 Ok(None)
@@ -2323,6 +2387,13 @@ impl App {
             self.sync_status = SyncStatus::Syncing;
             self.sync_issue = None;
             self.set_persistent_status("Synchronization is already in progress");
+        } else if !self.sync.retry_after().is_zero() {
+            self.status = format!(
+                "Retrying synchronization in {} seconds",
+                self.sync.retry_after().as_secs().saturating_add(1)
+            );
+        } else if self.store.retry_failed_operations().is_err() {
+            self.status = "Could not prepare synchronization retry".into();
         } else if self.start_sync_run() {
             self.sync_status = SyncStatus::Syncing;
             self.sync_issue = None;
@@ -2371,6 +2442,11 @@ impl App {
 
     fn handle_sync_event(&mut self, event: SyncEvent) -> Result<()> {
         match event {
+            SyncEvent::AuxiliaryWarning { message } => {
+                self.sync_issue = Some(message);
+                self.sync_status = SyncStatus::Error;
+                self.set_persistent_status("Some cached views are stale");
+            }
             SyncEvent::Started if self.scheduled_sync_running => {}
             SyncEvent::Started => {
                 self.sync_status = SyncStatus::Syncing;
@@ -2378,11 +2454,14 @@ impl App {
                 self.set_persistent_status("Syncing…");
             }
             SyncEvent::Finished { pending } => {
+                let pending = pending.max(self.store.outbox_len()?);
                 let was_scheduled = self.scheduled_sync_running;
                 self.scheduled_sync_running = false;
                 self.sync_follow_up_requested = false;
                 self.sync_issue = None;
-                if pending == 0 {
+                if self.sync.is_running() {
+                    self.sync_status = SyncStatus::Syncing;
+                } else if pending == 0 {
                     let recovered = self.sync_status != SyncStatus::Synced;
                     self.sync_status = SyncStatus::Synced;
                     if !was_scheduled {
@@ -2401,6 +2480,15 @@ impl App {
                 }
                 self.refresh_nav()?;
                 self.force_tasks()?;
+                if let Some(warning) = self
+                    .store
+                    .meta("auxiliary_warning")?
+                    .filter(|warning| !warning.is_empty())
+                {
+                    self.sync_issue = Some(warning);
+                    self.sync_status = SyncStatus::Error;
+                    self.set_persistent_status("Some cached views are stale");
+                }
             }
             SyncEvent::Failed { kind, message } => {
                 self.scheduled_sync_running = false;
@@ -2454,6 +2542,21 @@ impl App {
         self.persistent_status = Some(self.status.clone());
         self.transient_status = None;
     }
+
+    pub fn report_runtime_error(&mut self, error: anyhow::Error) {
+        // A failed editor or local command must not tear down the terminal.
+        // The durable outbox is left intact and a later retry can recover.
+        if self.editor_is_open() {
+            self.overlay = None;
+        }
+        self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
+        self.pending_render = None;
+        let message = format!("Local error: {error:#}");
+        self.sync_issue = Some(message.clone());
+        self.sync_status = SyncStatus::Error;
+        self.set_persistent_status(message);
+    }
 }
 
 fn push_history(stack: &mut Vec<HistoryEntry>, entry: HistoryEntry) {
@@ -2467,25 +2570,17 @@ fn remap_history_task_ids(entries: &mut [HistoryEntry], old_ids: &[String], new_
     for entry in entries {
         match entry {
             HistoryEntry::Change { before, after, .. } => {
-                if old_ids.contains(&before.id) {
-                    before.id = new_id.to_owned();
-                }
-                if old_ids.contains(&after.id) {
-                    after.id = new_id.to_owned();
-                }
-                if before
-                    .parent_id
-                    .as_ref()
-                    .is_some_and(|parent| old_ids.contains(parent))
-                {
-                    before.parent_id = Some(new_id.to_owned());
-                }
-                if after
-                    .parent_id
-                    .as_ref()
-                    .is_some_and(|parent| old_ids.contains(parent))
-                {
-                    after.parent_id = Some(new_id.to_owned());
+                for task in before.iter_mut().chain(after.iter_mut()) {
+                    if old_ids.contains(&task.id) {
+                        task.id = new_id.to_owned();
+                    }
+                    if task
+                        .parent_id
+                        .as_ref()
+                        .is_some_and(|parent| old_ids.contains(parent))
+                    {
+                        task.parent_id = Some(new_id.to_owned());
+                    }
                 }
             }
             HistoryEntry::Add {
@@ -3497,6 +3592,197 @@ mod tests {
             .unwrap();
         assert!(app.tasks.is_empty());
         assert_eq!(app.status, "Redid task deletion · pending sync");
+    }
+
+    #[test]
+    fn completion_and_project_move_undo_restore_every_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let inbox = store.project("inbox").unwrap().unwrap();
+        let parent = store.add_task("Parent", &inbox).unwrap();
+        let child = store.add_child_task("Child", &inbox, &parent).unwrap();
+        let grandchild = store.add_child_task("Grandchild", &inbox, &child).unwrap();
+        let destination = store.add_project("Destination").unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.focus = Focus::Tasks;
+        app.set_task_cursor(app.tasks.iter().position(|task| task.id == parent).unwrap());
+        app.complete().unwrap();
+        for id in [&parent, &child, &grandchild] {
+            assert!(store.task(id).unwrap().unwrap().checked);
+        }
+        app.undo().unwrap();
+        for id in [&parent, &child, &grandchild] {
+            assert!(!store.task(id).unwrap().unwrap().checked);
+        }
+        app.apply_task_move(
+            &parent,
+            &ProjectPickerItem {
+                id: destination.clone(),
+                name: "Destination".into(),
+                search_name: "destination".into(),
+            },
+        )
+        .unwrap();
+        for id in [&parent, &child, &grandchild] {
+            assert_eq!(store.task(id).unwrap().unwrap().project_id, destination);
+        }
+        app.undo().unwrap();
+        for id in [&parent, &child, &grandchild] {
+            assert_eq!(store.task(id).unwrap().unwrap().project_id, inbox.id);
+        }
+        assert_eq!(
+            store
+                .task(&grandchild)
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some(child.as_str())
+        );
+        app.redo().unwrap();
+        for id in [&parent, &child, &grandchild] {
+            assert_eq!(store.task(id).unwrap().unwrap().project_id, destination);
+        }
+    }
+
+    #[test]
+    fn earlier_edit_history_survives_synchronized_deletion_and_redo_reparses_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let remote = serde_json::from_value(
+            serde_json::json!({"id":"task","project_id":"inbox","content":"Original"}),
+        )
+        .unwrap();
+        store.merge_remote(&[], &[remote], &[], &[]).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.focus = Focus::Tasks;
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::Edit,
+            task_id: Some("task".into()),
+            accepted: true,
+            text: "Changed p1".into(),
+        })
+        .unwrap();
+        let sent = store.claim_next_outbox().unwrap().unwrap();
+        let mut parsed = store.task("task").unwrap().unwrap();
+        parsed.content = "Changed".into();
+        parsed.priority = 4;
+        store.apply_synced_task_edit(&parsed, sent.seq).unwrap();
+        store.finish_outbox(sent.seq).unwrap();
+        app.force_tasks().unwrap();
+        app.delete_task("task").unwrap();
+        let deleted = store.claim_next_outbox().unwrap().unwrap();
+        store.finish_outbox(deleted.seq).unwrap();
+        app.undo().unwrap();
+        let restored = store.task("task").unwrap().unwrap();
+        assert_ne!(restored.id, "task");
+        app.undo().unwrap();
+        let current = store.task("task").unwrap().unwrap();
+        assert_eq!(current.content, "Original");
+        assert_eq!(current.priority, 1);
+        assert!(
+            store
+                .outbox()
+                .unwrap()
+                .iter()
+                .any(|entry| matches!(entry.operation, Operation::UpdatePriority { priority: 1 }))
+        );
+        app.redo().unwrap();
+        assert!(store.outbox().unwrap().iter().any(|entry| matches!(&entry.operation, Operation::QuickEdit { expression, .. } if expression == "Changed p1")));
+    }
+
+    #[test]
+    fn recurring_completion_stays_active_and_redo_does_not_advance_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let today = Local::now().date_naive();
+        let remote = serde_json::from_value(serde_json::json!({"id":"task","project_id":"inbox","content":"Daily","due":{"date":today.format("%F").to_string(),"string":"every day","is_recurring":true}})).unwrap();
+        store.merge_remote(&[], &[remote], &[], &[]).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.focus = Focus::Tasks;
+        app.complete().unwrap();
+        let next = store.task("task").unwrap().unwrap();
+        assert!(!next.checked);
+        assert_eq!(next.due.as_ref().unwrap().concrete_date(), today.succ_opt());
+        let sent = store.claim_next_outbox().unwrap().unwrap();
+        store.finish_outbox(sent.seq).unwrap();
+        app.undo().unwrap();
+        assert_eq!(
+            store
+                .task("task")
+                .unwrap()
+                .unwrap()
+                .due
+                .unwrap()
+                .concrete_date(),
+            Some(today)
+        );
+        app.redo().unwrap();
+        assert_eq!(
+            store
+                .task("task")
+                .unwrap()
+                .unwrap()
+                .due
+                .unwrap()
+                .concrete_date(),
+            today.succ_opt()
+        );
+        let queued = store.outbox().unwrap();
+        assert!(
+            queued
+                .iter()
+                .any(|entry| matches!(entry.operation, Operation::RestoreRecurring { .. }))
+        );
+        assert!(matches!(
+            queued.last().unwrap().operation,
+            Operation::CompleteTask
+        ));
+        assert!(!queued.iter().any(|entry| matches!(&entry.operation, Operation::RestoreDue { due: Some(due) } if due.concrete_date() == today.succ_opt())));
+    }
+
+    #[test]
+    fn local_runtime_errors_leave_navigation_and_quitting_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.report_runtime_error(anyhow::anyhow!("could not start Neovim"));
+        assert_eq!(app.sync_status, SyncStatus::Error);
+        assert!(app.sync_issue.as_deref().unwrap().contains("Neovim"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_nav(), Some(&NavId::Today));
+        app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.quit);
     }
 
     #[test]

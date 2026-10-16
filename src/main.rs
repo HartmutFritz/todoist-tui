@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     let store = Store::open(&config.database_path)?;
     let sync = SyncManager::new(store.clone(), config.token)?;
     let mut app = App::new(store, sync, config.keybindings, config.config_path)?;
-    app.set_editor_visual_line_navigation(config.visual_line_navigation);
+    app.set_editor_options(config.editor);
 
     enable_raw_mode()?;
     // Install the guard immediately after raw mode succeeds so every later
@@ -92,7 +92,9 @@ fn main() -> Result<()> {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    app.handle_key(key)?;
+                    if let Err(error) = app.handle_key(key) {
+                        app.report_runtime_error(error);
+                    }
                     redraw = true;
                 }
                 Event::Resize(_, _) => {
@@ -102,7 +104,13 @@ fn main() -> Result<()> {
                 _ => {}
             }
         }
-        redraw |= app.tick()?;
+        match app.tick() {
+            Ok(changed) => redraw |= changed,
+            Err(error) => {
+                app.report_runtime_error(error);
+                redraw = true;
+            }
+        }
     }
     Ok(())
 }

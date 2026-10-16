@@ -1,4 +1,4 @@
-use chrono::{Datelike, NaiveDate};
+use chrono::{DateTime, Datelike, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -69,10 +69,7 @@ impl Due {
         if value.trim().eq_ignore_ascii_case("tod") || value.trim().eq_ignore_ascii_case("today") {
             return Some("Tod".to_owned());
         }
-        let Some(date_text) = value.get(..10) else {
-            return Some(value.to_owned());
-        };
-        let Ok(date) = NaiveDate::parse_from_str(date_text, "%Y-%m-%d") else {
+        let Some(date) = self.concrete_date() else {
             return Some(value.to_owned());
         };
         let days_from_today = date.signed_duration_since(today).num_days();
@@ -85,7 +82,10 @@ impl Due {
         } else {
             date.format("%b %-d").to_string()
         };
-        if let Some(time) = value.get(11..16) {
+        let local = self
+            .local_datetime()
+            .map(|date| date.format("%H:%M").to_string());
+        if let Some(time) = local.as_deref().or_else(|| value.get(11..16)) {
             formatted.push(' ');
             formatted.push_str(time);
         }
@@ -93,12 +93,90 @@ impl Due {
     }
 
     pub(crate) fn concrete_date(&self) -> Option<NaiveDate> {
+        if let Some(date) = self.local_datetime() {
+            return Some(date.date_naive());
+        }
         let value = self.display()?;
         NaiveDate::parse_from_str(value.get(..10)?, "%Y-%m-%d").ok()
     }
+
+    fn local_datetime(&self) -> Option<DateTime<Local>> {
+        DateTime::parse_from_rfc3339(self.display()?)
+            .ok()
+            .map(|date| date.with_timezone(&Local))
+    }
+
+    pub(crate) fn readable_display(&self) -> Option<String> {
+        self.local_datetime()
+            .map(|date| date.format("%Y-%m-%d %H:%M %:z").to_string())
+            .or_else(|| self.display().map(str::to_owned))
+    }
+
+    pub(crate) fn next_occurrence(&self) -> Self {
+        let mut next = self.clone();
+        let Some(date) = self.concrete_date() else {
+            return next;
+        };
+        // Timed rules require Todoist's recurrence timezone/DST policy. Keep
+        // the task active with its cached due value until the background reply
+        // confirms that schedule, rather than guessing by adding 24 UTC hours.
+        if self.display().is_some_and(|value| value.len() > 10) {
+            return next;
+        }
+        let expression = self.string.as_deref().unwrap_or_default().to_lowercase();
+        let from = date.max(Local::now().date_naive());
+        let date = if matches!(expression.as_str(), "every day" | "daily") {
+            from.succ_opt()
+        } else if matches!(expression.as_str(), "every week" | "weekly") {
+            let weeks = (from.signed_duration_since(date).num_days() / 7 + 1).max(1);
+            date.checked_add_signed(chrono::Duration::weeks(weeks))
+        } else if matches!(expression.as_str(), "every month" | "monthly") {
+            next_calendar_occurrence(date, from, 1)
+        } else if matches!(expression.as_str(), "every year" | "yearly") {
+            next_calendar_occurrence(date, from, 12)
+        } else {
+            let weekdays = [
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+                "sunday",
+            ];
+            (1..=7)
+                .filter_map(|days| from.checked_add_signed(chrono::Duration::days(days)))
+                .find(|candidate| {
+                    expression.strip_prefix("every ").is_some_and(|value| {
+                        value == weekdays[candidate.weekday().num_days_from_monday() as usize]
+                            || (value == "weekday"
+                                && candidate.weekday().num_days_from_monday() < 5)
+                    })
+                })
+        };
+        if let Some(date) = date {
+            next.date = Some(date.format("%F").to_string());
+        }
+        next
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn next_calendar_occurrence(
+    anchor: NaiveDate,
+    after: NaiveDate,
+    interval: u32,
+) -> Option<NaiveDate> {
+    let mut months = interval;
+    loop {
+        let next = anchor.checked_add_months(chrono::Months::new(months))?;
+        if next > after {
+            return Some(next);
+        }
+        months = months.checked_add(interval)?;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub project_id: String,
@@ -170,6 +248,18 @@ pub enum Operation {
     UpdateDue {
         due_string: String,
     },
+    RestoreDue {
+        due: Option<Due>,
+    },
+    RestoreRecurring {
+        due: Due,
+    },
+    RestoreCompletion {
+        completed: bool,
+    },
+    UpdateAssignee {
+        responsible_uid: Option<String>,
+    },
     UpdateLabels {
         labels: Vec<String>,
     },
@@ -181,6 +271,8 @@ pub enum Operation {
     },
     MoveTaskParent {
         parent_id: Option<String>,
+        #[serde(default)]
+        project_id: String,
     },
     CompleteTask,
     UncompleteTask,
@@ -228,6 +320,7 @@ pub struct OutboxEntry {
     pub uuid: String,
     pub entity_id: String,
     pub operation: Operation,
+    pub checkpoint: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -253,7 +346,7 @@ pub struct RemoteProject {
     pub is_archived: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteTask {
     #[serde(deserialize_with = "string_id")]
     pub id: String,
@@ -357,6 +450,55 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_timezone_dates_use_the_same_local_day_and_time_for_the_same_instant() {
+        let first = Due {
+            date: Some("2026-10-17T00:30:00+14:00".into()),
+            ..Due::default()
+        };
+        let second = Due {
+            date: Some("2026-10-16T10:30:00Z".into()),
+            ..Due::default()
+        };
+        let expected = DateTime::parse_from_rfc3339("2026-10-16T10:30:00Z")
+            .unwrap()
+            .with_timezone(&Local);
+        assert_eq!(first.concrete_date(), Some(expected.date_naive()));
+        assert_eq!(second.concrete_date(), Some(expected.date_naive()));
+        let expected_suffix = format!("Tod {}", expected.format("%H:%M"));
+        assert_eq!(
+            first.list_display_on(expected.date_naive()).as_deref(),
+            Some(expected_suffix.as_str())
+        );
+        assert_eq!(
+            second.list_display_on(expected.date_naive()),
+            first.list_display_on(expected.date_naive())
+        );
+    }
+
+    #[test]
+    fn recurrence_previews_preserve_calendar_anchors_and_leave_timed_rules_to_todoist() {
+        let today = Local::now().date_naive();
+        let anchor = today - chrono::Duration::days(10);
+        let weekly = Due {
+            date: Some(anchor.format("%F").to_string()),
+            string: Some("every week".into()),
+            is_recurring: true,
+            ..Due::default()
+        };
+        let next = weekly.next_occurrence().concrete_date().unwrap();
+        assert!(next > today);
+        assert_eq!(next.weekday(), anchor.weekday());
+        let timed = Due {
+            date: Some("2026-10-24T08:00:00Z".into()),
+            string: Some("every day".into()),
+            timezone: Some("Europe/London".into()),
+            is_recurring: true,
+            ..Due::default()
+        };
+        assert_eq!(timed.next_occurrence(), timed);
+    }
 
     #[test]
     fn task_uses_alphabetically_first_label_for_group() {

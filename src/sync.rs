@@ -1,13 +1,17 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
+    time::{Duration, Instant},
 };
 
-use crate::{store::Store, todoist::TodoistClient};
+use crate::{
+    store::Store,
+    todoist::{TodoistClient, permanent_rejection, retry_delay},
+};
 
 #[derive(Debug, Clone)]
 pub enum SyncEvent {
@@ -17,6 +21,9 @@ pub enum SyncEvent {
     },
     Failed {
         kind: SyncFailureKind,
+        message: String,
+    },
+    AuxiliaryWarning {
         message: String,
     },
 }
@@ -33,6 +40,13 @@ pub struct SyncManager {
     running: Arc<AtomicBool>,
     tx: Sender<SyncEvent>,
     rx: Receiver<SyncEvent>,
+    retry: Arc<Mutex<RetryState>>,
+    auxiliary_due: Arc<Mutex<Instant>>,
+}
+
+struct RetryState {
+    attempts: u32,
+    deadline: Instant,
 }
 
 struct RunningGuard {
@@ -58,12 +72,28 @@ impl Drop for RunningGuard {
 impl SyncManager {
     pub fn new(store: Store, token: Option<String>) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel();
+        let retry_after = store
+            .meta("retry_not_before")?
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+            .map(|date| {
+                (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::ZERO)
+            })
+            .unwrap_or_default();
         Ok(Self {
             client: token.map(TodoistClient::new).transpose()?,
             store,
             running: Arc::new(AtomicBool::new(false)),
             tx,
             rx,
+            retry: Arc::new(Mutex::new(RetryState {
+                attempts: u32::from(!retry_after.is_zero()),
+                deadline: Instant::now()
+                    .checked_add(retry_after)
+                    .unwrap_or_else(Instant::now),
+            })),
+            auxiliary_due: Arc::new(Mutex::new(Instant::now())),
         })
     }
 
@@ -78,6 +108,9 @@ impl SyncManager {
         let Some(client) = self.client.clone() else {
             return false;
         };
+        if !self.retry_after().is_zero() {
+            return false;
+        }
         if self
             .running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -88,6 +121,8 @@ impl SyncManager {
         let store = self.store.clone();
         let running = self.running.clone();
         let tx = self.tx.clone();
+        let retry = self.retry.clone();
+        let auxiliary_due = self.auxiliary_due.clone();
         let _ = tx.send(SyncEvent::Started);
         let worker = thread::Builder::new()
             .name("todoist-tui-sync".into())
@@ -96,27 +131,90 @@ impl SyncManager {
                     running,
                     finished: false,
                 };
+                let mut queued_rejection = false;
                 let result = (|| -> anyhow::Result<usize> {
+                    client.verify_account(&store)?;
                     // Refetch after every operation because Quick Add replaces temporary IDs
                     // in all later entries atomically.
                     loop {
-                        let Some(entry) = store.next_outbox()? else {
+                        let Some(entry) = store.claim_next_outbox()? else {
                             break;
                         };
-                        client.push(&store, &entry)?;
+                        if let Err(error) = client.push(&store, &entry) {
+                            if permanent_rejection(&error) {
+                                store.fail_outbox(entry.seq, &format!("{error:#}"))?;
+                            } else {
+                                return Err(error);
+                            }
+                        }
                     }
                     client.pull(&store)?;
+                    if store.outbox_len()? == 0
+                        && Instant::now()
+                            >= *auxiliary_due
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                    {
+                        let warnings = client.pull_auxiliary(&store)?;
+                        store.set_meta("auxiliary_warning", &warnings.join("\n\n"))?;
+                        // Membership is cheap enough to refresh every minute;
+                        // immediate task pushes never wait for another history scan.
+                        *auxiliary_due
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) =
+                            Instant::now() + Duration::from_secs(60);
+                        if !warnings.is_empty() {
+                            let _ = tx.send(SyncEvent::AuxiliaryWarning {
+                                message: warnings.join("\n\n"),
+                            });
+                        }
+                    }
+                    if let Some(message) = store.outbox_error()? {
+                        queued_rejection = true;
+                        anyhow::bail!("{message}");
+                    }
                     store.outbox_len()
                 })();
-                running_guard.finish();
                 match result {
                     Ok(pending) => {
+                        let mut retry = retry.lock().unwrap_or_else(|error| error.into_inner());
+                        retry.attempts = 0;
+                        retry.deadline = Instant::now();
+                        let _ = store.set_meta("retry_not_before", "");
+                        drop(retry);
+                        running_guard.finish();
                         let _ = tx.send(SyncEvent::Finished { pending });
                     }
                     Err(error) => {
+                        // Rejections stay durable but do not delay a correction.
+                        // Transport/server failures back off without sleeping in
+                        // the worker, so local changes remain completely usable.
+                        if !queued_rejection {
+                            let mut retry = retry.lock().unwrap_or_else(|error| error.into_inner());
+                            retry.attempts = retry.attempts.saturating_add(1);
+                            let delay = retry_delay(&error).unwrap_or_else(|| {
+                                Duration::from_secs((2_u64.pow(retry.attempts.min(8))).min(300))
+                            });
+                            let delay = delay.max(Duration::from_secs(1));
+                            retry.deadline = Instant::now()
+                                .checked_add(delay)
+                                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
+                            let persisted_delay = chrono::Duration::from_std(delay)
+                                .unwrap_or(chrono::Duration::days(1));
+                            let until = chrono::Utc::now()
+                                .checked_add_signed(persisted_delay)
+                                .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(1));
+                            let _ = store.set_meta("retry_not_before", &until.to_rfc3339());
+                        } else {
+                            let mut retry = retry.lock().unwrap_or_else(|error| error.into_inner());
+                            retry.attempts = 0;
+                            retry.deadline = Instant::now();
+                            let _ = store.set_meta("retry_not_before", "");
+                        }
+                        running_guard.finish();
                         let _ = tx.send(SyncEvent::Failed {
                             kind: classify_failure(&error),
-                            message: error.to_string(),
+                            message: format!("{error:#}"),
                         });
                     }
                 }
@@ -134,6 +232,27 @@ impl SyncManager {
 
     pub fn next_event(&self) -> Option<SyncEvent> {
         self.rx.try_recv().ok()
+    }
+
+    pub fn retry_after(&self) -> Duration {
+        self.retry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .deadline
+            .saturating_duration_since(Instant::now())
+    }
+
+    pub fn retry_due(&self) -> bool {
+        let retry = self.retry.lock().unwrap_or_else(|error| error.into_inner());
+        retry.attempts > 0 && Instant::now() >= retry.deadline
+    }
+
+    #[cfg(test)]
+    pub fn with_test_client(store: Store, client: TodoistClient) -> Self {
+        let mut manager = Self::new(store, None).unwrap();
+        manager.client = Some(client);
+        *manager.auxiliary_due.lock().unwrap() = Instant::now() + Duration::from_secs(3600);
+        manager
     }
 }
 

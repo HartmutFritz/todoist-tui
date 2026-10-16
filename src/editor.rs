@@ -12,7 +12,24 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use serde::Deserialize;
 use tempfile::TempDir;
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EditorOptions {
+    pub visual_line_navigation: bool,
+    pub save_on_enter_in_insert: bool,
+}
+
+impl Default for EditorOptions {
+    fn default() -> Self {
+        Self {
+            visual_line_navigation: true,
+            save_on_enter_in_insert: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorPurpose {
@@ -52,6 +69,7 @@ pub struct EditorSpan {
 const DOUBLE_ESCAPE_INTERVAL: Duration = Duration::from_millis(400);
 const FALLBACK_VISUAL_DOWN: &str = "lua if vim.fn.maparg('j', 'n') == '' then vim.keymap.set('n', 'j', 'gj', { buffer = true, silent = true, noremap = true }) end";
 const FALLBACK_VISUAL_UP: &str = "lua if vim.fn.maparg('k', 'n') == '' then vim.keymap.set('n', 'k', 'gk', { buffer = true, silent = true, noremap = true }) end";
+const ENTER_MAPPINGS: &str = "lua vim.keymap.set('i', '<S-CR>', '<CR>', { buffer = true, silent = true }); vim.keymap.set('n', '<CR>', '<Cmd>write<CR>', { buffer = true, silent = true })";
 
 pub struct EmbeddedEditor {
     purpose: EditorPurpose,
@@ -66,6 +84,7 @@ pub struct EmbeddedEditor {
     last_escape: Option<Instant>,
     rows: u16,
     cols: u16,
+    options: EditorOptions,
 }
 
 #[derive(Debug)]
@@ -89,23 +108,19 @@ impl EmbeddedEditor {
         )
     }
 
+    pub fn save_on_enter_in_insert(&self) -> bool {
+        self.options.save_on_enter_in_insert
+    }
+
     pub fn open(
         purpose: EditorPurpose,
         task_id: Option<String>,
         initial: &str,
         rows: u16,
         cols: u16,
-        visual_line_navigation: bool,
+        options: EditorOptions,
     ) -> Result<Self> {
-        Self::open_inner_with_options(
-            purpose,
-            task_id,
-            initial,
-            rows,
-            cols,
-            true,
-            visual_line_navigation,
-        )
+        Self::open_inner_with_options(purpose, task_id, initial, rows, cols, true, options)
     }
 
     #[cfg(test)]
@@ -124,7 +139,7 @@ impl EmbeddedEditor {
             rows,
             cols,
             load_user_config,
-            true,
+            EditorOptions::default(),
         )
     }
 
@@ -135,7 +150,7 @@ impl EmbeddedEditor {
         rows: u16,
         cols: u16,
         load_user_config: bool,
-        visual_line_navigation: bool,
+        options: EditorOptions,
     ) -> Result<Self> {
         let dir = tempfile::Builder::new()
             .prefix("todoist-tui-editor-")
@@ -168,7 +183,7 @@ impl EmbeddedEditor {
             "-c",
             "set guicursor=n-v-c-sm:block-blinkon0,i-ci-ve:ver25-blinkon0,r-cr-o:hor20-blinkon0",
         ]);
-        if visual_line_navigation {
+        if options.visual_line_navigation {
             command.args(["-c", FALLBACK_VISUAL_DOWN, "-c", FALLBACK_VISUAL_UP]);
         }
         match purpose {
@@ -185,12 +200,10 @@ impl EmbeddedEditor {
                 command.args(["-c", "normal! gg$", "-c", "startinsert!"]);
             }
         }
-        command.args([
-            "-c",
-            "inoremap <silent> <buffer> <CR> <Esc>:write<CR>",
-            "-c",
-            "nnoremap <silent> <buffer> <CR> <Cmd>write<CR>",
-        ]);
+        if options.save_on_enter_in_insert {
+            command.args(["-c", "inoremap <silent> <buffer> <CR> <Esc>:write<CR>"]);
+        }
+        command.args(["-c", ENTER_MAPPINGS]);
         let autocmd = format!(
             "autocmd BufWritePost <buffer> call writefile(['ok'], '{}') | silent! qall!",
             marker.to_string_lossy().replace('\'', "''")
@@ -248,6 +261,7 @@ impl EmbeddedEditor {
             last_escape: None,
             rows: rows.max(3),
             cols: cols.max(10),
+            options,
         })
     }
 
@@ -487,6 +501,9 @@ fn key_bytes(key: KeyEvent) -> Vec<u8> {
             bytes
         }
         KeyCode::Char(c) => character_bytes(c, key.modifiers.contains(KeyModifiers::SHIFT)),
+        // CSI-u keeps Shift+Enter distinct from CR inside the Neovim PTY.
+        // Its nonrecursive Insert-mode mapping bypasses save-on-Enter.
+        KeyCode::Enter if key.modifiers == KeyModifiers::SHIFT => b"\x1b[13;2u".to_vec(),
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Esc => vec![0x1b],
         KeyCode::Backspace => vec![0x7f],
@@ -714,9 +731,20 @@ mod tests {
     }
 
     #[test]
-    fn enter_in_insert_mode_accepts_a_new_task() {
-        let mut editor =
-            EmbeddedEditor::open_inner(EditorPurpose::Add, None, "", 8, 50, false).unwrap();
+    fn configured_enter_in_insert_mode_accepts_a_new_task() {
+        let mut editor = EmbeddedEditor::open_inner_with_options(
+            EditorPurpose::Add,
+            None,
+            "",
+            8,
+            50,
+            false,
+            EditorOptions {
+                save_on_enter_in_insert: true,
+                ..EditorOptions::default()
+            },
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(200));
         for key in [
             KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
@@ -744,6 +772,151 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn insert_enter_inserts_a_newline_by_default() {
+        let mut editor =
+            EmbeddedEditor::open_inner(EditorPurpose::Add, None, "", 8, 50, false).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        for character in "Title".chars() {
+            editor
+                .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        editor
+            .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        for character in "Description".chars() {
+            editor
+                .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        wait_for_description_line(&mut editor);
+        editor
+            .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        editor
+            .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let result = wait_for_result(&mut editor);
+        assert!(result.accepted);
+        assert_eq!(result.text, "Title\nDescription\n");
+    }
+
+    #[test]
+    fn insert_shift_enter_always_inserts_a_newline_without_saving() {
+        assert_ne!(
+            key_bytes(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            key_bytes(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        for save_on_enter_in_insert in [false, true] {
+            let mut editor = EmbeddedEditor::open_inner_with_options(
+                EditorPurpose::Add,
+                None,
+                "",
+                8,
+                50,
+                false,
+                EditorOptions {
+                    save_on_enter_in_insert,
+                    ..EditorOptions::default()
+                },
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            for character in "Title".chars() {
+                editor
+                    .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                    .unwrap();
+            }
+            editor
+                .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+                .unwrap();
+            for character in "Description".chars() {
+                editor
+                    .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                    .unwrap();
+            }
+            wait_for_description_line(&mut editor);
+            editor
+                .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            editor
+                .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            let result = wait_for_result(&mut editor);
+            assert!(result.accepted);
+            assert_eq!(result.text, "Title\nDescription\n");
+        }
+    }
+
+    #[test]
+    fn normal_enter_saves_every_editor_regardless_of_insert_enter_setting() {
+        for save_on_enter_in_insert in [false, true] {
+            for purpose in [
+                EditorPurpose::Add,
+                EditorPurpose::AddChild,
+                EditorPurpose::Edit,
+                EditorPurpose::Due,
+                EditorPurpose::AddFilter,
+                EditorPurpose::EditFilter,
+                EditorPurpose::AddProject,
+                EditorPurpose::RenameProject,
+            ] {
+                let mut editor = EmbeddedEditor::open_inner_with_options(
+                    purpose,
+                    None,
+                    "Content",
+                    8,
+                    50,
+                    false,
+                    EditorOptions {
+                        save_on_enter_in_insert,
+                        ..EditorOptions::default()
+                    },
+                )
+                .unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+                editor
+                    .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap();
+                editor
+                    .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .unwrap();
+                let result = wait_for_result(&mut editor);
+                assert!(
+                    result.accepted,
+                    "{purpose:?}, save_on_enter_in_insert={save_on_enter_in_insert}"
+                );
+                assert_eq!(result.text, "Content\n");
+            }
+        }
+    }
+
+    fn wait_for_description_line(editor: &mut EmbeddedEditor) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                editor.poll().unwrap().is_none(),
+                "Insert-mode newline unexpectedly closed Neovim"
+            );
+            if editor.cursor() == (1, 11)
+                && editor
+                    .lines()
+                    .get(1)
+                    .is_some_and(|line| line.contains("Description"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Newline was not inserted; screen: {:?}",
+                editor.lines()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!editor.dir.path().join("saved").exists());
     }
 
     #[test]
@@ -786,6 +959,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         for key in [
             KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         ] {
             editor.send_key(key).unwrap();
@@ -816,6 +990,9 @@ mod tests {
                 .unwrap();
         }
         editor
+            .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        editor
             .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
@@ -842,6 +1019,9 @@ mod tests {
                 .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
                 .unwrap();
         }
+        editor
+            .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
         editor
             .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
@@ -892,6 +1072,9 @@ mod tests {
                 .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
                 .unwrap();
         }
+        editor
+            .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
         editor
             .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();

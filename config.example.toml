@@ -10,6 +10,9 @@
 # In Normal mode, make an otherwise-unmapped j/k move by visual wrapped lines.
 # Existing user mappings are always preserved.
 visual_line_navigation = true
+# Normal-mode Enter always saves. By default Insert-mode Enter inserts a newline.
+# Set true to save with Insert-mode Enter; Shift+Enter still inserts a newline.
+save_on_enter_in_insert = false
 
 # Optional direct Quick Add shortcuts. No special-add keys are enabled by
 # default. The project name may be written with or without its leading #.

@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
+use crate::editor::EditorOptions;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Down,
@@ -155,21 +157,7 @@ struct FileConfig {
     keybindings: BindingConfig,
     special_add: BTreeMap<String, String>,
     project_jumps: BTreeMap<String, String>,
-    editor: EditorConfig,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct EditorConfig {
-    visual_line_navigation: bool,
-}
-
-impl Default for EditorConfig {
-    fn default() -> Self {
-        Self {
-            visual_line_navigation: true,
-        }
-    }
+    editor: EditorOptions,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -308,23 +296,23 @@ impl KeyBindings {
         Self::load_with_editor_options(path, required).map(|(bindings, _)| bindings)
     }
 
-    pub fn load_with_editor_options(path: &Path, required: bool) -> Result<(Self, bool)> {
+    pub fn load_with_editor_options(path: &Path, required: bool) -> Result<(Self, EditorOptions)> {
         if !path.exists() {
             if required {
                 bail!("configuration file does not exist: {}", path.display());
             }
             let config = FileConfig::default();
-            let visual_line_navigation = config.editor.visual_line_navigation;
-            return Ok((Self::from_file_config(config)?, visual_line_navigation));
+            let editor = config.editor;
+            return Ok((Self::from_file_config(config)?, editor));
         }
         let source = fs::read_to_string(path)
             .with_context(|| format!("read configuration {}", path.display()))?;
         let config: FileConfig = toml::from_str(&source)
             .with_context(|| format!("parse configuration {}", path.display()))?;
-        let visual_line_navigation = config.editor.visual_line_navigation;
+        let editor = config.editor;
         let bindings = Self::from_file_config(config)
             .with_context(|| format!("validate configuration in {}", path.display()))?;
-        Ok((bindings, visual_line_navigation))
+        Ok((bindings, editor))
     }
 
     #[cfg(test)]
@@ -842,13 +830,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let default_path = dir.path().join("default.toml");
         fs::write(&default_path, "[keybindings]\ndown = ['x']\n").unwrap();
-        let (_, enabled) = KeyBindings::load_with_editor_options(&default_path, true).unwrap();
-        assert!(enabled);
+        let (_, editor) = KeyBindings::load_with_editor_options(&default_path, true).unwrap();
+        assert!(editor.visual_line_navigation);
 
         let disabled_path = dir.path().join("disabled.toml");
         fs::write(&disabled_path, "[editor]\nvisual_line_navigation = false\n").unwrap();
-        let (_, enabled) = KeyBindings::load_with_editor_options(&disabled_path, true).unwrap();
-        assert!(!enabled);
+        let (_, editor) = KeyBindings::load_with_editor_options(&disabled_path, true).unwrap();
+        assert!(!editor.visual_line_navigation);
+    }
+
+    #[test]
+    fn insert_enter_saving_defaults_off_and_can_be_enabled_or_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (_, editor) = KeyBindings::load_with_editor_options(&path, false).unwrap();
+        assert!(!editor.save_on_enter_in_insert);
+        for (source, expected) in [
+            ("[editor]\nvisual_line_navigation = false\n", false),
+            ("[editor]\nsave_on_enter_in_insert = true\n", true),
+            ("[editor]\nsave_on_enter_in_insert = false\n", false),
+        ] {
+            fs::write(&path, source).unwrap();
+            let (_, editor) = KeyBindings::load_with_editor_options(&path, true).unwrap();
+            assert_eq!(editor.save_on_enter_in_insert, expected);
+        }
+        fs::write(&path, "[editor]\nsave_on_enter_in_insert = 'yes'\n").unwrap();
+        assert!(KeyBindings::load_with_editor_options(&path, true).is_err());
     }
 
     #[test]

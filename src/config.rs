@@ -5,14 +5,14 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::keymap::KeyBindings;
+use crate::{editor::EditorOptions, keymap::KeyBindings};
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub token: Option<String>,
     pub database_path: PathBuf,
     pub keybindings: KeyBindings,
-    pub visual_line_navigation: bool,
+    pub editor: EditorOptions,
     pub config_path: PathBuf,
 }
 
@@ -37,13 +37,13 @@ impl Config {
                 .join("todoist-tui")
                 .join("config.toml")
         });
-        let (keybindings, visual_line_navigation) =
+        let (keybindings, editor) =
             KeyBindings::load_with_editor_options(&config_path, explicit_config.is_some())?;
         Ok(Self {
             token,
             database_path,
             keybindings,
-            visual_line_navigation,
+            editor,
             config_path,
         })
     }
