@@ -805,7 +805,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         .map(|(key, meaning)| {
             Line::from(vec![
                 Span::styled(
-                    format!("  {key:<14}"),
+                    format!("  {key:<14}        "),
                     Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(meaning, Style::default().fg(TEXT)),
@@ -815,7 +815,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
     for (key, project) in keys.special_add_bindings() {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {key:<14}"),
+                format!("  {key:<14}        "),
                 Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -828,7 +828,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         let key = format!("{}{prefix}", keys.display(Action::Jump));
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {key:<14}"),
+                format!("  {key:<14}        "),
                 Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
