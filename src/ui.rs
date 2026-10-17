@@ -37,6 +37,7 @@ const SYNC_RED: Color = Color::Rgb(222, 76, 86);
 const TASK_LOOKAHEAD: usize = 4;
 const LIST_TOP_PADDING: u16 = 1;
 const TASK_RIGHT_PADDING: u16 = 2;
+const DESCRIPTION_MARKER: &str = "\u{2630}";
 
 fn priority_display(priority: u8) -> (&'static str, Option<Color>) {
     match priority {
@@ -282,13 +283,15 @@ fn task_lines<'a>(
             })
             .flatten();
         let assignee = task.assignee.as_ref().map(|name| format!("  @{name}"));
+        let description = (!task.description.is_empty()).then(|| format!("  {DESCRIPTION_MARKER}"));
         let suffix_width = priority
             .as_ref()
             .map_or(0, |(label, _)| UnicodeWidthStr::width(label.as_str()))
             + due
                 .as_ref()
                 .map_or(0, |(label, _)| UnicodeWidthStr::width(label.as_str()))
-            + assignee.as_deref().map_or(0, UnicodeWidthStr::width);
+            + assignee.as_deref().map_or(0, UnicodeWidthStr::width)
+            + description.as_deref().map_or(0, UnicodeWidthStr::width);
         let indentation = depth.saturating_mul(2);
         let title_width = content_width.saturating_sub(2 + indentation + suffix_width);
         let continuation_width = content_width.saturating_sub(3 + indentation);
@@ -328,6 +331,14 @@ fn task_lines<'a>(
         if let Some(assignee) = assignee {
             spans.push(Span::styled(
                 assignee,
+                Style::default()
+                    .fg(MUTED)
+                    .bg(if is_selected { SELECT } else { PANEL }),
+            ));
+        }
+        if let Some(description) = description {
+            spans.push(Span::styled(
+                description,
                 Style::default()
                     .fg(MUTED)
                     .bg(if is_selected { SELECT } else { PANEL }),
@@ -1380,6 +1391,27 @@ mod tests {
         let (lines, positions) = task_lines(&tasks, Some(0), true, true, false, false, 80);
         assert_eq!(lines.len(), 3);
         assert_eq!(positions, [1, 2]);
+    }
+
+    #[test]
+    fn task_description_shows_a_text_marker_on_the_right() {
+        let mut with_description = task("With note", &[]);
+        with_description.description = "Body".into();
+        let tasks = [task("Plain", &[]), with_description];
+
+        let (lines, _) = task_lines(&tasks, None, false, false, false, false, 80);
+
+        assert!(
+            !lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.contains(DESCRIPTION_MARKER))
+        );
+        let marker = format!("  {DESCRIPTION_MARKER}");
+        assert_eq!(
+            lines[1].spans.last().map(|span| span.content.as_ref()),
+            Some(marker.as_str())
+        );
     }
 
     #[test]

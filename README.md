@@ -51,7 +51,7 @@ below mean Shift+letter.
 | Key | Action |
 | --- | --- |
 | `j` / `k`, Down / Up | Move down / up |
-| `h` / `l` | Focus navigation / tasks |
+| `h` / `l`, Left / Right | Focus navigation / tasks |
 | Enter | Enter tasks, open task details, or confirm a picker |
 | `gg` / `G` | First / last item |
 | `g` + at least two characters | Jump to a uniquely matching project or favorite filter |
@@ -67,7 +67,8 @@ below mean Shift+letter.
 | `u` / Ctrl+r | Undo / redo a task change from this session |
 | `L` / `A` / `C` | Toggle label grouping / alphabetical order / completed tasks |
 | `P` / Ctrl+f | Add a project / personal filter |
-| `r` | Rename a project when navigation has focus; synchronize otherwise |
+| `R` | Rename the selected project |
+| `r` | Synchronize |
 | `J` / `K` | Move the focused project or task down / up among siblings |
 | `y` | Copy the focused title |
 | Ctrl+0 … Ctrl+9 | Set/remove a project's space override |
@@ -78,12 +79,16 @@ below mean Shift+letter.
 Search uses case-insensitive name prefixes. Type a prefix and press Enter, or
 press Esc once to select results with `j`/`k`. A second Esc cancels. Project
 search includes hidden projects; task search includes cached completed tasks.
-Help and detail dialogs close with Enter, Esc, or `q`.
+Help and detail dialogs close with Enter, Esc, or `q`. Tasks that have a
+description show a text indicator (`☰`) on the right; Enter opens the full
+description.
 
 Tasks are grouped by label by default. Sorting, grouping, and completed-task
-visibility are remembered between runs. Subtasks stay with their parent;
-alphabetical sorting and Upcoming's date groups determine placement instead of
-manual top/bottom order. Disable alphabetical sorting before using `J`/`K`.
+visibility are remembered between runs. Subtasks stay with their parent.
+Alphabetical sorting affects only the displayed order; `a` and `q` still record
+top/bottom placement, which appears once sorting is disabled. In Upcoming,
+date groups determine placement instead. Disable alphabetical sorting before
+using `J`/`K`.
 
 Personal projects default to space `1`, team/shared projects to `2`; built-in
 views and favorite filters lead space `0`. Space overrides and hidden membership

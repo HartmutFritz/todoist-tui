@@ -233,14 +233,14 @@ impl Default for BindingConfig {
             up: strings(&["k", "up"]),
             down_five: Vec::new(),
             up_five: Vec::new(),
-            focus_navigation: strings(&["h"]),
-            focus_tasks: strings(&["l"]),
+            focus_navigation: strings(&["h", "left"]),
+            focus_tasks: strings(&["l", "right"]),
             confirm: strings(&["enter"]),
             search_projects: strings(&["p"]),
             search_tasks: strings(&["f"]),
             search_filters: strings(&["shift+f"]),
             add_filter: strings(&["ctrl+f"]),
-            rename_project: strings(&["r"]),
+            rename_project: strings(&["shift+r"]),
             add_project: strings(&["shift+p"]),
             move_project_down: strings(&["shift+j"]),
             move_project_up: strings(&["shift+k"]),
@@ -926,15 +926,40 @@ mod tests {
     }
 
     #[test]
-    fn project_rename_shares_r_with_sync_and_add_uses_shift_p() {
+    fn project_rename_uses_shift_r_and_add_uses_shift_p() {
         let bindings = KeyBindings::defaults();
         let r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
-        assert!(bindings.matches(Action::RenameProject, r));
+        assert!(!bindings.matches(Action::RenameProject, r));
         assert!(bindings.matches(Action::Sync, r));
         assert_eq!(bindings.main_action(r), Some(Action::Sync));
         assert!(bindings.matches(
+            Action::RenameProject,
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)
+        ));
+        assert!(bindings.matches(
             Action::AddProject,
             KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)
+        ));
+    }
+
+    #[test]
+    fn arrow_keys_focus_navigation_and_tasks_like_h_and_l() {
+        let bindings = KeyBindings::defaults();
+        assert!(bindings.matches(
+            Action::FocusNavigation,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)
+        ));
+        assert!(bindings.matches(
+            Action::FocusTasks,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+        ));
+        assert!(bindings.matches(
+            Action::FocusNavigation,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)
+        ));
+        assert!(bindings.matches(
+            Action::FocusTasks,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)
         ));
     }
 

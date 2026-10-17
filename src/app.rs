@@ -1295,8 +1295,10 @@ impl App {
     }
 
     fn effective_add_placement(&self, requested: AddPlacement) -> AddPlacement {
-        if !self.sort_tasks_alphabetically && matches!(self.selected_nav(), Some(NavId::Project(_)))
-        {
+        // Record explicit top/bottom placement in real projects even while
+        // alphabetical sorting controls the displayed order, so the durable
+        // Todoist order places the task there once sorting is disabled.
+        if matches!(self.selected_nav(), Some(NavId::Project(_))) {
             requested
         } else {
             AddPlacement::Natural
@@ -3298,7 +3300,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_add_placement_applies_inside_label_groups_but_not_sorted_views() {
+    fn manual_add_placement_is_recorded_in_projects_even_when_sorted() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
         let sync = SyncManager::new(store.clone(), None).unwrap();
@@ -3330,7 +3332,11 @@ mod tests {
         app.sort_tasks_alphabetically = true;
         assert_eq!(
             app.effective_add_placement(AddPlacement::Top),
-            AddPlacement::Natural
+            AddPlacement::Top
+        );
+        assert_eq!(
+            app.effective_add_placement(AddPlacement::Bottom),
+            AddPlacement::Bottom
         );
 
         app.sort_tasks_alphabetically = false;
