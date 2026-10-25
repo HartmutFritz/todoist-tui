@@ -11,9 +11,16 @@ use uuid::Uuid;
 
 use crate::model::{
     Due, Filter, INBOX_LOCAL_ID, NavId, NavRow, Operation, OutboxEntry, PROJECT_SPACE_COUNT,
-    Project, ProjectOrder, RemoteCollaborator, RemoteFilter, RemoteLabel, RemoteProject,
-    RemoteTask, Task, TaskOrder,
+    Project, RemoteCollaborator, RemoteFilter, RemoteLabel, RemoteProject, RemoteTask, Task,
+    TaskOrder,
 };
+
+#[path = "store_diagnostics.rs"]
+mod diagnostics;
+#[path = "store_ordering.rs"]
+mod order_storage;
+use crate::ordering::{OrderScope, Placement};
+pub use diagnostics::{OUTBOX_PAGE_SIZE, OutboxPage};
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -216,6 +223,7 @@ impl Store {
             "rewrite_pending",
             "INTEGER NOT NULL DEFAULT 1",
         )?;
+        order_storage::initialize(&conn, previous_schema_version)?;
 
         conn.execute_batch(
             "BEGIN;
@@ -231,7 +239,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS filter_tasks_filter ON filter_tasks(filter_id);
              CREATE INDEX IF NOT EXISTS outbox_entity ON outbox(entity_id);
              INSERT OR IGNORE INTO projects(id, name, is_inbox) VALUES('inbox', 'Inbox', 1);
-              PRAGMA user_version=9;
+               PRAGMA user_version=10;
              COMMIT;",
         )?;
         if previous_schema_version < 8 {
@@ -298,6 +306,7 @@ impl Store {
     pub fn nav_rows(&self, show_hidden: bool) -> Result<Vec<NavRow>> {
         let conn = self.connect()?;
         let projects = projects_from(&conn)?;
+        let project_spaces = project_display_spaces(&projects);
         let filters = favorite_filters_from(&conn)?;
         let mut project_counts = HashMap::<String, usize>::new();
         {
@@ -370,6 +379,7 @@ impl Store {
                 can_assign_tasks: false,
                 space_override: None,
                 is_hidden: false,
+                folder_id: None,
             });
         let mut leading = vec![
             (
@@ -437,7 +447,8 @@ impl Store {
                 visible_projects.push(project);
             }
         }
-        let ordered_projects = project_hierarchy_rows(&visible_projects, &project_counts);
+        let ordered_projects =
+            project_hierarchy_rows(&visible_projects, &project_counts, &project_spaces);
         for space in 0..PROJECT_SPACE_COUNT {
             let space_rows = ordered_projects
                 .iter()
@@ -453,7 +464,7 @@ impl Store {
             rows.extend(space_rows);
         }
         hidden_rows.extend(
-            project_hierarchy_rows(&hidden_projects, &project_counts)
+            project_hierarchy_rows(&hidden_projects, &project_counts, &project_spaces)
                 .into_iter()
                 .map(|(_, row)| row),
         );
@@ -475,16 +486,17 @@ impl Store {
         let conn = self.connect()?;
         if matches!(nav, NavId::Today | NavId::Upcoming) {
             let sql = if show_completed {
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
                  FROM tasks WHERE deleted=0 ORDER BY checked,child_order,id"
             } else {
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
                  FROM tasks WHERE checked=0 AND deleted=0 ORDER BY child_order,id"
             };
             let mut stmt = conn.prepare(sql)?;
             let mut tasks = stmt
                 .query_map([], row_to_task)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            order_storage::sort_tasks(&conn, &mut tasks)?;
             let today = Local::now().date_naive();
             tasks.retain(|task| {
                 let Some(date) = task.due.as_ref().and_then(Due::concrete_date) else {
@@ -513,36 +525,38 @@ impl Store {
         }
         let (sql, id) = match (nav, show_completed) {
             (NavId::Project(id), true) => (
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
                  FROM tasks WHERE project_id=?1 AND deleted=0 ORDER BY checked,child_order,id", id),
             (NavId::Filter(id), true) => (
-                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name
+                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id
                  FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
                  WHERE ft.filter_id=?1 AND t.deleted=0 ORDER BY t.checked,t.child_order,t.id", id),
             (NavId::Project(id), false) => (
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
                  FROM tasks WHERE project_id=?1 AND checked=0 AND deleted=0 ORDER BY child_order,id", id),
             (NavId::Filter(id), false) => (
-                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name
+                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id
                  FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
                  WHERE ft.filter_id=?1 AND t.checked=0 AND t.deleted=0 ORDER BY t.child_order,t.id", id),
             (NavId::Today | NavId::Upcoming, _) => unreachable!(),
         };
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([id], row_to_task)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut tasks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        order_storage::sort_tasks(&conn, &mut tasks)?;
+        Ok(tasks)
     }
 
     pub fn tasks_for_search(&self) -> Result<Vec<(Task, String)>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,
-                    t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,COALESCE(p.name,'Unknown project')
+                    t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id,COALESCE(p.name,'Unknown project')
              FROM tasks t LEFT JOIN projects p ON p.id=t.project_id AND p.deleted=0
              WHERE t.deleted=0
              ORDER BY t.checked,lower(t.content),t.child_order,t.id",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row_to_task(row)?, row.get(11)?)))?;
+        let rows = stmt.query_map([], |row| Ok((row_to_task(row)?, row.get(12)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -769,18 +783,22 @@ impl Store {
                 "parent and child tasks must be in the same project"
             );
         }
+        let section_id = parent_id
+            .map(|id| task_from(&tx, id).map(|task| task.and_then(|task| task.section_id)))
+            .transpose()?
+            .flatten();
         let next_order: i64 = if position == TaskAddPosition::Top {
             tx.execute(
                 "UPDATE tasks SET child_order=child_order+1
-                 WHERE project_id=?1 AND parent_id IS ?2 AND deleted=0",
-                params![project.id, parent_id],
+                 WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=0 AND deleted=0",
+                params![project.id, parent_id, section_id],
             )?;
             0
         } else {
             tx.query_row(
                 "SELECT COALESCE(MAX(child_order),-1)+1 FROM tasks
-                 WHERE project_id=?1 AND parent_id IS ?2",
-                params![project.id, parent_id],
+                  WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=0 AND deleted=0",
+                params![project.id, parent_id, section_id],
                 |r| r.get(0),
             )?
         };
@@ -789,15 +807,16 @@ impl Store {
             TaskAddPosition::Top | TaskAddPosition::Bottom => Some(next_order),
         };
         tx.execute(
-            "INSERT INTO tasks(id,project_id,parent_id,content,description,child_order)
-             VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO tasks(id,project_id,parent_id,content,description,child_order,section_id)
+              VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
                 id,
                 project.id,
                 parent_id,
                 expression.trim(),
                 description,
-                next_order
+                next_order,
+                section_id
             ],
         )?;
         queue(
@@ -810,6 +829,11 @@ impl Store {
                 project_name: project.name.clone(),
                 parent_id: parent_id.map(str::to_owned),
                 target_order,
+                placement: Some(if position == TaskAddPosition::Top {
+                    Placement::Top
+                } else {
+                    Placement::Bottom
+                }),
             },
         )?;
         tx.commit()?;
@@ -849,23 +873,59 @@ impl Store {
                 ancestor_id = ancestor.parent_id;
             }
         }
+        let section_id = if let Some(parent) = parent_id.as_deref() {
+            task_from(&tx, parent)?.and_then(|task| task.section_id)
+        } else {
+            task.section_id.clone()
+        };
         let next_order: i64 = tx.query_row(
             "SELECT COALESCE(MAX(child_order),-1)+1 FROM tasks
-             WHERE project_id=?1 AND parent_id IS ?2 AND id<>?3",
-            params![task.project_id, parent_id, id],
+              WHERE project_id=?1 AND parent_id IS ?2 AND id<>?3 AND section_id IS ?4",
+            params![task.project_id, parent_id, id, section_id],
             |row| row.get(0),
         )?;
         tx.execute(
-            "UPDATE tasks SET parent_id=?2,child_order=?3 WHERE id=?1",
-            params![id, parent_id, next_order],
+            "UPDATE tasks SET parent_id=?2,child_order=?3,section_id=?4 WHERE id=?1",
+            params![id, parent_id, next_order, section_id],
         )?;
+        tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id) UPDATE tasks SET section_id=?2 WHERE id IN (SELECT id FROM tree)",params![id,section_id])?;
+        order_storage::local_position(&tx, None, &order_storage::task_scope(&task), 0)?;
+        order_storage::local_position(
+            &tx,
+            Some(&id),
+            &OrderScope::Tasks {
+                project_id: task.project_id.clone(),
+                parent_id: parent_id.clone(),
+                section_id: section_id.clone(),
+            },
+            i64::MAX,
+        )?;
+        let next_order =
+            tx.query_row("SELECT child_order FROM tasks WHERE id=?1", [&id], |row| {
+                row.get(0)
+            })?;
         queue(
             &tx,
             &id,
             Operation::MoveTaskParent {
-                parent_id,
-                project_id: task.project_id,
+                parent_id: parent_id.clone(),
+                project_id: task.project_id.clone(),
+                section_id: section_id.clone(),
             },
+        )?;
+        order_storage::queue_plan(
+            &tx,
+            &id,
+            OrderScope::Tasks {
+                project_id: task.project_id,
+                parent_id,
+                section_id,
+            },
+            vec![TaskOrder {
+                id: id.clone(),
+                child_order: next_order,
+            }],
+            false,
         )?;
         tx.execute("UPDATE outbox SET error=NULL WHERE entity_id=?1 AND json_extract(payload,'$.kind')='quick_add' AND json_extract(checkpoint,'$.parsed.id') IS NOT NULL", [&id])?;
         tx.commit()?;
@@ -891,6 +951,7 @@ impl Store {
                 project_name,
                 parent_id,
                 target_order,
+                placement,
                 ..
             } = serde_json::from_str(&payload)?
         {
@@ -903,6 +964,7 @@ impl Store {
                     project_name,
                     parent_id,
                     target_order,
+                    placement,
                 };
                 tx.execute("UPDATE outbox SET payload=?2,uuid=?3,claimed=0,error=NULL,checkpoint='null' WHERE seq=?1", params![seq, serde_json::to_string(&operation)?, Uuid::new_v4().to_string()])?;
                 tx.commit()?;
@@ -986,11 +1048,60 @@ impl Store {
                 params![id, serde_json::to_string(&due)?],
             )?;
         } else if completed {
+            let closing=tx.prepare("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
+                SELECT t.id,t.project_id,t.parent_id,t.section_id FROM tasks t JOIN tree ON t.id=tree.id WHERE t.checked=0 AND t.deleted=0 ORDER BY t.child_order,t.id")?
+                .query_map([&id],|row|Ok((row.get::<_,String>(0)?,OrderScope::Tasks{project_id:row.get(1)?,parent_id:row.get(2)?,section_id:row.get(3)?})))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut next = HashMap::new();
+            for (id, scope) in closing {
+                let rank = if let Some(rank) = next.get(&scope) {
+                    *rank
+                } else {
+                    let OrderScope::Tasks {
+                        project_id,
+                        parent_id,
+                        section_id,
+                    } = &scope
+                    else {
+                        unreachable!()
+                    };
+                    tx.query_row("SELECT COALESCE(MAX(child_order),-1)+1 FROM tasks WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=1 AND deleted=0",params![project_id,parent_id,section_id],|row|row.get::<_,i64>(0))?
+                };
+                tx.execute(
+                    "UPDATE tasks SET child_order=?2 WHERE id=?1",
+                    params![id, rank],
+                )?;
+                next.insert(scope, rank + 1);
+            }
             tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
                 UPDATE tasks SET checked=1 WHERE id IN (SELECT id FROM tree)", [&id])?;
+            order_storage::local_position(&tx, None, &order_storage::task_scope(&task), 0)?;
         } else {
+            let mut next = Some(id.clone());
+            let mut visited = HashSet::new();
+            let mut scopes = Vec::new();
+            while let Some(current) = next {
+                if !visited.insert(current.clone()) {
+                    break;
+                }
+                let Some(ancestor) = task_from(&tx, &current)? else {
+                    break;
+                };
+                if ancestor.checked {
+                    let rank:i64=tx.query_row("SELECT COALESCE(MAX(child_order),-1)+1 FROM tasks WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=0 AND deleted=0",params![ancestor.project_id,ancestor.parent_id,ancestor.section_id],|row|row.get(0))?;
+                    tx.execute(
+                        "UPDATE tasks SET child_order=?2 WHERE id=?1",
+                        params![ancestor.id, rank],
+                    )?;
+                }
+                scopes.push(order_storage::task_scope(&ancestor));
+                next = ancestor.parent_id;
+            }
             tx.execute("WITH RECURSIVE ancestors(id) AS (SELECT ?1 UNION SELECT t.parent_id FROM tasks t JOIN ancestors a ON t.id=a.id WHERE t.parent_id IS NOT NULL)
                 UPDATE tasks SET checked=0 WHERE id IN (SELECT id FROM ancestors)", [&id])?;
+            for scope in scopes {
+                order_storage::local_position(&tx, None, &scope, 0)?;
+            }
         }
         queue(
             &tx,
@@ -1012,14 +1123,14 @@ impl Store {
         let current =
             task_from_including_deleted(&tx, &task.id)?.context("edited task no longer exists")?;
         preserve_pending_task_fields(&tx, &task.id.clone(), completed_seq, &current, &mut task)?;
-        if current.project_id != task.project_id {
+        if current.project_id != task.project_id || current.section_id != task.section_id {
             tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
-                UPDATE tasks SET project_id=?2 WHERE id IN (SELECT id FROM tree)", params![task.id, task.project_id])?;
+                UPDATE tasks SET project_id=?2,section_id=?3 WHERE id IN (SELECT id FROM tree)", params![task.id, task.project_id,task.section_id])?;
         }
         {
             tx.execute(
                 "UPDATE tasks SET project_id=?2,content=?3,description=?4,labels_json=?5,
-                  due_json=?6,priority=?7,parent_id=?8 WHERE id=?1",
+                  due_json=?6,priority=?7,parent_id=?8,section_id=?9 WHERE id=?1",
                 params![
                     task.id,
                     task.project_id,
@@ -1029,17 +1140,64 @@ impl Store {
                     task.due.as_ref().map(serde_json::to_string).transpose()?,
                     task.priority,
                     task.parent_id,
+                    task.section_id,
                 ],
+            )?;
+        }
+        if current.project_id != task.project_id || current.section_id != task.section_id {
+            order_storage::local_position(&tx, None, &order_storage::task_scope(&current), 0)?;
+            order_storage::local_position(
+                &tx,
+                Some(&task.id),
+                &order_storage::task_scope(&task),
+                i64::MAX,
             )?;
         }
         tx.commit()?;
         Ok(())
     }
 
+    pub fn task_move_restriction(
+        &self,
+        id: &str,
+        project_id: &str,
+    ) -> Result<Option<&'static str>> {
+        let conn = self.connect()?;
+        let id = resolve_task_id_from(&conn, id)?.unwrap_or_else(|| id.into());
+        let task = task_from(&conn, &id)?.context("selected task no longer exists")?;
+        let rejected:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind') IN ('move_task','move_task_parent'))",[&id],|row|row.get(0))?;
+        // After a rejected optimistic move the cached task can be displayed at
+        // its intended destination; ordering metadata retains its server scope.
+        let source = if rejected {
+            conn.query_row(
+                "SELECT scope FROM order_meta WHERE resource='task' AND id=?1",
+                [&id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|scope| serde_json::from_str::<OrderScope>(&scope).ok())
+            .and_then(|scope| match scope {
+                OrderScope::Tasks { project_id, .. } => Some(project_id),
+                _ => None,
+            })
+            .unwrap_or(task.project_id)
+        } else {
+            task.project_id
+        };
+        let source = project_from(&conn, &source)?;
+        let project_id =
+            resolve_project_id_from(&conn, project_id)?.unwrap_or_else(|| project_id.into());
+        let destination =
+            project_from(&conn, &project_id)?.context("destination project no longer exists")?;
+        Ok(source.and_then(|source|source.workspace_id).filter(|workspace|destination.workspace_id.as_ref()!=Some(workspace)).map(|_|"Todoist does not support moving individual tasks out of a team workspace. Choose another project in the same team."))
+    }
+
     pub fn move_task(&self, id: &str, project_id: &str) -> Result<()> {
         let conn = self.connect()?;
         let tx = conn.unchecked_transaction()?;
         let id = resolve_task_id_from(&tx, id)?.unwrap_or_else(|| id.to_owned());
+        let original = task_from(&tx, &id)?.context("selected task no longer exists")?;
+        supersede_rejected_task_moves(&tx, &id)?;
         let project_id =
             resolve_project_id_from(&tx, project_id)?.unwrap_or_else(|| project_id.to_owned());
         let next_order: i64 = tx.query_row(
@@ -1052,13 +1210,48 @@ impl Store {
             "destination project no longer exists"
         );
         tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
-            UPDATE tasks SET project_id=?2 WHERE id IN (SELECT id FROM tree)", params![id, project_id])?;
+            UPDATE tasks SET project_id=?2,section_id=NULL WHERE id IN (SELECT id FROM tree)", params![id, project_id])?;
         let changed = tx.execute(
             "UPDATE tasks SET project_id=?2,parent_id=NULL,child_order=?3 WHERE id=?1",
             params![id, project_id, next_order],
         )?;
         anyhow::ensure!(changed == 1, "selected task no longer exists");
-        queue(&tx, &id, Operation::MoveTask { project_id })?;
+        order_storage::local_position(&tx, None, &order_storage::task_scope(&original), 0)?;
+        order_storage::local_position(
+            &tx,
+            Some(&id),
+            &OrderScope::Tasks {
+                project_id: project_id.clone(),
+                parent_id: None,
+                section_id: None,
+            },
+            i64::MAX,
+        )?;
+        let next_order =
+            tx.query_row("SELECT child_order FROM tasks WHERE id=?1", [&id], |row| {
+                row.get(0)
+            })?;
+        queue(
+            &tx,
+            &id,
+            Operation::MoveTask {
+                project_id: project_id.clone(),
+            },
+        )?;
+        order_storage::queue_plan(
+            &tx,
+            &id,
+            OrderScope::Tasks {
+                project_id,
+                parent_id: None,
+                section_id: None,
+            },
+            vec![TaskOrder {
+                id: id.clone(),
+                child_order: next_order,
+            }],
+            false,
+        )?;
         tx.execute("UPDATE outbox SET error=NULL WHERE entity_id=?1 AND json_extract(payload,'$.kind')='quick_add' AND json_extract(checkpoint,'$.parsed.id') IS NOT NULL", [&id])?;
         tx.commit()?;
         Ok(())
@@ -1125,13 +1318,19 @@ impl Store {
                     .map(|resolved| resolved.unwrap_or_else(|| parent_id.to_owned()))
             })
             .transpose()?;
+        if current.project_id != target_project_id
+            || current.parent_id != target_parent_id
+            || current.section_id != target.section_id
+        {
+            supersede_rejected_task_moves(tx, &id)?;
+        }
         if current.project_id != target_project_id {
             tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
-                UPDATE tasks SET project_id=?2 WHERE id IN (SELECT id FROM tree)", params![id, target_project_id])?;
+                UPDATE tasks SET project_id=?2,section_id=?3 WHERE id IN (SELECT id FROM tree)", params![id, target_project_id,target.section_id])?;
         }
         tx.execute(
             "UPDATE tasks SET project_id=?2,content=?3,description=?4,labels_json=?5,
-             due_json=?6,priority=?7,child_order=?8,checked=?9,parent_id=?10,deleted=0 WHERE id=?1",
+             due_json=?6,priority=?7,child_order=?8,checked=?9,parent_id=?10,section_id=?11,deleted=0 WHERE id=?1",
             params![
                 id,
                 target_project_id,
@@ -1142,9 +1341,28 @@ impl Store {
                 target.priority,
                 target.child_order,
                 target.checked,
-                target_parent_id
+                target_parent_id,target.section_id
             ],
         )?;
+        if !target.checked {
+            order_storage::local_position(
+                tx,
+                Some(&id),
+                &OrderScope::Tasks {
+                    project_id: target_project_id.clone(),
+                    parent_id: target_parent_id.clone(),
+                    section_id: target.section_id.clone(),
+                },
+                target.child_order,
+            )?;
+        }
+        if current.project_id != target_project_id
+            || current.parent_id != target_parent_id
+            || current.section_id != target.section_id
+            || target.checked
+        {
+            order_storage::local_position(tx, None, &order_storage::task_scope(&current), 0)?;
+        }
         if current.checked && !target.checked {
             queue(tx, &id, Operation::RestoreCompletion { completed: false })?;
         }
@@ -1197,6 +1415,8 @@ impl Store {
         }
         if current.parent_id != target_parent_id
             || (current.project_id != target_project_id && target_parent_id.is_some())
+            || current.section_id != target.section_id
+            || (current.project_id != target_project_id && target.section_id.is_some())
         {
             queue(
                 tx,
@@ -1204,6 +1424,7 @@ impl Store {
                 Operation::MoveTaskParent {
                     parent_id: target_parent_id.clone(),
                     project_id: target_project_id.clone(),
+                    section_id: target.section_id.clone(),
                 },
             )?;
         }
@@ -1219,14 +1440,22 @@ impl Store {
         if current.child_order != target.child_order
             || current.parent_id != target_parent_id
             || current.project_id != target_project_id
+            || current.section_id != target.section_id
+            || (current.checked && !target.checked)
         {
-            queue_task_reorder(
+            order_storage::queue_plan(
                 tx,
                 &id,
+                OrderScope::Tasks {
+                    project_id: target_project_id,
+                    parent_id: target_parent_id,
+                    section_id: target.section_id.clone(),
+                },
                 vec![TaskOrder {
                     id: id.clone(),
                     child_order: target.child_order,
                 }],
+                false,
             )?;
         }
         Ok(id)
@@ -1236,10 +1465,12 @@ impl Store {
         let conn = self.connect()?;
         let id = resolve_task_id_from(&conn, id)?.unwrap_or_else(|| id.to_owned());
         let tx = conn.unchecked_transaction()?;
+        let original = task_from(&tx, &id)?.context("task to undo no longer exists")?;
         supersede_rejected_task_updates(&tx, &id, true)?;
         tx.execute("UPDATE outbox SET error=NULL WHERE entity_id=?1", [&id])?;
         let changed = tx.execute("UPDATE tasks SET deleted=1 WHERE id=?1", [&id])?;
         anyhow::ensure!(changed == 1, "task to undo no longer exists");
+        order_storage::local_position(&tx, None, &order_storage::task_scope(&original), 0)?;
         queue(&tx, &id, Operation::DeleteTask)?;
         tx.commit()?;
         Ok(id)
@@ -1251,7 +1482,7 @@ impl Store {
         let root = task_from(&conn, &id)?.context("selected task no longer exists")?;
         let mut stmt = conn.prepare(
             "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,
-                    checked,parent_id,assignee_name
+                    checked,parent_id,assignee_name,section_id
              FROM tasks WHERE project_id=?1 AND deleted=0 ORDER BY child_order,id",
         )?;
         let project_tasks = stmt
@@ -1275,6 +1506,7 @@ impl Store {
             )?;
             tx.execute("UPDATE tasks SET deleted=1 WHERE id=?1", [&task.id])?;
         }
+        order_storage::local_position(&tx, None, &order_storage::task_scope(&root), 0)?;
         queue(&tx, &id, Operation::DeleteTask)?;
         tx.commit()?;
         Ok(tree)
@@ -1343,6 +1575,7 @@ impl Store {
                             project_name: project.name,
                             parent_id: task.parent_id.clone(),
                             target_order: Some(task.child_order),
+                            placement: Some(Placement::Index(task.child_order)),
                         },
                     )?;
                     queue(
@@ -1376,6 +1609,16 @@ impl Store {
                 }
                 restored.push(task);
             }
+            for task in &restored {
+                if !task.checked {
+                    order_storage::local_position(
+                        &tx,
+                        Some(&task.id),
+                        &order_storage::task_scope(task),
+                        task.child_order,
+                    )?;
+                }
+            }
             tx.commit()?;
             return Ok(restored);
         }
@@ -1401,8 +1644,8 @@ impl Store {
             let id = format!("local:{}", Uuid::new_v4());
             tx.execute(
                 "INSERT INTO tasks(id,project_id,parent_id,content,description,labels_json,due_json,
-                                   priority,child_order,checked,deleted,assignee_name)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11)",
+                                   priority,child_order,checked,deleted,assignee_name,section_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12)",
                 params![
                     id,
                     project_id,
@@ -1415,6 +1658,7 @@ impl Store {
                     snapshot.child_order,
                     snapshot.checked,
                     snapshot.assignee,
+                    snapshot.section_id,
                 ],
             )?;
             queue(
@@ -1426,7 +1670,10 @@ impl Store {
                     project_id: project.id.clone(),
                     project_name: project.name,
                     parent_id: parent_id.clone(),
-                    target_order: Some(snapshot.child_order),
+                    // Position only after the final project/section move. A
+                    // move can allocate a new server key even within a project.
+                    target_order: None,
+                    placement: None,
                 },
             )?;
             if parent_id.is_none() {
@@ -1438,6 +1685,31 @@ impl Store {
                     },
                 )?;
             }
+            if snapshot.section_id.is_some() {
+                queue(
+                    &tx,
+                    &id,
+                    Operation::MoveTaskParent {
+                        parent_id: parent_id.clone(),
+                        project_id: project_id.clone(),
+                        section_id: snapshot.section_id.clone(),
+                    },
+                )?;
+            }
+            order_storage::queue_plan(
+                &tx,
+                &id,
+                OrderScope::Tasks {
+                    project_id: project_id.clone(),
+                    parent_id: parent_id.clone(),
+                    section_id: snapshot.section_id.clone(),
+                },
+                vec![TaskOrder {
+                    id: id.clone(),
+                    child_order: snapshot.child_order,
+                }],
+                false,
+            )?;
             queue(
                 &tx,
                 &id,
@@ -1495,6 +1767,16 @@ impl Store {
             remapped.insert(snapshot.id.clone(), id);
             restored.push(task);
         }
+        for task in &restored {
+            if !task.checked {
+                order_storage::local_position(
+                    &tx,
+                    Some(&task.id),
+                    &order_storage::task_scope(task),
+                    task.child_order,
+                )?;
+            }
+        }
         // Attach every child before archiving its parent on the server.
         for id in completed.into_iter().rev() {
             queue(&tx, &id, Operation::RestoreCompletion { completed: true })?;
@@ -1538,17 +1820,16 @@ impl Store {
             .context("selected project no longer exists")?;
         anyhow::ensure!(!selected.is_inbox, "Inbox order is fixed");
 
-        let projects_by_id = projects
-            .iter()
-            .map(|project| (project.id.as_str(), project))
-            .collect::<HashMap<_, _>>();
-        let selected_group = project_display_group(selected, &projects_by_id);
+        let project_spaces = project_display_spaces(&projects);
+        let selected_group = project_display_group(selected, &project_spaces);
         let candidates = projects
             .iter()
             .filter(|project| {
                 !project.is_inbox
                     && project.parent_id == selected.parent_id
-                    && project_display_group(project, &projects_by_id) == selected_group
+                    && project.workspace_id == selected.workspace_id
+                    && project.folder_id == selected.folder_id
+                    && project_display_group(project, &project_spaces) == selected_group
             })
             .collect::<Vec<_>>();
         let Some(position) = candidates
@@ -1570,7 +1851,12 @@ impl Store {
 
         let siblings = projects
             .iter()
-            .filter(|project| !project.is_inbox && project.parent_id == selected.parent_id)
+            .filter(|project| {
+                !project.is_inbox
+                    && project.parent_id == selected.parent_id
+                    && project.workspace_id == selected.workspace_id
+                    && project.folder_id == selected.folder_id
+            })
             .collect::<Vec<_>>();
         let mut ordered_ids = siblings
             .iter()
@@ -1586,21 +1872,27 @@ impl Store {
             .context("target project is missing from its sibling order")?;
         ordered_ids.swap(selected_position, target_position);
 
-        for (child_order, id) in ordered_ids.iter().enumerate() {
+        for (position, id) in ordered_ids.iter().enumerate() {
             tx.execute(
                 "UPDATE projects SET child_order=?2 WHERE id=?1",
-                params![id, child_order as i64],
+                params![id, siblings[position].child_order],
             )?;
         }
+        let scope = order_storage::project_scope(selected);
         let order = projects_from(&tx)?
             .into_iter()
-            .filter(|project| !project.is_inbox)
-            .map(|project| ProjectOrder {
+            .filter(|project| {
+                !project.is_inbox
+                    && project.parent_id == selected.parent_id
+                    && project.workspace_id == selected.workspace_id
+                    && project.folder_id == selected.folder_id
+            })
+            .map(|project| TaskOrder {
                 id: project.id,
                 child_order: project.child_order,
             })
             .collect();
-        queue_project_reorder(&tx, project_id, order)?;
+        order_storage::queue_plan(&tx, project_id, scope, order, true)?;
         tx.commit()?;
         Ok(true)
     }
@@ -1621,27 +1913,39 @@ impl Store {
             "completed tasks cannot be reordered"
         );
         anyhow::ensure!(
-            selected.project_id == target.project_id && selected.parent_id == target.parent_id,
+            selected.project_id == target.project_id
+                && selected.parent_id == target.parent_id
+                && selected.section_id == target.section_id,
             "tasks can only be reordered among siblings"
         );
 
         let sql = if selected.parent_id.is_some() {
             "SELECT id FROM tasks
-             WHERE project_id=?1 AND parent_id=?2 AND checked=0 AND deleted=0
+             WHERE project_id=?1 AND parent_id=?2 AND section_id IS ?3 AND checked=0 AND deleted=0
              ORDER BY child_order,id"
         } else {
             "SELECT id FROM tasks
-             WHERE project_id=?1 AND parent_id IS NULL AND checked=0 AND deleted=0
+             WHERE project_id=?1 AND parent_id IS NULL AND section_id IS ?3 AND checked=0 AND deleted=0
              ORDER BY child_order,id"
         };
         let mut ordered_ids = {
             let mut stmt = tx.prepare(sql)?;
             if let Some(parent_id) = selected.parent_id.as_deref() {
-                stmt.query_map(params![selected.project_id, parent_id], |row| row.get(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()?
+                stmt.query_map(
+                    params![selected.project_id, parent_id, selected.section_id],
+                    |row| row.get(0),
+                )?
+                .collect::<rusqlite::Result<Vec<String>>>()?
             } else {
-                stmt.query_map([selected.project_id.as_str()], |row| row.get(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()?
+                stmt.query_map(
+                    params![
+                        selected.project_id,
+                        Option::<String>::None,
+                        selected.section_id
+                    ],
+                    |row| row.get(0),
+                )?
+                .collect::<rusqlite::Result<Vec<String>>>()?
             }
         };
         let selected_position = ordered_ids
@@ -1666,7 +1970,13 @@ impl Store {
                 child_order,
             });
         }
-        queue_task_reorder(&tx, &task_id, order)?;
+        order_storage::queue_plan(
+            &tx,
+            &task_id,
+            order_storage::task_scope(&selected),
+            order,
+            true,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1763,8 +2073,19 @@ impl Store {
              ORDER BY seq LIMIT 1", [], row_to_outbox,
         ).optional()?;
         if let Some(entry) = &entry {
+            tx.execute("UPDATE outbox SET checkpoint=json_set(CASE WHEN checkpoint='null' THEN '{}' ELSE checkpoint END,'$.key_migration',json('true')) WHERE seq=?1 AND claimed=0",[entry.seq])?;
             tx.execute("UPDATE outbox SET claimed=1 WHERE seq=?1", [entry.seq])?;
         }
+        let entry = entry
+            .map(|mut entry| -> Result<_> {
+                entry.checkpoint = serde_json::from_str(&tx.query_row(
+                    "SELECT checkpoint FROM outbox WHERE seq=?1",
+                    [entry.seq],
+                    |row| row.get::<_, String>(0),
+                )?)?;
+                Ok(entry)
+            })
+            .transpose()?;
         tx.commit()?;
         Ok(entry)
     }
@@ -1797,6 +2118,10 @@ impl Store {
             )
             .optional()?;
         if let Some(entry) = entry {
+            let rejected_move = matches!(
+                &entry.operation,
+                Operation::MoveTask { .. } | Operation::MoveTaskParent { .. }
+            );
             let mut checkpoint = if entry.checkpoint.is_object() {
                 entry.checkpoint
             } else {
@@ -1826,6 +2151,11 @@ impl Store {
                 "UPDATE outbox SET error=?2,checkpoint=?3 WHERE seq=?1",
                 params![seq, message, serde_json::to_string(&checkpoint)?],
             )?;
+            // Corrections queued while this request was in flight become safe
+            // to unblock only once the original move is definitely rejected.
+            if rejected_move && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind') IN ('move_task','move_task_parent'))",params![entry.entity_id,seq],|row|row.get::<_,bool>(0))? {
+                supersede_rejected_task_moves(&tx,&entry.entity_id)?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1924,6 +2254,9 @@ impl Store {
             child_order: task.child_order,
             checked: task.checked || task.is_completed,
             assignee: assignee_name.clone(),
+            section_id: self
+                .task_order_section(&task.id)
+                .unwrap_or_else(|_| current.section_id.clone()),
         };
         preserve_pending_task_fields(&tx, old_id, add_seq, &current, &mut updated)?;
         let pending_assignee: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind')='update_assignee')", params![old_id, add_seq], |row| row.get(0))?;
@@ -1940,12 +2273,12 @@ impl Store {
             tx.execute(
             "UPDATE OR REPLACE tasks SET id=?2,project_id=?3,content=?4,description=?5,labels_json=?6,
              due_json=?7,priority=?8,child_order=?9,checked=?10,deleted=?11,parent_id=?12,
-             responsible_uid=?13,assignee_name=?14 WHERE id=?1",
+             responsible_uid=?13,assignee_name=?14,section_id=?15 WHERE id=?1",
             params![old_id,task.id,updated.project_id,updated.content,updated.description,
                 serde_json::to_string(&updated.labels)?,updated.due.as_ref().map(serde_json::to_string).transpose()?,
                     updated.priority,updated.child_order,
                     updated.checked,locally_deleted,updated.parent_id,
-                    responsible_uid,updated.assignee],
+                    responsible_uid,updated.assignee,updated.section_id],
         )?;
         }
         remap_task_id(&tx, old_id, &task.id)?;
@@ -2008,43 +2341,8 @@ impl Store {
             "UPDATE outbox SET entity_id=?2 WHERE entity_id=?1",
             params![old_id, new_id],
         )?;
-        let queued = {
-            let mut stmt = tx.prepare("SELECT seq,payload FROM outbox ORDER BY seq")?;
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (seq, payload) in queued {
-            let mut operation = serde_json::from_str::<Operation>(&payload)?;
-            let changed = match &mut operation {
-                Operation::QuickAdd { project_id, .. }
-                | Operation::MoveTask { project_id }
-                | Operation::MoveTaskParent { project_id, .. }
-                    if project_id == old_id =>
-                {
-                    *project_id = new_id.to_owned();
-                    true
-                }
-                Operation::ReorderProjects { projects } => {
-                    let mut changed = false;
-                    for project in projects {
-                        if project.id == old_id {
-                            project.id = new_id.to_owned();
-                            changed = true;
-                        }
-                    }
-                    changed
-                }
-                _ => false,
-            };
-            if changed {
-                tx.execute(
-                    "UPDATE outbox SET payload=?2 WHERE seq=?1",
-                    params![seq, serde_json::to_string(&operation)?],
-                )?;
-            }
-        }
+        rewrite_project_references(&tx, old_id, new_id)?;
+        order_storage::remap(&tx, old_id, new_id, true)?;
         tx.execute(
             "INSERT INTO project_id_aliases(old_id,new_id) VALUES(?1,?2)
              ON CONFLICT(old_id) DO UPDATE SET new_id=excluded.new_id",
@@ -2187,6 +2485,11 @@ impl Store {
         labels: &[RemoteLabel],
         filters: &[RemoteFilter],
     ) -> Result<()> {
+        self.merge_order_metadata(&serde_json::json!({
+            "projects":projects.iter().map(|project|serde_json::json!({"id":project.id,"parent_id":project.parent_id,"workspace_id":project.workspace_id,"child_order":project.child_order,"is_deleted":project.is_deleted,"is_archived":project.is_archived,"is_inbox_project":project.is_inbox_project})).collect::<Vec<_>>(),
+            "items":tasks,
+            "filters":filters.iter().map(|filter|serde_json::json!({"id":filter.id,"workspace_id":filter.workspace_id,"item_order":filter.item_order,"is_deleted":filter.is_deleted})).collect::<Vec<_>>()
+        }),false)?;
         self.merge_remote_snapshot(projects, tasks, labels, filters, false, None)
     }
 
@@ -2203,6 +2506,7 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let collaborator_names = collaborator_names(&tx)?;
         let (pending_tasks, pending_filters, pending_projects) = pending_entity_ids(&tx)?;
+        let protected_order = order_storage::protected_ordinals(&tx)?;
         let mut transferred_inbox_hidden = None;
         if let Some(remote_inbox) = projects
             .iter()
@@ -2222,6 +2526,7 @@ impl Store {
                 )?;
                 tx.execute("DELETE FROM projects WHERE id=?1", [&old])?;
                 rewrite_project_references(&tx, &old, &remote_inbox.id)?;
+                order_storage::remap(&tx, &old, &remote_inbox.id, true)?;
                 tx.execute("INSERT INTO project_id_aliases(old_id,new_id) VALUES(?1,?2) ON CONFLICT(old_id) DO UPDATE SET new_id=excluded.new_id", params![old, remote_inbox.id])?;
                 transferred_inbox_hidden = Some((remote_inbox.id.as_str(), is_hidden));
             }
@@ -2290,9 +2595,9 @@ impl Store {
                 "INSERT INTO projects(id,name,parent_id,child_order,workspace_id,is_inbox,is_shared,can_assign,deleted)
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
                  ON CONFLICT(id) DO UPDATE SET name=excluded.name,parent_id=excluded.parent_id,
-                 child_order=excluded.child_order,workspace_id=excluded.workspace_id,is_inbox=excluded.is_inbox,
+                  child_order=CASE WHEN ?10 THEN projects.child_order ELSE excluded.child_order END,workspace_id=excluded.workspace_id,is_inbox=excluded.is_inbox,
                  is_shared=excluded.is_shared,can_assign=excluded.can_assign,deleted=excluded.deleted",
-                params![p.id,p.name,p.parent_id,p.child_order,p.workspace_id,inbox,p.shared,p.can_assign_tasks,p.is_deleted || p.is_archived],
+                params![p.id,p.name,p.parent_id,p.child_order,p.workspace_id,inbox,p.shared,p.can_assign_tasks,p.is_deleted || p.is_archived,protected_order.contains(&p.id)],
             )?;
         }
         if let Some((remote_inbox_id, is_hidden)) = transferred_inbox_hidden {
@@ -2310,18 +2615,19 @@ impl Store {
                 .as_ref()
                 .and_then(|id| collaborator_names.get(id))
                 .cloned();
+            let due = reconciled_due(&tx, &task.id, task.due.as_ref())?;
             tx.execute(
                 "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id,responsible_uid,assignee_name)
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                  ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,content=excluded.content,
                  description=excluded.description,labels_json=excluded.labels_json,due_json=excluded.due_json,
-                 priority=excluded.priority,child_order=excluded.child_order,checked=excluded.checked,
+                  priority=excluded.priority,child_order=CASE WHEN ?14 OR (tasks.checked=1 AND excluded.checked=1) THEN tasks.child_order ELSE excluded.child_order END,checked=excluded.checked,
                  deleted=excluded.deleted,parent_id=excluded.parent_id,
                  responsible_uid=excluded.responsible_uid,assignee_name=excluded.assignee_name",
                 params![task.id,task.project_id,task.content,task.description,serde_json::to_string(&task.labels)?,
-                    task.due.as_ref().map(serde_json::to_string).transpose()?,task.priority,task.child_order,
+                    due.as_ref().map(serde_json::to_string).transpose()?,task.priority,task.child_order,
                     task.checked || task.is_completed,task.is_deleted,task.parent_id,
-                    task.responsible_uid,assignee_name],
+                    task.responsible_uid,assignee_name,protected_order.contains(&task.id)],
             )?;
         }
         for label in labels {
@@ -2348,6 +2654,8 @@ impl Store {
                 tx.execute("DELETE FROM filter_tasks WHERE filter_id=?1", [&filter.id])?;
             }
         }
+        order_storage::hydrate(&tx)?;
+        order_storage::reconcile(&tx)?;
         if let Some(token) = sync_token {
             tx.execute("INSERT INTO meta(key,value) VALUES('sync_token',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [token])?;
         }
@@ -2372,22 +2680,24 @@ impl Store {
                 .as_ref()
                 .and_then(|id| collaborator_names.get(id))
                 .cloned();
+            let due = reconciled_due(&tx, &task.id, task.due.as_ref())?;
             tx.execute(
                 "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id,responsible_uid,assignee_name)
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11,?12)
                  ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,content=excluded.content,
                  description=excluded.description,labels_json=excluded.labels_json,due_json=excluded.due_json,
-                 priority=excluded.priority,child_order=excluded.child_order,deleted=excluded.deleted,
+                  priority=excluded.priority,child_order=tasks.child_order,deleted=excluded.deleted,
                  parent_id=excluded.parent_id,responsible_uid=excluded.responsible_uid,
                  assignee_name=excluded.assignee_name
                  WHERE tasks.checked=1",
                 params![task.id,task.project_id,task.content,task.description,
                     serde_json::to_string(&task.labels)?,
-                    task.due.as_ref().map(serde_json::to_string).transpose()?,
+                    due.as_ref().map(serde_json::to_string).transpose()?,
                     task.priority,task.child_order,task.is_deleted,task.parent_id,
                     task.responsible_uid,assignee_name],
             )?;
         }
+        order_storage::hydrate(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -2397,6 +2707,7 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let collaborator_names = collaborator_names(&tx)?;
         let (pending_tasks, _, _) = pending_entity_ids(&tx)?;
+        let protected_order = order_storage::protected_ordinals(&tx)?;
         // Refresh active matches while retaining cached membership for tasks
         // completed from this filter, so they remain available in its history.
         tx.execute(
@@ -2411,18 +2722,19 @@ impl Store {
                     .as_ref()
                     .and_then(|id| collaborator_names.get(id))
                     .cloned();
+                let due = reconciled_due(&tx, &task.id, task.due.as_ref())?;
                 tx.execute(
                     "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id,responsible_uid,assignee_name)
                      VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                      ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,content=excluded.content,
                      description=excluded.description,labels_json=excluded.labels_json,due_json=excluded.due_json,
-                     priority=excluded.priority,child_order=excluded.child_order,checked=excluded.checked,
+                     priority=excluded.priority,child_order=CASE WHEN ?14 THEN tasks.child_order ELSE excluded.child_order END,checked=excluded.checked,
                      deleted=excluded.deleted,parent_id=excluded.parent_id,
                      responsible_uid=excluded.responsible_uid,assignee_name=excluded.assignee_name",
                     params![task.id,task.project_id,task.content,task.description,serde_json::to_string(&task.labels)?,
-                        task.due.as_ref().map(serde_json::to_string).transpose()?,task.priority,task.child_order,
+                        due.as_ref().map(serde_json::to_string).transpose()?,task.priority,task.child_order,
                         task.checked || task.is_completed,task.is_deleted,task.parent_id,
-                        task.responsible_uid,assignee_name],
+                        task.responsible_uid,assignee_name,protected_order.contains(&task.id)],
                 )?;
             }
             if !task.checked && !task.is_deleted {
@@ -2432,6 +2744,8 @@ impl Store {
                 )?;
             }
         }
+        order_storage::hydrate(&tx)?;
+        order_storage::reconcile(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -2445,28 +2759,66 @@ enum ProjectDisplayGroup {
 
 fn project_display_group(
     project: &Project,
-    projects_by_id: &HashMap<&str, &Project>,
+    project_spaces: &HashMap<&str, u8>,
 ) -> ProjectDisplayGroup {
     if project.is_hidden {
         return ProjectDisplayGroup::Hidden;
     }
-    let mut root = project;
-    let mut visited = HashSet::new();
-    visited.insert(root.id.as_str());
-    while let Some(parent) = root
-        .parent_id
-        .as_deref()
-        .and_then(|parent_id| projects_by_id.get(parent_id).copied())
-        .filter(|parent| !parent.is_hidden && visited.insert(parent.id.as_str()))
-    {
-        root = parent;
+    ProjectDisplayGroup::Space(project_spaces[project.id.as_str()])
+}
+
+fn project_display_spaces(projects: &[Project]) -> HashMap<&str, u8> {
+    let by_id = projects
+        .iter()
+        .map(|project| (project.id.as_str(), project))
+        .collect::<HashMap<_, _>>();
+    let mut spaces = HashMap::with_capacity(projects.len());
+    for project in projects {
+        if spaces.contains_key(project.id.as_str()) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut positions = HashMap::new();
+        let mut current = project.id.as_str();
+        let space = loop {
+            if let Some(space) = spaces.get(current) {
+                break *space;
+            }
+            if let Some(&start) = positions.get(current) {
+                // A cycle has no real root. Choose the same stable anchor for
+                // every member and descendant, independent of Todoist order.
+                let anchor = path[start..].iter().min().expect("non-empty project cycle");
+                break by_id[anchor].space();
+            }
+            positions.insert(current, path.len());
+            path.push(current);
+            let ancestor = by_id[current];
+            match ancestor
+                .parent_id
+                .as_deref()
+                .filter(|parent| by_id.contains_key(parent))
+            {
+                Some(parent) => current = parent,
+                None => {
+                    break if ancestor.is_inbox {
+                        0
+                    } else {
+                        ancestor.space()
+                    };
+                }
+            }
+        };
+        for id in path {
+            spaces.insert(id, space);
+        }
     }
-    ProjectDisplayGroup::Space(root.space())
+    spaces
 }
 
 fn project_hierarchy_rows(
     projects: &[&Project],
     counts: &HashMap<String, usize>,
+    project_spaces: &HashMap<&str, u8>,
 ) -> Vec<(u8, NavRow)> {
     let visible_ids = projects
         .iter()
@@ -2485,7 +2837,7 @@ fn project_hierarchy_rows(
             project,
             projects,
             counts,
-            project.space(),
+            project_spaces[project.id.as_str()],
             0,
             &mut visited,
             &mut rows,
@@ -2499,7 +2851,7 @@ fn project_hierarchy_rows(
                 project,
                 projects,
                 counts,
-                project.space(),
+                project_spaces[project.id.as_str()],
                 0,
                 &mut visited,
                 &mut rows,
@@ -2550,8 +2902,9 @@ fn append_project_tree(
 
 fn projects_from(conn: &Connection) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare(
-        "SELECT id,name,parent_id,child_order,workspace_id,is_inbox,is_shared,can_assign,space_override,is_hidden
-         FROM projects WHERE deleted=0 ORDER BY child_order,id",
+        "SELECT p.id,p.name,p.parent_id,p.child_order,p.workspace_id,p.is_inbox,p.is_shared,p.can_assign,p.space_override,p.is_hidden,p.folder_id
+         FROM projects p LEFT JOIN order_meta f ON f.resource='folder' AND f.id=p.folder_id
+         WHERE p.deleted=0 ORDER BY COALESCE(p.workspace_id,''),COALESCE(f.rank,p.child_order),p.child_order,p.id",
     )?;
     let rows = stmt.query_map([], row_to_project)?;
     rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
@@ -2600,7 +2953,7 @@ fn row_to_filter(row: &rusqlite::Row<'_>) -> rusqlite::Result<Filter> {
 fn project_from(conn: &Connection, id: &str) -> Result<Option<Project>> {
     Ok(conn
         .query_row(
-            "SELECT id,name,parent_id,child_order,workspace_id,is_inbox,is_shared,can_assign,space_override,is_hidden
+            "SELECT id,name,parent_id,child_order,workspace_id,is_inbox,is_shared,can_assign,space_override,is_hidden,folder_id
              FROM projects WHERE id=?1 AND deleted=0",
             [id],
             row_to_project,
@@ -2611,7 +2964,7 @@ fn project_from(conn: &Connection, id: &str) -> Result<Option<Project>> {
 fn task_from(conn: &Connection, id: &str) -> Result<Option<Task>> {
     Ok(conn
         .query_row(
-            "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name
+            "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
              FROM tasks WHERE id=?1 AND deleted=0",
             [id],
             row_to_task,
@@ -2620,7 +2973,7 @@ fn task_from(conn: &Connection, id: &str) -> Result<Option<Task>> {
 }
 
 fn task_from_including_deleted(conn: &Connection, id: &str) -> Result<Option<Task>> {
-    Ok(conn.query_row("SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name FROM tasks WHERE id=?1", [id], row_to_task).optional()?)
+    Ok(conn.query_row("SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id FROM tasks WHERE id=?1", [id], row_to_task).optional()?)
 }
 
 fn preserve_pending_task_fields(
@@ -2637,6 +2990,14 @@ fn preserve_pending_task_fields(
     })? {
         let (entity, payload) = row?;
         let operation: Operation = serde_json::from_str(&payload)?;
+        if let Operation::OrderResources { plans } = &operation
+            && plans.iter().any(|plan| {
+                matches!(plan.scope, OrderScope::Tasks { .. })
+                    && plan.positions.iter().any(|position| position.id == id)
+            })
+        {
+            remote.child_order = local.child_order;
+        }
         if entity != id {
             if let Operation::ReorderTasks { tasks } = &operation
                 && tasks.iter().any(|task| task.id == id)
@@ -2679,17 +3040,22 @@ fn preserve_pending_task_fields(
             Operation::MoveTask { .. } => {
                 remote.project_id.clone_from(&local.project_id);
                 remote.parent_id.clone_from(&local.parent_id);
+                remote.section_id.clone_from(&local.section_id);
                 remote.child_order = local.child_order;
             }
             Operation::MoveTaskParent { .. } => {
                 remote.project_id.clone_from(&local.project_id);
                 remote.parent_id.clone_from(&local.parent_id);
+                remote.section_id.clone_from(&local.section_id);
                 remote.child_order = local.child_order;
             }
             Operation::CompleteTask
             | Operation::UncompleteTask
             | Operation::RestoreCompletion { .. } => {
                 remote.checked = local.checked;
+                if local.checked {
+                    remote.child_order = local.child_order;
+                }
                 if local.due.as_ref().is_some_and(|due| due.is_recurring) {
                     remote.due.clone_from(&local.due);
                 }
@@ -2836,7 +3202,26 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         can_assign_tasks: row.get(7)?,
         space_override: space.filter(|space| *space < PROJECT_SPACE_COUNT),
         is_hidden: row.get(9)?,
+        folder_id: optional_named_column(row, "folder_id")?,
     })
+}
+
+fn reconciled_due(conn: &Connection, id: &str, remote: Option<&Due>) -> Result<Option<Due>> {
+    let mut due = remote.cloned();
+    if let Some(due) = due.as_mut() {
+        let old: Option<String> = conn
+            .query_row("SELECT due_json FROM tasks WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        let old = old
+            .as_deref()
+            .map(serde_json::from_str::<Due>)
+            .transpose()?;
+        due.preserve_preview_anchor(old.as_ref());
+    }
+    Ok(due)
 }
 
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -2856,7 +3241,15 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         checked: row.get(8)?,
         parent_id: row.get(9)?,
         assignee: row.get(10)?,
+        section_id: optional_named_column(row, "section_id")?,
     })
+}
+
+fn optional_named_column(row: &rusqlite::Row<'_>, name: &str) -> rusqlite::Result<Option<String>> {
+    match row.get(name) {
+        Err(rusqlite::Error::InvalidColumnName(_)) => Ok(None),
+        result => result,
+    }
 }
 
 fn append_deleted_task_tree(id: &str, remaining: &mut HashMap<String, Task>, tree: &mut Vec<Task>) {
@@ -2924,12 +3317,9 @@ fn pending_entity_ids_after(
             Operation::AddProject { .. } | Operation::UpdateProject { .. } => {
                 projects.insert(id);
             }
-            Operation::ReorderProjects {
-                projects: reordered,
-            } => projects.extend(reordered.into_iter().map(|project| project.id)),
-            Operation::ReorderTasks { tasks: reordered } => {
-                tasks.extend(reordered.into_iter().map(|task| task.id));
-            }
+            Operation::ReorderProjects { .. }
+            | Operation::ReorderTasks { .. }
+            | Operation::OrderResources { .. } => {}
             _ => {
                 tasks.insert(id);
             }
@@ -2967,6 +3357,22 @@ fn queue(tx: &Transaction<'_>, entity_id: &str, operation: Operation) -> Result<
             serde_json::to_string(&operation)?
         ],
     )?;
+    Ok(())
+}
+
+fn supersede_rejected_task_moves(tx: &Transaction<'_>, id: &str) -> Result<()> {
+    let rejected = tx.prepare("SELECT seq FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind') IN ('move_task','move_task_parent') ORDER BY seq")?
+        .query_map([id],|row|row.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for seq in rejected {
+        let placement:Option<(i64,String,String,bool)>=tx.query_row("SELECT seq,entity_id,payload,claimed FROM outbox WHERE seq>?1 ORDER BY seq LIMIT 1",[seq],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
+        if let Some((next_seq, entity, payload, false)) = placement
+            && entity == id
+            && matches!(serde_json::from_str::<Operation>(&payload)?,Operation::OrderResources{plans} if plans.len()==1 && !plans[0].full && plans[0].positions.len()==1 && plans[0].positions[0].id==id)
+        {
+            tx.execute("DELETE FROM outbox WHERE seq=?1", [next_seq])?;
+        }
+        tx.execute("DELETE FROM outbox WHERE seq=?1", [seq])?;
+    }
     Ok(())
 }
 
@@ -3110,42 +3516,6 @@ fn queue_project_rename(tx: &Transaction<'_>, entity_id: &str, name: &str) -> Re
     Ok(())
 }
 
-fn queue_project_reorder(
-    tx: &Transaction<'_>,
-    entity_id: &str,
-    projects: Vec<ProjectOrder>,
-) -> Result<()> {
-    let stale = {
-        let mut stmt = tx.prepare(
-            "SELECT seq,payload FROM outbox WHERE claimed=0 OR error IS NOT NULL ORDER BY seq",
-        )?;
-        stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
-        .filter_map(|row| match row {
-            Ok((seq, payload))
-                if matches!(
-                    serde_json::from_str::<Operation>(&payload),
-                    Ok(Operation::ReorderProjects { .. })
-                ) =>
-            {
-                Some(Ok(seq))
-            }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for seq in stale {
-        tx.execute("DELETE FROM outbox WHERE seq=?1", [seq])?;
-    }
-    queue(tx, entity_id, Operation::ReorderProjects { projects })
-}
-
-fn queue_task_reorder(tx: &Transaction<'_>, entity_id: &str, tasks: Vec<TaskOrder>) -> Result<()> {
-    queue(tx, entity_id, Operation::ReorderTasks { tasks })
-}
-
 fn rewrite_task_references(tx: &Transaction<'_>, old_id: &str, new_id: &str) -> Result<()> {
     let entries = {
         let mut stmt = tx.prepare("SELECT seq,payload FROM outbox ORDER BY seq")?;
@@ -3175,6 +3545,24 @@ fn rewrite_task_references(tx: &Transaction<'_>, old_id: &str, new_id: &str) -> 
                 }
                 changed
             }
+            Operation::OrderResources { plans } => {
+                let mut changed = false;
+                for plan in plans {
+                    if let OrderScope::Tasks { parent_id, .. } = &mut plan.scope {
+                        for position in &mut plan.positions {
+                            if position.id == old_id {
+                                position.id = new_id.to_owned();
+                                changed = true;
+                            }
+                        }
+                        if parent_id.as_deref() == Some(old_id) {
+                            *parent_id = Some(new_id.to_owned());
+                            changed = true;
+                        }
+                    }
+                }
+                changed
+            }
             _ => false,
         };
         if changed {
@@ -3200,6 +3588,7 @@ fn remap_task_id(tx: &Transaction<'_>, old_id: &str, new_id: &str) -> Result<()>
         params![old_id, new_id],
     )?;
     rewrite_task_references(tx, old_id, new_id)?;
+    order_storage::remap(tx, old_id, new_id, false)?;
     tx.execute(
         "UPDATE tasks SET parent_id=?2 WHERE parent_id=?1",
         params![old_id, new_id],
@@ -3248,6 +3637,31 @@ fn rewrite_project_references(tx: &Transaction<'_>, old_id: &str, new_id: &str) 
                 for project in projects {
                     if project.id == old_id {
                         project.id = new_id.to_owned();
+                    }
+                }
+            }
+            Operation::OrderResources { plans } => {
+                for plan in plans {
+                    match &mut plan.scope {
+                        OrderScope::Tasks { project_id, .. }
+                        | OrderScope::Sections { project_id }
+                            if project_id == old_id =>
+                        {
+                            *project_id = new_id.to_owned()
+                        }
+                        OrderScope::Projects { parent_id, .. }
+                            if parent_id.as_deref() == Some(old_id) =>
+                        {
+                            *parent_id = Some(new_id.to_owned())
+                        }
+                        _ => {}
+                    }
+                    if matches!(plan.scope, OrderScope::Projects { .. }) {
+                        for position in &mut plan.positions {
+                            if position.id == old_id {
+                                position.id = new_id.to_owned();
+                            }
+                        }
                     }
                 }
             }
@@ -3370,6 +3784,60 @@ mod tests {
 
     fn remote_task(id: &str, parent: Option<&str>) -> RemoteTask {
         serde_json::from_value(serde_json::json!({"id": id, "project_id": "inbox", "parent_id": parent, "content": id})).unwrap()
+    }
+
+    #[test]
+    fn calendar_preview_anchors_survive_restart_and_remote_or_filter_confirmation() {
+        use chrono::Datelike;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar.db");
+        let store = Store::open(&path).unwrap();
+        let mut task = remote_task("calendar", None);
+        let origin = Local::now().date_naive().with_day(10).unwrap();
+        task.due = Some(Due {
+            string: Some("every 3 months".into()),
+            date: Some(origin.format("%F").to_string()),
+            is_recurring: true,
+            ..Due::default()
+        });
+        store.merge_remote(&[], &[task.clone()], &[], &[]).unwrap();
+        store.set_task_completed("calendar", true).unwrap();
+        let preview = store.task("calendar").unwrap().unwrap().due.unwrap();
+        assert_eq!(preview.preview_anchor.as_ref().unwrap().origin, origin);
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        store.finish_outbox(entry.seq).unwrap();
+        drop(store);
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            store.task("calendar").unwrap().unwrap().due.as_ref(),
+            Some(&preview)
+        );
+        task.due = Some(preview.clone());
+        task.due.as_mut().unwrap().preview_anchor = None;
+        store.merge_remote(&[], &[task.clone()], &[], &[]).unwrap();
+        assert_eq!(
+            store.task("calendar").unwrap().unwrap().due.as_ref(),
+            Some(&preview)
+        );
+        store
+            .replace_filter_membership("cached-filter", &[task.clone()])
+            .unwrap();
+        assert_eq!(
+            store.task("calendar").unwrap().unwrap().due.as_ref(),
+            Some(&preview)
+        );
+        task.due.as_mut().unwrap().date = Some("2030-05-20".into());
+        store.merge_remote(&[], &[task], &[], &[]).unwrap();
+        assert!(
+            store
+                .task("calendar")
+                .unwrap()
+                .unwrap()
+                .due
+                .unwrap()
+                .preview_anchor
+                .is_none()
+        );
     }
 
     #[test]
@@ -3536,7 +4004,7 @@ mod tests {
                 .any(|entry| matches!(entry.operation, Operation::UpdatePriority { priority: 4 }))
         );
         assert!(queued.iter().any(|entry| matches!(&entry.operation, Operation::RestoreDue { due: Some(due) } if due.date.as_deref() == Some("2026-10-14"))));
-        assert!(queued.iter().any(|entry| matches!(&entry.operation, Operation::ReorderTasks { tasks } if tasks[0].child_order == 7)));
+        assert!(queued.iter().any(|entry| matches!(&entry.operation, Operation::OrderResources { plans } if plans[0].positions[0].child_order == 7)));
     }
 
     #[test]
@@ -3687,6 +4155,125 @@ mod tests {
         assert!(store.task("pending").unwrap().is_some());
         assert!(store.task("history").unwrap().is_some());
         assert_eq!(store.sync_token().unwrap(), "new-token");
+    }
+
+    fn team_move_fixture() -> Store {
+        let store = store();
+        let mut team = remote_project("team", "Team");
+        team.workspace_id = Some("workspace".into());
+        let mut root = remote_task("root", None);
+        root.project_id = "team".into();
+        let mut child = remote_task("child", Some("root"));
+        child.project_id = "team".into();
+        store
+            .merge_remote(
+                &[team, remote_project("personal", "Personal")],
+                &[root, child, remote_task("other", None)],
+                &[],
+                &[],
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn rejected_move_correction_unblocks_followups_without_erasing_unrelated_rejections() {
+        let store = team_move_fixture();
+        store.move_task("root", "personal").unwrap();
+        let failed = store.claim_next_outbox().unwrap().unwrap();
+        store
+            .fail_outbox(failed.seq, "Moving from a workspace is not implemented.")
+            .unwrap();
+        store.update_labels("root", &["Keep".into()]).unwrap();
+        store.update_due("other", "invalid").unwrap();
+        let other = store.claim_next_outbox().unwrap().unwrap();
+        assert_eq!(other.entity_id, "other");
+        store.fail_outbox(other.seq, "Unrelated due error").unwrap();
+        assert!(
+            store
+                .task_move_restriction("root", "personal")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .task_move_restriction("root", "team")
+                .unwrap()
+                .is_none()
+        );
+        store.move_task("root", "team").unwrap();
+        assert_eq!(
+            store.outbox_error().unwrap().as_deref(),
+            Some("Unrelated due error")
+        );
+        assert_eq!(store.task("root").unwrap().unwrap().labels, ["Keep"]);
+        assert_eq!(store.task("child").unwrap().unwrap().project_id, "team");
+        assert!(store.outbox().unwrap().iter().all(|entry|entry.seq!=failed.seq && !matches!(&entry.operation,Operation::OrderResources{plans} if plans.iter().any(|plan|matches!(&plan.scope,OrderScope::Tasks{project_id,..} if project_id=="personal")))));
+        assert!(matches!(
+            store.claim_next_outbox().unwrap().unwrap().operation,
+            Operation::UpdateLabels { .. }
+        ));
+    }
+
+    #[test]
+    fn undo_of_a_rejected_move_removes_its_blocker_and_old_placement() {
+        let store = team_move_fixture();
+        let original = store.task("root").unwrap().unwrap();
+        store.move_task("root", "personal").unwrap();
+        let failed = store.claim_next_outbox().unwrap().unwrap();
+        store
+            .fail_outbox(failed.seq, "Forbidden workspace move")
+            .unwrap();
+        store.apply_task_snapshot(&original).unwrap();
+        assert!(store.outbox_error().unwrap().is_none());
+        let next = store.claim_next_outbox().unwrap().unwrap();
+        assert!(matches!(next.operation,Operation::MoveTask{project_id} if project_id=="team"));
+        assert_ne!(next.uuid, failed.uuid);
+        assert_eq!(store.task("child").unwrap().unwrap().project_id, "team");
+    }
+
+    #[test]
+    fn correction_during_an_inflight_move_waits_for_its_confirmed_rejection() {
+        let store = team_move_fixture();
+        store.move_task("root", "personal").unwrap();
+        let inflight = store.claim_next_outbox().unwrap().unwrap();
+        store.move_task("root", "team").unwrap();
+        assert_eq!(
+            store.claim_next_outbox().unwrap().unwrap().uuid,
+            inflight.uuid
+        );
+        assert!(
+            matches!(store.next_outbox().unwrap().unwrap().operation,Operation::MoveTask{project_id} if project_id=="personal")
+        );
+        store
+            .fail_outbox(inflight.seq, "Forbidden workspace move")
+            .unwrap();
+        assert!(store.outbox_error().unwrap().is_none());
+        let next = store.claim_next_outbox().unwrap().unwrap();
+        assert!(matches!(next.operation,Operation::MoveTask{project_id} if project_id=="team"));
+        assert_ne!(next.uuid, inflight.uuid);
+    }
+
+    #[test]
+    fn correcting_a_rejected_move_does_not_discard_a_possibly_sent_placement() {
+        let store = team_move_fixture();
+        store.move_task("root", "personal").unwrap();
+        let failed = store.claim_next_outbox().unwrap().unwrap();
+        let placement = store
+            .outbox()
+            .unwrap()
+            .into_iter()
+            .find(|entry| matches!(entry.operation, Operation::OrderResources { .. }))
+            .unwrap();
+        store.connect().unwrap().execute("UPDATE outbox SET claimed=1,checkpoint=?2 WHERE seq=?1",params![placement.seq,r#"{"keys_done":[false],"keys_writes":[{"command":"item_update","id":"root","field":"order_key","key":"a1"}]}"#]).unwrap();
+        store
+            .fail_outbox(failed.seq, "Confirmed move rejection")
+            .unwrap();
+        store.move_task("root", "team").unwrap();
+        let retained = store.next_outbox().unwrap().unwrap();
+        assert_eq!(retained.seq, placement.seq);
+        assert_eq!(retained.uuid, placement.uuid);
+        assert_eq!(retained.checkpoint["keys_done"], serde_json::json!([false]));
     }
 
     #[test]
@@ -4126,7 +4713,7 @@ mod tests {
             Some(child_id.as_str())
         );
         assert!(matches!(
-            store.outbox().unwrap().last().unwrap().operation,
+            store.outbox().unwrap().iter().rev().nth(1).unwrap().operation,
             Operation::MoveTaskParent {
                 parent_id: Some(ref id), ..
             } if id == &child_id
@@ -4142,7 +4729,14 @@ mod tests {
         store.set_task_parent(&sibling_id, None).unwrap();
         assert_eq!(store.task(&sibling_id).unwrap().unwrap().parent_id, None);
         assert!(matches!(
-            store.outbox().unwrap().last().unwrap().operation,
+            store
+                .outbox()
+                .unwrap()
+                .iter()
+                .rev()
+                .nth(1)
+                .unwrap()
+                .operation,
             Operation::MoveTaskParent {
                 parent_id: None,
                 ..
@@ -4378,7 +4972,7 @@ mod tests {
             task_id
         );
         assert!(matches!(
-            store.outbox().unwrap().last().unwrap().operation,
+            store.outbox().unwrap().iter().rev().nth(1).unwrap().operation,
             Operation::MoveTask { ref project_id } if project_id == "destination"
         ));
     }
@@ -4407,8 +5001,8 @@ mod tests {
         );
         assert!(matches!(
             store.outbox().unwrap().last().unwrap().operation,
-            Operation::ReorderTasks { ref tasks }
-                if tasks.iter().map(|task| task.id.as_str()).collect::<Vec<_>>()
+            Operation::OrderResources { ref plans }
+                if plans[0].positions.iter().map(|task| task.id.as_str()).collect::<Vec<_>>()
                     == [second_id.as_str(), first_id.as_str()]
         ));
     }
@@ -4580,8 +5174,8 @@ mod tests {
         assert_eq!(outbox.len(), 1);
         assert!(matches!(
             &outbox[0].operation,
-            Operation::ReorderProjects { projects }
-                if projects.iter().map(|project| project.id.as_str()).collect::<Vec<_>>()
+            Operation::OrderResources { plans }
+                if plans[0].positions.iter().map(|project| project.id.as_str()).collect::<Vec<_>>()
                     == ["b", "hidden", "a", "other"]
         ));
 
@@ -4782,6 +5376,209 @@ mod tests {
                 ("Other".into(), 0)
             ]
         );
+    }
+
+    fn navigation_group_names(rows: &[NavRow]) -> Vec<Vec<&str>> {
+        let mut groups = vec![Vec::new()];
+        for row in rows {
+            match row {
+                NavRow::Item { name, .. } => groups.last_mut().unwrap().push(name.as_str()),
+                NavRow::Separator => groups.push(Vec::new()),
+            }
+        }
+        groups.retain(|group| !group.is_empty());
+        groups
+    }
+
+    #[test]
+    fn visible_descendants_keep_a_hidden_roots_space_across_refresh_and_restart() {
+        let store = store();
+        let root = remote_project("root", "Root");
+        let mut middle = remote_project("middle", "Hidden middle");
+        middle.parent_id = Some("root".into());
+        let mut child = remote_project("child", "Visible child");
+        child.parent_id = Some("middle".into());
+        let mut grandchild = remote_project("grandchild", "Grandchild");
+        grandchild.parent_id = Some("child".into());
+        grandchild.child_order = 0;
+        let mut peer = remote_project("peer", "Peer");
+        peer.parent_id = Some("middle".into());
+        peer.child_order = 2;
+        let mut personal = remote_project("personal", "Personal");
+        personal.child_order = 10;
+        let mut team = remote_project("team", "Team");
+        team.workspace_id = Some("workspace".into());
+        team.child_order = 20;
+        let mut seven = remote_project("seven", "Space seven");
+        seven.child_order = 30;
+        let remote = vec![root, middle, child, grandchild, peer, personal, team, seven];
+        store.merge_remote(&remote, &[], &[], &[]).unwrap();
+        for (id, space) in [("root", 7), ("seven", 7), ("child", 2), ("peer", 9)] {
+            store.toggle_space(id, space).unwrap();
+        }
+        store.toggle_project_hidden("root").unwrap();
+        store.toggle_project_hidden("middle").unwrap();
+        let expected = vec![
+            vec!["Inbox", "Today", "Upcoming"],
+            vec!["Personal"],
+            vec!["Team"],
+            vec!["Visible child", "Grandchild", "Peer", "Space seven"],
+        ];
+        assert_eq!(
+            navigation_group_names(&store.nav_rows(false).unwrap()),
+            expected
+        );
+        store.merge_remote(&remote, &[], &[], &[]).unwrap();
+        let reopened = Store::open(store.path.clone()).unwrap();
+        let collapsed = reopened.nav_rows(false).unwrap();
+        assert_eq!(navigation_group_names(&collapsed), expected);
+        assert!(
+            collapsed.iter().any(
+                |row| matches!(row, NavRow::Item { name, depth: 1, .. } if name == "Grandchild")
+            )
+        );
+        let expanded = reopened.nav_rows(true).unwrap();
+        let mut expected_expanded = expected;
+        expected_expanded.push(vec!["Root", "Hidden middle"]);
+        assert_eq!(navigation_group_names(&expanded), expected_expanded);
+        let names = expanded
+            .iter()
+            .filter_map(|row| match row {
+                NavRow::Item { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), names.len());
+    }
+
+    #[test]
+    fn hidden_root_metadata_controls_child_default_space() {
+        let store = store();
+        let mut root = remote_project("root", "Root");
+        root.workspace_id = Some("workspace".into());
+        let mut child = remote_project("child", "Child");
+        child.parent_id = Some("root".into());
+        let personal = remote_project("personal", "Personal");
+        let mut team = remote_project("team", "Team");
+        team.shared = true;
+        let mut remote = vec![root, child, personal, team];
+        store.merge_remote(&remote, &[], &[], &[]).unwrap();
+        store.toggle_project_hidden("root").unwrap();
+        assert_eq!(
+            navigation_group_names(&store.nav_rows(false).unwrap()),
+            vec![
+                vec!["Inbox", "Today", "Upcoming"],
+                vec!["Personal"],
+                vec!["Child", "Team"],
+            ]
+        );
+        // A remote change to the hidden root's default grouping still applies.
+        remote[0].workspace_id = None;
+        remote[1].shared = true;
+        store.merge_remote(&remote, &[], &[], &[]).unwrap();
+        assert_eq!(
+            navigation_group_names(&store.nav_rows(false).unwrap()),
+            vec![
+                vec!["Inbox", "Today", "Upcoming"],
+                vec!["Child", "Personal"],
+                vec!["Team"],
+            ]
+        );
+    }
+
+    #[test]
+    fn sibling_reordering_uses_inherited_spaces_and_preserves_hidden_siblings() {
+        let store = store();
+        let root = remote_project("root", "Root");
+        let mut a = remote_project("a", "A");
+        a.parent_id = Some("root".into());
+        let mut hidden = remote_project("hidden", "Hidden");
+        hidden.parent_id = Some("root".into());
+        hidden.child_order = 2;
+        let mut b = remote_project("b", "B");
+        b.parent_id = Some("root".into());
+        b.child_order = 3;
+        store
+            .merge_remote(&[root, a, hidden, b], &[], &[], &[])
+            .unwrap();
+        for (id, space) in [("root", 7), ("a", 1), ("b", 9)] {
+            store.toggle_space(id, space).unwrap();
+        }
+        store.toggle_project_hidden("root").unwrap();
+        store.toggle_project_hidden("hidden").unwrap();
+
+        assert!(store.move_project("a", true).unwrap());
+        assert!(!store.move_project("a", true).unwrap());
+        let siblings = store
+            .projects()
+            .unwrap()
+            .into_iter()
+            .filter(|project| project.parent_id.as_deref() == Some("root"))
+            .map(|project| (project.id, project.child_order))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            siblings,
+            [("b".into(), 0), ("hidden".into(), 1), ("a".into(), 2)]
+        );
+        assert_eq!(
+            navigation_group_names(&store.nav_rows(false).unwrap()),
+            vec![vec!["Inbox", "Today", "Upcoming"], vec!["B", "A"]]
+        );
+        assert!(store.move_project("a", false).unwrap());
+        assert_eq!(store.outbox().unwrap().len(), 1);
+        assert!(
+            matches!(&store.outbox().unwrap()[0].operation, Operation::OrderResources { plans }
+            if plans[0].positions.iter().map(|project| project.id.as_str()).collect::<Vec<_>>() == ["a", "hidden", "b"])
+        );
+    }
+
+    #[test]
+    fn cyclic_and_missing_project_ancestors_have_stable_spaces_without_duplicates() {
+        let store = store();
+        let mut a = remote_project("a", "A");
+        a.parent_id = Some("b".into());
+        let mut b = remote_project("b", "B");
+        b.parent_id = Some("a".into());
+        let mut child = remote_project("child", "Child");
+        child.parent_id = Some("a".into());
+        child.child_order = 2;
+        let mut orphan = remote_project("orphan", "Orphan");
+        orphan.parent_id = Some("missing".into());
+        let mut self_parent = remote_project("self", "Self");
+        self_parent.parent_id = Some("self".into());
+        store
+            .merge_remote(&[a, b, child, orphan, self_parent], &[], &[], &[])
+            .unwrap();
+        for (id, space) in [("a", 7), ("b", 2), ("child", 4), ("orphan", 3), ("self", 5)] {
+            store.toggle_space(id, space).unwrap();
+        }
+        store.toggle_project_hidden("a").unwrap();
+        for down in [true, false] {
+            let projects = store.projects().unwrap();
+            let spaces = project_display_spaces(&projects);
+            for id in ["a", "b", "child"] {
+                assert_eq!(spaces[id], 7);
+            }
+            assert_eq!(spaces["orphan"], 3);
+            assert_eq!(spaces["self"], 5);
+            for show_hidden in [false, true] {
+                let rows = store.nav_rows(show_hidden).unwrap();
+                let ids = rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        NavRow::Item {
+                            id: NavId::Project(id),
+                            is_inbox: false,
+                            ..
+                        } => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(ids.len(), if show_hidden { 5 } else { 4 });
+                assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len());
+            }
+            assert!(store.move_project("b", down).unwrap());
+        }
     }
 
     #[test]

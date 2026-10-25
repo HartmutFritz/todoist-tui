@@ -22,8 +22,7 @@ use crate::{
 };
 
 const API_BASE: &str = "https://api.todoist.com/api/v1";
-const SYNC_RESOURCES: &str =
-    r#"["projects","items","labels","filters","workspace_filters","collaborators","user"]"#;
+const SYNC_RESOURCES: &str = r#"["projects","items","sections","labels","filters","workspace_filters","collaborators","user"]"#;
 
 #[derive(Debug, Deserialize)]
 struct SyncResponse {
@@ -202,6 +201,7 @@ impl TodoistClient {
                     | Operation::UpdateFilter { .. }
                     | Operation::ReorderProjects { .. }
                     | Operation::ReorderTasks { .. }
+                    | Operation::OrderResources { .. }
             )
         {
             store.finish_outbox(entry.seq)?;
@@ -215,6 +215,7 @@ impl TodoistClient {
                 project_name,
                 parent_id,
                 target_order,
+                placement,
             } => {
                 let is_inbox = store
                     .project(project_id)?
@@ -230,6 +231,11 @@ impl TodoistClient {
                 }
                 let mut task = self.parse_task(store, entry, &text, &mut checkpoint)?;
                 store.map_created_task_id(&entry.entity_id, &task.id)?;
+                if checkpoint["created_order_recorded"] != true {
+                    store.record_created_order(&checkpoint["parsed"])?;
+                    checkpoint["created_order_recorded"]=json!(true);
+                    store.save_checkpoint(entry.seq,&checkpoint)?;
+                }
                 let follow_ups = store.task_follow_up_operations(&task.id, entry.seq)?;
                 let superseded_project = checkpoint["rejected"] == true && follow_ups.iter().any(|operation|
                     matches!(operation, Operation::MoveTask { .. }) || matches!(operation, Operation::QuickEdit { expression, .. } if contains_explicit_project(expression)));
@@ -242,6 +248,7 @@ impl TodoistClient {
                     return Ok(());
                 }
                 if enforce_fallback_project && task.project_id != *project_id && !superseded_project {
+                    store.set_meta("ordering_dirty","true")?;
                     self.step(store, entry, &mut checkpoint, "fallback",
                         "item_move",
                         json!({"id": task.id, "project_id": project_id}),
@@ -249,6 +256,7 @@ impl TodoistClient {
                     task.project_id.clone_from(project_id);
                 }
                 if let Some(parent_id) = parent_id && !superseded_parent {
+                    store.set_meta("ordering_dirty","true")?;
                     let resolved_parent = store.resolve_sync_task_id(parent_id)?;
                     self.step(store, entry, &mut checkpoint, "parent",
                         "item_move",
@@ -257,12 +265,37 @@ impl TodoistClient {
                     task.project_id.clone_from(project_id);
                     task.parent_id = Some(resolved_parent);
                 }
-                if let Some(target_order) = target_order {
-                    self.step(store, entry, &mut checkpoint, "order",
-                        "item_reorder",
-                        json!({"items": [{"id": task.id, "child_order": target_order}]}),
-                    )?;
-                    task.child_order = *target_order;
+                if checkpoint["order"] != true {
+                    let mut key_placement=*placement;
+                    if key_placement.is_none() && let Some(target_order)=target_order {
+                        if checkpoint["key_migration"] != true {
+                            store.set_meta("ordering_dirty","true")?;
+                            match self.step(store,entry,&mut checkpoint,"order","item_reorder",json!({"items":[{"id":task.id,"child_order":target_order}]})) {
+                                Ok(())=>{},
+                                Err(error) if permanent_rejection(&error)=>key_placement=Some(crate::ordering::Placement::Legacy(*target_order)),
+                                Err(error)=>return Err(error),
+                            }
+                        }else{key_placement=Some(crate::ordering::Placement::Legacy(*target_order));}
+                    }
+                    if let Some(placement)=key_placement {
+                        if checkpoint.get("order-keys_writes").is_none() {
+                            self.ensure_order_metadata(store)?;
+                            store.set_meta("ordering_dirty","true")?;
+                            let plan=store.placement_plan(&task.id,placement)?;
+                            checkpoint["placed_index"]=json!(plan.positions[0].child_order);
+                            checkpoint["order_plan"]=serde_json::to_value(&plan)?;
+                            let writes=store.prepare_key_writes(&[plan])?;
+                            checkpoint["order-keys_writes"]=serde_json::to_value(writes)?;
+                            store.save_checkpoint(entry.seq,&checkpoint)?;
+                        }
+                        self.send_key_writes(store,entry,&mut checkpoint,"order-keys")?;
+                        checkpoint["order"]=json!(true);
+                        store.save_checkpoint(entry.seq,&checkpoint)?;
+                    }
+                }
+                if let Some(index)=checkpoint.get("placed_index").and_then(Value::as_i64) {task.child_order=index;}
+                if checkpoint.get("placed_index").is_some() && let Ok(crate::ordering::OrderScope::Tasks{project_id,parent_id,..})=store.task_order_scope(&task.id) {
+                    task.project_id=project_id;task.parent_id=parent_id;
                 }
                 if !description.is_empty() && !superseded_description {
                     self.step(store, entry, &mut checkpoint, "description",
@@ -272,6 +305,10 @@ impl TodoistClient {
                     task.description.clone_from(description);
                 }
                 store.replace_task_id(&task.id, &task)?;
+                if let Some(plan)=checkpoint.get("order_plan") {
+                    store.finish_order_outbox(entry,&[serde_json::from_value(plan.clone())?])?;
+                    return Ok(());
+                }
             }
             Operation::UpdateTask {
                 content,
@@ -328,12 +365,12 @@ impl TodoistClient {
                 "item_update",
                 json!({"id": entry.entity_id, "priority": priority}),
             )?,
-            Operation::MoveTask { project_id } => self.command(
-                entry,
-                "item_move",
-                json!({"id": entry.entity_id, "project_id": project_id}),
-            )?,
-            Operation::MoveTaskParent { parent_id, project_id } => {
+            Operation::MoveTask { project_id } => {
+                store.set_meta("ordering_dirty","true")?;
+                self.command(entry,"item_move",json!({"id":entry.entity_id,"project_id":project_id}))?;
+            },
+            Operation::MoveTaskParent { parent_id, project_id, section_id } => {
+                store.set_meta("ordering_dirty","true")?;
                 if let Some(parent_id) = parent_id {
                     let resolved_parent = store.resolve_sync_task_id(parent_id)?;
                     self.command(
@@ -348,7 +385,7 @@ impl TodoistClient {
                     self.command(
                         entry,
                         "item_move",
-                        task_parent_move_args(&entry.entity_id, None, &destination),
+                        if let Some(section)=section_id {json!({"id":entry.entity_id,"section_id":section})}else{task_parent_move_args(&entry.entity_id, None, &destination)},
                     )?;
                 }
             }
@@ -401,12 +438,48 @@ impl TodoistClient {
                 json!({"id": entry.entity_id, "name": name}),
             )?,
             Operation::ReorderProjects { projects } => {
-                self.command(entry, "project_reorder", project_reorder_args(projects))?
+                let mut checkpoint=checkpoint_object(entry);
+                if checkpoint["key_migration"] != true {
+                    match self.command(entry,"project_reorder",project_reorder_args(projects)) {
+                        Ok(())=>{store.set_meta("ordering_dirty","true")?;store.finish_outbox(entry.seq)?;return Ok(());},
+                        Err(error) if permanent_rejection(&error)=>{},Err(error)=>return Err(error),
+                    }
+                }
+                self.ensure_order_metadata(store)?;
+                let plans=store.legacy_order_plans(projects.iter().map(|project|crate::model::TaskOrder{id:project.id.clone(),child_order:project.child_order}).collect(),true)?;
+                self.push_order_plans(store,entry,&plans,&mut checkpoint)?;
+                return Ok(());
             }
             Operation::ReorderTasks { tasks } => {
-                let tasks = tasks.iter().filter(|task| !task.id.starts_with("local:")).collect::<Vec<_>>();
-                if !tasks.is_empty() { self.command(entry, "item_reorder", json!({"items": tasks}))?; }
+                let mut checkpoint=checkpoint_object(entry);
+                if checkpoint["key_migration"] != true {
+                    match self.command(entry,"item_reorder",json!({"items":tasks})) {
+                        Ok(())=>{store.set_meta("ordering_dirty","true")?;store.finish_outbox(entry.seq)?;return Ok(());},
+                        Err(error) if permanent_rejection(&error)=>{},Err(error)=>return Err(error),
+                    }
+                }
+                self.ensure_order_metadata(store)?;
+                let plans=store.legacy_order_plans(tasks.clone(),false)?;
+                self.push_order_plans(store,entry,&plans,&mut checkpoint)?;
+                return Ok(());
             }
+            Operation::OrderResources {plans}=>{
+                let mut checkpoint=checkpoint_object(entry);
+                self.push_order_plans(store,entry,plans,&mut checkpoint)?;
+                return Ok(());
+            }
+        }
+        if matches!(
+            entry.operation,
+            Operation::QuickEdit { .. }
+                | Operation::AddProject { .. }
+                | Operation::DeleteTask
+                | Operation::CompleteTask
+                | Operation::UncompleteTask
+                | Operation::RestoreCompletion { .. }
+                | Operation::RestoreRecurring { .. }
+        ) {
+            store.set_meta("ordering_dirty", "true")?;
         }
         store.finish_outbox(entry.seq)?;
         Ok(())
@@ -441,7 +514,11 @@ impl TodoistClient {
                 .clone(),
         )
         .context("Todoist Quick Add response did not contain a task")?;
-        checkpoint["parsed"] = serde_json::to_value(&task)?;
+        checkpoint["parsed"] = value
+            .get("task")
+            .or_else(|| value.get("item"))
+            .unwrap_or(&value)
+            .clone();
         store.save_checkpoint(entry.seq, checkpoint)?;
         Ok(task)
     }
@@ -595,19 +672,30 @@ impl TodoistClient {
         let updated = if let Some(updated) = checkpoint.get("updated") {
             serde_json::from_value(updated.clone())?
         } else {
-            let updated = merge_quick_edit(
+            let mut updated = merge_quick_edit(
                 &original,
                 &parsed,
                 expression,
                 description,
                 parsed_project_selected,
             );
+            let section = checkpoint["parsed"]
+                .get("section_id")
+                .filter(|value| !value.is_null())
+                .map(id_value)
+                .transpose()?;
+            if parsed_project_selected
+                && (updated.project_id != original.project_id || section.is_some())
+            {
+                updated.section_id = section;
+            }
             checkpoint["updated"] = serde_json::to_value(&updated)?;
             store.save_checkpoint(entry.seq, &checkpoint)?;
             updated
         };
-        let move_project =
-            (updated.project_id != original.project_id).then(|| updated.project_id.clone());
+        let move_project = (updated.project_id != original.project_id
+            || updated.section_id != original.section_id)
+            .then(|| updated.project_id.clone());
 
         let mut args = json!({
             "id": entry.entity_id,
@@ -628,10 +716,15 @@ impl TodoistClient {
         if let Some(project_id) = move_project
             && checkpoint["move"] != true
         {
+            store.set_meta("ordering_dirty", "true")?;
             self.command_with_uuid(
                 move_uuid,
                 "item_move",
-                json!({"id": entry.entity_id, "project_id": project_id}),
+                if let Some(section) = &updated.section_id {
+                    json!({"id":entry.entity_id,"section_id":section})
+                } else {
+                    json!({"id": entry.entity_id, "project_id": project_id})
+                },
             )?;
             checkpoint["move"] = json!(true);
             store.save_checkpoint(entry.seq, &checkpoint)?;
@@ -648,6 +741,147 @@ impl TodoistClient {
 
     fn command(&self, entry: &OutboxEntry, kind: &str, args: Value) -> Result<()> {
         self.command_with_uuid(&entry.uuid, kind, args)
+    }
+
+    fn ensure_order_metadata(&self, store: &Store) -> Result<()> {
+        if store.ordering_needs_pull()? {
+            self.pull(store)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_workspace_folders(&self, store: &Store, workspace: &str) -> Result<()> {
+        let dirty = store.meta(&format!("folder_dirty:{workspace}"))?.as_deref() == Some("true");
+        if !dirty && !store.folders_need_refresh(workspace)? {
+            return Ok(());
+        }
+        let mut folders = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut request = self
+                .auth(self.http.get(format!("{}/folders", self.base)))
+                .query(&[("workspace_id", workspace), ("limit", "200")]);
+            if let Some(cursor) = &cursor {
+                request = request.query(&[("cursor", cursor)]);
+            }
+            let page: Page<Value> = Self::check(request.send()?)?.json()?;
+            folders.extend(page.results);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        store.replace_workspace_folders(workspace, &folders)?;
+        store.set_meta(&format!("folder_dirty:{workspace}"), "false")
+    }
+
+    fn push_order_plans(
+        &self,
+        store: &Store,
+        entry: &OutboxEntry,
+        plans: &[crate::ordering::OrderPlan],
+        checkpoint: &mut Value,
+    ) -> Result<()> {
+        if checkpoint.get("keys_writes").is_none() {
+            self.ensure_order_metadata(store)?;
+            for workspace in store.order_workspaces(plans)? {
+                self.ensure_workspace_folders(store, &workspace)?;
+            }
+            store.set_meta("ordering_dirty", "true")?;
+            checkpoint["keys_writes"] = serde_json::to_value(store.prepare_key_writes(plans)?)?;
+            store.save_checkpoint(entry.seq, checkpoint)?;
+        }
+        self.send_key_writes(store, entry, checkpoint, "keys")?;
+        for workspace in store.order_workspaces(plans)? {
+            if store.meta(&format!("folder_dirty:{workspace}"))?.as_deref() == Some("true") {
+                self.ensure_workspace_folders(store, &workspace)?;
+            }
+        }
+        store.finish_order_outbox(entry, plans)
+    }
+
+    fn send_key_writes(
+        &self,
+        store: &Store,
+        entry: &OutboxEntry,
+        checkpoint: &mut Value,
+        prefix: &str,
+    ) -> Result<()> {
+        let writes: Vec<crate::ordering::KeyWrite> =
+            serde_json::from_value(checkpoint[format!("{prefix}_writes")].clone())?;
+        let done_field = format!("{prefix}_done");
+        let mut done: Vec<bool> = checkpoint
+            .get(&done_field)
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_else(|| vec![false; writes.len()]);
+        anyhow::ensure!(
+            done.len() == writes.len(),
+            "Ordering checkpoint has an inconsistent command count"
+        );
+        let pending = (0..writes.len())
+            .filter(|index| !done[*index])
+            .collect::<Vec<_>>();
+        for indices in pending.chunks(100) {
+            let commands=indices.iter().map(|index|{
+                let write=&writes[*index];json!({"type":write.command,"uuid":format!("{}-{prefix}-{index}",entry.uuid),"args":{"id":write.id,&write.field:write.key}})
+            }).collect::<Vec<_>>();
+            store.set_meta("ordering_dirty", "true")?;
+            for write in &writes {
+                if write.command == "folder_update"
+                    && let Some(workspace) = store.folder_workspace(&write.id)?
+                {
+                    store.set_meta(&format!("folder_dirty:{workspace}"), "true")?;
+                }
+            }
+            let response = Self::check(
+                self.auth(self.http.post(format!("{}/sync", self.base)))
+                    .form(&[("commands", serde_json::to_string(&commands)?)])
+                    .send()?,
+            )?;
+            let value: Value = response
+                .json()
+                .context("decode ordering command response")?;
+            let statuses = value
+                .get("sync_status")
+                .context("Todoist ordering response omitted statuses")?;
+            let mut failure = None;
+            for index in indices {
+                let uuid = format!("{}-{prefix}-{index}", entry.uuid);
+                match statuses.get(&uuid) {
+                    Some(status) if status == "ok" => {
+                        done[*index] = true;
+                        store.confirm_order_key(&writes[*index])?;
+                    }
+                    Some(status)
+                        if status.get("http_code") == Some(&json!(404))
+                            || status.to_string().contains("ITEM_NOT_FOUND") =>
+                    {
+                        done[*index] = true;
+                        store.mark_order_resource_missing(&writes[*index])?;
+                    }
+                    Some(status) => {
+                        if failure.is_none() {
+                            failure = Some(command_failure(status));
+                        }
+                    }
+                    None => {
+                        if failure.is_none() {
+                            failure = Some(anyhow::anyhow!(
+                                "Todoist ordering response omitted a command status"
+                            ));
+                        }
+                    }
+                }
+            }
+            checkpoint[&done_field] = serde_json::to_value(&done)?;
+            store.save_checkpoint(entry.seq, checkpoint)?;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     fn command_with_uuid(&self, uuid: &str, kind: &str, args: Value) -> Result<()> {
@@ -716,7 +950,8 @@ impl TodoistClient {
                 continue;
             }
             let mut sync: SyncResponse =
-                serde_json::from_value(value).context("decode sync response")?;
+                serde_json::from_value(value.clone()).context("decode sync response")?;
+            store.merge_order_metadata(&value, sync.full_sync)?;
             sync.filters.append(&mut sync.workspace_filters);
             if let Some(user) = sync.user.take() {
                 sync.collaborators.push(user);
@@ -739,6 +974,7 @@ impl TodoistClient {
                 break;
             }
         }
+        store.finish_order_pull()?;
         Ok(())
     }
 
@@ -830,8 +1066,11 @@ impl TodoistClient {
             if let Some(value) = cursor.as_deref() {
                 request = request.query(&[("cursor", value)]);
             }
-            let page: Page<RemoteTask> = Self::check(request.send()?)?.json()?;
-            all.extend(page.results);
+            let page: Page<Value> = Self::check(request.send()?)?.json()?;
+            for item in page.results {
+                store.record_completed_order(&item)?;
+                all.push(serde_json::from_value(item)?);
+            }
             cursor = page.next_cursor;
             if cursor.is_none() {
                 break;
@@ -854,8 +1093,11 @@ impl TodoistClient {
             if let Some(value) = cursor.as_deref() {
                 request = request.query(&[("cursor", value)]);
             }
-            let page: Page<RemoteTask> = Self::check(request.send()?)?.json()?;
-            all.extend(page.results);
+            let page: Page<Value> = Self::check(request.send()?)?.json()?;
+            for item in page.results {
+                store.record_created_order(&item)?;
+                all.push(serde_json::from_value(item)?);
+            }
             cursor = page.next_cursor;
             if cursor.is_none() {
                 break;
@@ -882,6 +1124,12 @@ fn id_value(value: &Value) -> Result<String> {
 }
 
 fn command_failure(status: &Value) -> anyhow::Error {
+    let unsupported_workspace_move = status
+        .pointer("/error_extra/explanation")
+        .and_then(Value::as_str)
+        .is_some_and(|explanation| {
+            explanation.eq_ignore_ascii_case("Moving from a workspace is not implemented.")
+        });
     ApiFailure {
         status: status
             .get("http_code")
@@ -891,7 +1139,9 @@ fn command_failure(status: &Value) -> anyhow::Error {
             .pointer("/error_extra/retry_after")
             .and_then(Value::as_u64)
             .map(Duration::from_secs),
-        message: format!("Todoist rejected operation: {status}"),
+        message: if unsupported_workspace_move {
+            format!("Todoist does not support moving individual tasks out of a team workspace. Undo the rejected move, or use v to return the task to a project in its original team. Original rejection: {status}")
+        } else {format!("Todoist rejected operation: {status}")},
     }
     .into()
 }
@@ -1037,6 +1287,10 @@ fn merge_quick_edit(
 }
 
 #[cfg(test)]
+#[path = "todoist_live_tests.rs"]
+mod live_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{
@@ -1144,9 +1398,434 @@ mod tests {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
             if let Some(worker) = self.worker.take() {
-                worker.join().unwrap();
+                let result = worker.join();
+                if !thread::panicking() {
+                    result.unwrap();
+                }
             }
         }
+    }
+
+    fn ordering_fixture(value: Value) -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        store.merge_order_metadata(&value, false).unwrap();
+        store
+            .merge_remote_snapshot(
+                &serde_json::from_value::<Vec<RemoteProject>>(
+                    value.get("projects").cloned().unwrap_or(json!([])),
+                )
+                .unwrap(),
+                &serde_json::from_value::<Vec<RemoteTask>>(
+                    value.get("items").cloned().unwrap_or(json!([])),
+                )
+                .unwrap(),
+                &[],
+                &[],
+                false,
+                Some("cached-token"),
+            )
+            .unwrap();
+        store.finish_order_pull().unwrap();
+        (dir, store)
+    }
+
+    fn ordering_tasks() -> Value {
+        json!({"projects":[{"id":"p","name":"Project"}],"items":[
+            {"id":"a","project_id":"p","content":"A","order_key":"a0"},
+            {"id":"b","project_id":"p","content":"B","order_key":"a1"},
+            {"id":"c","project_id":"p","content":"C","order_key":"a2"},
+            {"id":"d","project_id":"p","content":"D","order_key":"a3"}
+        ]})
+    }
+
+    fn request_commands(request: &str) -> Vec<Value> {
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let url = reqwest::Url::parse(&format!("http://mock/?{body}")).unwrap();
+        let commands = url
+            .query_pairs()
+            .find(|(key, _)| key == "commands")
+            .unwrap()
+            .1;
+        serde_json::from_str(&commands).unwrap()
+    }
+
+    #[test]
+    fn key_batches_resume_only_failed_commands_with_identical_arguments_after_restart() {
+        use crate::{
+            model::TaskOrder,
+            ordering::{OrderPlan, OrderScope},
+        };
+        let api = MockApi::new();
+        let (dir, store) = ordering_fixture(ordering_tasks());
+        // Reverse a whole sibling scope: three key changes are needed.
+        let operation = Operation::OrderResources {
+            plans: vec![OrderPlan {
+                scope: OrderScope::Tasks {
+                    project_id: "p".into(),
+                    parent_id: None,
+                    section_id: None,
+                },
+                positions: ["d", "c", "b", "a"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, id)| TaskOrder {
+                        id: id.into(),
+                        child_order: index as i64,
+                    })
+                    .collect(),
+                full: true,
+                resolve_scopes: false,
+            }],
+        };
+        let conn = rusqlite::Connection::open(dir.path().join("cache.db")).unwrap();
+        conn.execute(
+            "INSERT INTO outbox(uuid,entity_id,payload) VALUES('batch','a',?1)",
+            [serde_json::to_string(&operation).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        api.respond(200,json!({"sync_status":{
+            "batch-keys-0":"ok","batch-keys-1":{"http_code":500,"error":"temporary"},"batch-keys-2":"ok"
+        }}));
+        assert!(api.client.push(&store, &entry).is_err());
+        let original = request_commands(&api.request());
+        assert_eq!(original.len(), 3);
+        assert!(
+            original
+                .iter()
+                .all(|command| command["type"] == "item_update"
+                    && command["args"].get("order_key").is_some())
+        );
+        drop(store);
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let resumed = store.claim_next_outbox().unwrap().unwrap();
+        assert_eq!(resumed.checkpoint["keys_done"], json!([true, false, true]));
+        // Even if the remote keys changed after a partial success, a possibly
+        // executed command must retain its checkpointed UUID and arguments.
+        let mut remote = ordering_tasks();
+        remote["items"][0]["order_key"] = json!("a9");
+        store.merge_order_metadata(&remote, false).unwrap();
+        api.command("batch-keys-1");
+        api.client.push(&store, &resumed).unwrap();
+        assert_eq!(request_commands(&api.request()), vec![original[1].clone()]);
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn legacy_queues_translate_only_unsent_or_confirmed_rejected_commands() {
+        for (claimed, rejected) in [(false, false), (true, false), (true, true)] {
+            let api = MockApi::new();
+            let (dir, store) = ordering_fixture(ordering_tasks());
+            let operation = Operation::ReorderTasks {
+                tasks: vec![
+                    crate::model::TaskOrder {
+                        id: "b".into(),
+                        child_order: 0,
+                    },
+                    crate::model::TaskOrder {
+                        id: "a".into(),
+                        child_order: 1,
+                    },
+                ],
+            };
+            let conn = rusqlite::Connection::open(dir.path().join("cache.db")).unwrap();
+            conn.execute(
+                "INSERT INTO outbox(uuid,entity_id,payload,claimed) VALUES('legacy','a',?1,?2)",
+                rusqlite::params![serde_json::to_string(&operation).unwrap(), claimed],
+            )
+            .unwrap();
+            drop(conn);
+            let entry = store.claim_next_outbox().unwrap().unwrap();
+            if claimed {
+                if rejected {
+                    api.respond(200,json!({"sync_status":{"legacy":{"http_code":400,"error":"deprecated command"}}}));
+                } else {
+                    api.command("legacy");
+                }
+            }
+            if !claimed || rejected {
+                api.command("legacy-keys-0");
+            }
+            api.client.push(&store, &entry).unwrap();
+            if claimed {
+                assert_eq!(
+                    request_commands(&api.request()),
+                    vec![
+                        json!({"type":"item_reorder","uuid":"legacy","args":{"items":[{"id":"b","child_order":0},{"id":"a","child_order":1}]}})
+                    ]
+                );
+            }
+            if !claimed || rejected {
+                let commands = request_commands(&api.request());
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0]["type"], "item_update");
+                assert_eq!(commands[0]["uuid"], "legacy-keys-0");
+                assert_eq!(commands[0]["args"]["id"], "a");
+                assert!(commands[0]["args"]["order_key"].as_str().unwrap() > "a1");
+            }
+            assert_eq!(store.outbox_len().unwrap(), 0);
+            assert!(api.requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_reorder_paginates_folder_anchors_and_uses_default_keys() {
+        let api = MockApi::new();
+        let (_dir, store) = ordering_fixture(json!({"projects":[
+            {"id":"a","name":"A","workspace_id":"w","child_order":0,"default_order_key":"a0"},
+            {"id":"b","name":"B","workspace_id":"w","child_order":2,"default_order_key":"a2"}
+        ]}));
+        store.move_project("a", true).unwrap();
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        api.respond(200, json!({"results":[],"next_cursor":"page-two"}));
+        api.respond(
+            200,
+            json!({"results":[{"id":"f","workspace_id":"w","default_order":1}],"next_cursor":null}),
+        );
+        api.respond(200,json!({"sync_status":{
+            format!("{}-keys-0",entry.uuid):"ok",format!("{}-keys-1",entry.uuid):"ok",format!("{}-keys-2",entry.uuid):"ok"
+        }}));
+        api.respond(200,json!({"results":[{"id":"f","workspace_id":"w","default_order_key":"a1"}],"next_cursor":null}));
+        api.client.push(&store, &entry).unwrap();
+        let first = api.request();
+        assert!(first.starts_with("GET /folders?") && first.contains("workspace_id=w"));
+        assert!(api.request().contains("cursor=page-two"));
+        let commands = request_commands(&api.request());
+        assert_eq!(commands.len(), 3);
+        assert!(
+            commands
+                .iter()
+                .all(|command| command["args"].get("default_order_key").is_some()
+                    && command["args"].get("order_key").is_none())
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command["type"] == "folder_update" && command["args"]["id"] == "f")
+        );
+        assert!(
+            commands
+                .iter()
+                .filter(|command| command["type"] == "project_update")
+                .count()
+                == 2
+        );
+        assert!(api.request().starts_with("GET /folders?"));
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_pull_reconciles_server_adjusted_keys_and_missing_reorder_targets() {
+        let api = MockApi::new();
+        let (dir, store) = ordering_fixture(ordering_tasks());
+        store.reorder_task("a", "b").unwrap();
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        api.command(&format!("{}-keys-0", entry.uuid));
+        api.client.push(&store, &entry).unwrap();
+        let commands = request_commands(&api.request());
+        let requested = commands[0]["args"]["order_key"].as_str().unwrap();
+        assert!(requested > "a1" && requested < "a2");
+        let mut refreshed = ordering_tasks();
+        refreshed["sync_token"] = json!("after-collision");
+        refreshed["items"][0]["order_key"] = json!("a1l");
+        api.respond(200, refreshed);
+        api.client.pull(&store).unwrap();
+        assert!(api.request().contains("resource_types="));
+        let conn = rusqlite::Connection::open(dir.path().join("cache.db")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT key FROM order_meta WHERE resource='task' AND id='a'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "a1l"
+        );
+        store.reorder_task("a", "c").unwrap();
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        api.respond(200,json!({"sync_status":{format!("{}-keys-0",entry.uuid):{"http_code":404,"error":"ITEM_NOT_FOUND"}}}));
+        api.client.push(&store, &entry).unwrap();
+        assert_eq!(request_commands(&api.request())[0]["args"]["id"], "a");
+        assert!(store.task("a").unwrap().is_none());
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn personal_project_reordering_uses_project_update_order_key() {
+        let api = MockApi::new();
+        let (_dir, store) = ordering_fixture(json!({"projects":[
+            {"id":"a","name":"A","order_key":"a0"},
+            {"id":"b","name":"B","order_key":"a1"}
+        ]}));
+        store.move_project("a", true).unwrap();
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        api.command(&format!("{}-keys-0", entry.uuid));
+        api.client.push(&store, &entry).unwrap();
+        let commands = request_commands(&api.request());
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["type"], "project_update");
+        assert_eq!(commands[0]["args"]["id"], "a");
+        assert!(commands[0]["args"]["order_key"].as_str().unwrap() > "a1");
+        assert!(commands[0]["args"].get("default_order_key").is_none());
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn personal_to_team_task_moves_retry_durably_and_keep_later_edits_and_subtasks() {
+        let (source, destination) = ("personal", "team");
+        let api = MockApi::new();
+        let mut data = json!({"projects":[
+            {"id":"personal","name":"Personal","order_key":"a0"},
+            {"id":"team","name":"Team","workspace_id":"workspace","default_order_key":"a0"}
+        ],"items":[
+            {"id":"root","project_id":source,"section_id":"source-section","content":"Root","order_key":"a0"},
+            {"id":"child","project_id":source,"section_id":"source-section","parent_id":"root","content":"Child","order_key":"a0"},
+            {"id":"grandchild","project_id":source,"section_id":"source-section","parent_id":"child","content":"Grandchild","order_key":"a0"},
+            {"id":"neighbor","project_id":destination,"content":"Neighbor","order_key":"a0"}
+        ]});
+        let (dir, store) = ordering_fixture(data.clone());
+        store.move_task("root", destination).unwrap();
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        assert!(matches!(entry.operation, Operation::MoveTask { .. }));
+        api.respond(500, json!({"error":"temporary transport failure"}));
+        assert!(api.client.push(&store, &entry).is_err());
+        let first = request_commands(&api.request());
+        assert_eq!(
+            first,
+            vec![
+                json!({"type":"item_move","uuid":entry.uuid,"args":{"id":"root","project_id":destination}})
+            ]
+        );
+        store.update_labels("root", &["local".into()]).unwrap();
+        drop(store);
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let resumed = store.claim_next_outbox().unwrap().unwrap();
+        assert_eq!(resumed.uuid, entry.uuid);
+        api.command(&resumed.uuid);
+        api.client.push(&store, &resumed).unwrap();
+        assert_eq!(request_commands(&api.request()), first);
+        for task in data["items"].as_array_mut().unwrap().iter_mut().take(3) {
+            task["project_id"] = json!(destination);
+            task["section_id"] = Value::Null;
+        }
+        data["items"][0]["order_key"] = json!("a1");
+        data["sync_token"] = json!("after-cross-workspace-move");
+        api.respond(200, data);
+        let order = store.claim_next_outbox().unwrap().unwrap();
+        assert!(matches!(order.operation, Operation::OrderResources { .. }));
+        api.client.push(&store, &order).unwrap();
+        let pull = api.request();
+        assert!(pull.contains("sync_token=") && !pull.contains("commands="));
+        for id in ["root", "child", "grandchild"] {
+            let task = store.task(id).unwrap().unwrap();
+            assert_eq!(task.project_id, destination);
+            assert!(task.section_id.is_none());
+        }
+        assert_eq!(
+            store.task("child").unwrap().unwrap().parent_id.as_deref(),
+            Some("root")
+        );
+        assert_eq!(
+            store
+                .task("grandchild")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some("child")
+        );
+        assert_eq!(store.task("root").unwrap().unwrap().labels, ["local"]);
+        let labels = store.claim_next_outbox().unwrap().unwrap();
+        api.command(&labels.uuid);
+        api.client.push(&store, &labels).unwrap();
+        assert_eq!(
+            request_commands(&api.request())[0]["args"],
+            json!({"id":"root","labels":["local"]})
+        );
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn actual_workspace_rejection_survives_restart_and_returning_to_the_team_recovers() {
+        let api = MockApi::new();
+        let data = json!({"projects":[{"id":"team","name":"Team","workspace_id":"workspace","default_order_key":"a0"},{"id":"personal","name":"Personal","order_key":"a0"}],"items":[{"id":"root","project_id":"team","content":"Root","order_key":"a0"},{"id":"child","project_id":"team","parent_id":"root","content":"Child","order_key":"a0"}]});
+        let (dir, store) = ordering_fixture(data.clone());
+        store.move_task("root", "personal").unwrap();
+        let failed = store.claim_next_outbox().unwrap().unwrap();
+        let rejection = json!({"error":"Forbidden","error_code":1,"error_extra":{"explanation":"Moving from a workspace is not implemented."},"error_tag":"FORBIDDEN","http_code":403});
+        api.respond(200, json!({"sync_status":{&failed.uuid:rejection}}));
+        let error = api.client.push(&store, &failed).unwrap_err();
+        assert!(permanent_rejection(&error));
+        assert!(error.to_string().contains("Undo the rejected move"));
+        assert!(
+            error
+                .to_string()
+                .contains("Moving from a workspace is not implemented.")
+        );
+        store.fail_outbox(failed.seq, &error.to_string()).unwrap();
+        assert_eq!(
+            request_commands(&api.request())[0]["args"]["project_id"],
+            "personal"
+        );
+        drop(store);
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        assert!(store.outbox_error().unwrap().is_some());
+        assert!(store.claim_next_outbox().unwrap().is_none());
+        store.move_task("root", "team").unwrap();
+        let correction = store.claim_next_outbox().unwrap().unwrap();
+        api.command(&correction.uuid);
+        api.client.push(&store, &correction).unwrap();
+        assert_eq!(
+            request_commands(&api.request())[0]["args"],
+            json!({"id":"root","project_id":"team"})
+        );
+        let mut refreshed = data;
+        refreshed["sync_token"] = json!("recovered");
+        api.respond(200, refreshed);
+        let placement = store.claim_next_outbox().unwrap().unwrap();
+        api.client.push(&store, &placement).unwrap();
+        assert!(api.request().contains("sync_token="));
+        assert!(store.outbox_error().unwrap().is_none());
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert_eq!(store.task("root").unwrap().unwrap().project_id, "team");
+        assert_eq!(store.task("child").unwrap().unwrap().project_id, "team");
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn claimed_legacy_quick_add_retries_its_original_placement_before_new_key_writes() {
+        let api = MockApi::new();
+        let (dir, store) = ordering_fixture(ordering_tasks());
+        let project = store.project("p").unwrap().unwrap();
+        let id = store
+            .add_task_at_top_with_description("Legacy task", "", &project)
+            .unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("cache.db")).unwrap();
+        // Emulate a pre-migration creation whose parser response was saved,
+        // but whose integer placement may already have reached Todoist.
+        let parsed =
+            json!({"id":"created","project_id":"p","content":"Legacy task","order_key":"a9"});
+        conn.execute("UPDATE outbox SET uuid='old-add',claimed=1,payload=json_remove(payload,'$.placement'),checkpoint=?1 WHERE entity_id=?2",rusqlite::params![json!({"parsed":parsed}).to_string(),id]).unwrap();
+        drop(conn);
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        api.command("old-add-order");
+        api.client.push(&store, &entry).unwrap();
+        assert_eq!(
+            request_commands(&api.request()),
+            vec![json!({
+                "type":"item_reorder","uuid":"old-add-order","args":{"items":[{"id":"created","child_order":0}]}
+            })]
+        );
+        assert!(store.ordering_needs_pull().unwrap());
+        assert_eq!(store.task(&id).unwrap().unwrap().id, "created");
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert!(api.requests.try_recv().is_err());
     }
 
     #[test]
@@ -1155,6 +1834,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
         let store = Store::open(&path).unwrap();
+        let neighbor: RemoteTask = serde_json::from_value(
+            json!({"id":"neighbor","project_id":"inbox","content":"Existing"}),
+        )
+        .unwrap();
+        store.merge_remote(&[], &[neighbor], &[], &[]).unwrap();
+        store
+            .record_created_order(&json!({"id":"neighbor","project_id":"inbox","order_key":"a0"}))
+            .unwrap();
+        store.finish_order_pull().unwrap();
         let inbox = store.project("inbox").unwrap().unwrap();
         let id = store
             .add_task_at_top_with_description("Buy milk", "Description", &inbox)
@@ -1162,9 +1850,9 @@ mod tests {
         let entry = store.claim_next_outbox().unwrap().unwrap();
         api.respond(
             200,
-            json!({"id":"remote-task", "project_id":"inbox", "content":"Buy milk"}),
+            json!({"id":"remote-task", "project_id":"inbox", "content":"Buy milk","order_key":"a1"}),
         );
-        api.command(&format!("{}-order", entry.uuid));
+        api.command(&format!("{}-order-keys-0", entry.uuid));
         api.respond(500, json!({"error":"temporary failure"}));
         assert!(api.client.push(&store, &entry).is_err());
         store
@@ -1186,7 +1874,9 @@ mod tests {
             "remote-task"
         );
         assert!(api.request().starts_with("POST /tasks/quick "));
-        assert!(api.request().contains("item_reorder"));
+        let ordered = api.request();
+        assert!(ordered.contains("item_update") && ordered.contains("order_key"));
+        assert!(!ordered.contains("item_reorder"));
         let first = api.request();
         let retried = api.request();
         assert!(first.contains(&format!("{}-description", entry.uuid)));
@@ -1456,6 +2146,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
         let store = Store::open(&path).unwrap();
+        store.finish_order_pull().unwrap();
         let inbox = store.project("inbox").unwrap().unwrap();
         store.add_task("Captured", &inbox).unwrap();
         let entry = store.claim_next_outbox().unwrap().unwrap();
@@ -1465,7 +2156,7 @@ mod tests {
         let store = Store::open(path).unwrap();
         api.respond(
             200,
-            json!({"id":"only-task","project_id":"inbox","content":"Captured"}),
+            json!({"id":"only-task","project_id":"inbox","content":"Captured","order_key":"a0"}),
         );
         api.client
             .push(&store, &store.claim_next_outbox().unwrap().unwrap())
@@ -1539,6 +2230,19 @@ mod tests {
         assert_eq!(value["timezone"], "Europe/London");
         assert_eq!(value["is_recurring"], true);
         assert_eq!(exact_due_value(None), Value::Null);
+        let mut anchored = due.clone();
+        anchored.preview_anchor = Some(crate::model::RecurrenceAnchor {
+            expression: "every 3 months".into(),
+            origin: chrono::NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
+            expected: chrono::NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(),
+        });
+        assert!(
+            serde_json::to_value(&anchored)
+                .unwrap()
+                .get("preview_anchor")
+                .is_some()
+        );
+        assert_eq!(exact_due_value(Some(&anchored)), value);
         assert_eq!(
             quick_add_request("Plan", "Summer Holiday", false).0,
             "Plan #Summer\\ Holiday"
@@ -1599,23 +2303,29 @@ mod tests {
         let entry = store.claim_next_outbox().unwrap().unwrap();
         api.respond(
             200,
-            json!({"id":"created","project_id":"inbox","content":"Task"}),
+            json!({"id":"created","project_id":"inbox","content":"Task","order_key":"a0"}),
         );
         api.respond(200, json!({"sync_status":{format!("{}-fallback", entry.uuid):{"http_code":400,"error":"Project no longer exists"}}}));
         let error = api.client.push(&store, &entry).unwrap_err();
         assert_eq!(store.task(&id).unwrap().unwrap().id, "created");
         store.fail_outbox(entry.seq, &error.to_string()).unwrap();
         store.move_task(&id, "destination").unwrap();
+        api.respond(200,json!({"sync_token":"current","items":[{"id":"created","project_id":"inbox","content":"Task","order_key":"a0"}]}));
         let resumed = store.claim_next_outbox().unwrap().unwrap();
         api.client.push(&store, &resumed).unwrap();
         let moved = store.claim_next_outbox().unwrap().unwrap();
         api.command(&moved.uuid);
         api.client.push(&store, &moved).unwrap();
+        api.respond(200,json!({"sync_token":"after-move","items":[{"id":"created","project_id":"destination","content":"Task","order_key":"a0"}]}));
+        let ordered = store.claim_next_outbox().unwrap().unwrap();
+        api.client.push(&store, &ordered).unwrap();
         assert_eq!(store.outbox_len().unwrap(), 0);
         assert_eq!(store.task(&id).unwrap().unwrap().project_id, "destination");
         assert!(api.request().starts_with("POST /tasks/quick "));
         assert!(api.request().contains("source"));
+        assert!(api.request().contains("sync_token"));
         assert!(api.request().contains("destination"));
+        assert!(api.request().contains("sync_token"));
         assert!(api.requests.try_recv().is_err());
     }
 
@@ -1658,6 +2368,7 @@ mod tests {
             child_order: 7,
             checked: false,
             assignee: None,
+            section_id: None,
         }
     }
 

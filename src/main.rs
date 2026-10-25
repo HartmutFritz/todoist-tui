@@ -4,6 +4,8 @@ mod config;
 mod editor;
 mod keymap;
 mod model;
+mod ordering;
+mod recurrence;
 mod store;
 mod sync;
 mod todoist;

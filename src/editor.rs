@@ -85,9 +85,10 @@ pub struct EmbeddedEditor {
     rows: u16,
     cols: u16,
     options: EditorOptions,
+    notice: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EditorResult {
     pub purpose: EditorPurpose,
     pub task_id: Option<String>,
@@ -110,6 +111,14 @@ impl EmbeddedEditor {
 
     pub fn save_on_enter_in_insert(&self) -> bool {
         self.options.save_on_enter_in_insert
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub fn set_notice(&mut self, message: String) {
+        self.notice = Some(message);
     }
 
     pub fn open(
@@ -262,6 +271,7 @@ impl EmbeddedEditor {
             rows: rows.max(3),
             cols: cols.max(10),
             options,
+            notice: None,
         })
     }
 
@@ -476,7 +486,13 @@ fn update_cursor_shape(output: &[u8], cursor_shape: &AtomicU8) {
 
 fn character_bytes(character: char, shifted: bool) -> Vec<u8> {
     if shifted && character.is_lowercase() {
-        character.to_uppercase().collect::<String>().into_bytes()
+        let mut uppercase = character.to_uppercase();
+        let first = uppercase.next().unwrap_or(character);
+        if uppercase.next().is_none() {
+            first.to_string().into_bytes()
+        } else {
+            character.to_string().into_bytes()
+        }
     } else {
         character.to_string().into_bytes()
     }
@@ -485,11 +501,33 @@ fn character_bytes(character: char, shifted: bool) -> Vec<u8> {
 fn key_bytes(key: KeyEvent) -> Vec<u8> {
     match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let lower = c.to_ascii_lowercase() as u8;
-            if lower.is_ascii_lowercase() {
-                vec![lower - b'a' + 1]
+            let control = match c.to_ascii_lowercase() {
+                'a'..='z' => Some(c.to_ascii_lowercase() as u8 - b'a' + 1),
+                ' ' | '@' => Some(0),
+                '[' => Some(27),
+                '\\' => Some(28),
+                ']' => Some(29),
+                '^' => Some(30),
+                '_' => Some(31),
+                '?' => Some(127),
+                _ => None,
+            };
+            if let Some(control) = control {
+                let mut bytes = Vec::new();
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    bytes.push(0x1b);
+                }
+                bytes.push(control);
+                bytes
             } else {
-                Vec::new()
+                // Do not truncate Unicode to u8 and accidentally generate an
+                // unrelated ASCII control key on a non-US keyboard.
+                let parameter = 1
+                    + u8::from(key.modifiers.contains(KeyModifiers::SHIFT))
+                    + 2 * u8::from(key.modifiers.contains(KeyModifiers::ALT))
+                    + 4
+                    + 8 * u8::from(key.modifiers.contains(KeyModifiers::SUPER));
+                format!("\x1b[{};{parameter}u", c as u32).into_bytes()
             }
         }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -519,8 +557,43 @@ fn key_bytes(key: KeyEvent) -> Vec<u8> {
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
         KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::F(number) => format!("\x1b[{}~", number + 10).into_bytes(),
+        KeyCode::F(number) => function_key_bytes(number, key.modifiers),
         _ => Vec::new(),
+    }
+}
+
+fn function_key_bytes(number: u8, modifiers: KeyModifiers) -> Vec<u8> {
+    // xterm defines F13–F63 as modified F1–F12. Larger numbers
+    // have no standard xterm encoding; never wrap u8 arithmetic or emit text.
+    let (base, implicit) = match number {
+        1..=12 => (number, KeyModifiers::NONE),
+        13..=24 => (number - 12, KeyModifiers::SHIFT),
+        25..=36 => (number - 24, KeyModifiers::CONTROL),
+        37..=48 => (number - 36, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        49..=60 => (number - 48, KeyModifiers::ALT),
+        61..=63 => (number - 60, KeyModifiers::ALT | KeyModifiers::SHIFT),
+        _ => return Vec::new(),
+    };
+    let modifiers = modifiers | implicit;
+    let parameter = 1
+        + u8::from(modifiers.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(modifiers.contains(KeyModifiers::ALT))
+        + 4 * u8::from(modifiers.contains(KeyModifiers::CONTROL))
+        + 8 * u8::from(modifiers.contains(KeyModifiers::SUPER));
+    if base <= 4 {
+        let letter = b"PQRS"[(base - 1) as usize] as char;
+        if parameter == 1 {
+            format!("\x1bO{letter}").into_bytes()
+        } else {
+            format!("\x1b[1;{parameter}{letter}").into_bytes()
+        }
+    } else {
+        let code = [15, 17, 18, 19, 20, 21, 23, 24][(base - 5) as usize];
+        if parameter == 1 {
+            format!("\x1b[{code}~").into_bytes()
+        } else {
+            format!("\x1b[{code};{parameter}~").into_bytes()
+        }
     }
 }
 
@@ -582,6 +655,73 @@ mod tests {
             key_bytes(KeyEvent::new(KeyCode::Char('ä'), KeyModifiers::NONE)),
             "ä".as_bytes()
         );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Char('ß'), KeyModifiers::SHIFT)),
+            "ß".as_bytes()
+        );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Char('š'), KeyModifiers::CONTROL)),
+            b"\x1b[353;5u"
+        );
+    }
+
+    #[test]
+    fn function_keys_use_standard_sequences_and_high_numbers_never_overflow() {
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
+            b"\x1b[15~"
+        );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::F(12), KeyModifiers::CONTROL)),
+            b"\x1b[24;5~"
+        );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::F(13), KeyModifiers::NONE)),
+            b"\x1b[1;2P"
+        );
+        for number in [0, 64, 245, 255] {
+            assert!(key_bytes(KeyEvent::new(KeyCode::F(number), KeyModifiers::NONE)).is_empty());
+        }
+    }
+
+    #[test]
+    fn forwarded_function_keys_trigger_their_neovim_mappings() {
+        let mut editor =
+            EmbeddedEditor::open_inner(EditorPurpose::Add, None, "", 8, 70, false).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        editor
+            .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        let command = ":lua for _, n in ipairs({1, 4, 5, 12, 13, 24, 36}) do vim.keymap.set(\"i\", \"<F\" .. n .. \">\", \"[\" .. n .. \"]\", {buffer=true}) end";
+        for character in command.chars() {
+            editor
+                .send_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        editor
+            .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        editor
+            .send_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .unwrap();
+        for number in [1, 4, 5, 12, 13, 24, 36] {
+            editor
+                .send_key(KeyEvent::new(KeyCode::F(number), KeyModifiers::NONE))
+                .unwrap();
+        }
+        editor
+            .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        editor
+            .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let result = wait_for_result(&mut editor);
+        assert!(result.accepted);
+        assert_eq!(result.text.trim(), "[1][4][5][12][13][24][36]");
     }
 
     #[test]

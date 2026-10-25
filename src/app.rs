@@ -6,13 +6,17 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use nucleo_matcher::{
+    Matcher, Utf32String,
+    pattern::{AtomKind, CaseMatching, Normalization, Pattern},
+};
 
 use crate::{
     clipboard,
     editor::{EditorCursorShape, EditorOptions, EditorPurpose, EditorResult, EmbeddedEditor},
     keymap::{Action, KeyBindings},
     model::{Filter, NavId, NavRow, Project, Task},
-    store::{Store, TaskViewPreferences},
+    store::{OUTBOX_PAGE_SIZE, OutboxPage, Store, TaskViewPreferences},
     sync::{SyncEvent, SyncFailureKind, SyncManager},
 };
 
@@ -55,8 +59,15 @@ pub enum Overlay {
         message: String,
         scroll: usize,
     },
-    Details(Task),
-    FilterDetails(Filter),
+    Details {
+        task: Task,
+        scroll: usize,
+    },
+    FilterDetails {
+        filter: Filter,
+        scroll: usize,
+    },
+    Outbox(OutboxView),
     LabelPicker {
         task_id: String,
         query: String,
@@ -71,6 +82,7 @@ pub enum Overlay {
         cursor: usize,
         mode: PickerMode,
         projects: Vec<ProjectPickerItem>,
+        search: ProjectSearch,
     },
     TaskPicker {
         query: String,
@@ -85,6 +97,28 @@ pub enum Overlay {
         filters: Vec<FilterPickerItem>,
     },
     Editor(EmbeddedEditor),
+    EditorRecovery {
+        draft: Box<EditorDraft>,
+        message: String,
+    },
+}
+
+#[derive(Default)]
+pub struct OutboxView {
+    pub page: Option<OutboxPage>,
+    pub cursor: usize,
+    pub details: bool,
+    pub scroll: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditorDraft {
+    pub result: EditorResult,
+    special_add_target: Option<Project>,
+    fallback: Option<Project>,
+    placement: AddPlacement,
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +131,73 @@ pub enum ProjectPickerPurpose {
 pub struct ProjectPickerItem {
     pub id: String,
     pub name: String,
-    search_name: String,
+}
+
+/// One matcher allocation and one ranked result set per project-picker query.
+/// Candidate names are an immutable local snapshot for the lifetime of a picker.
+#[derive(Default)]
+pub struct ProjectSearch {
+    matcher: Matcher,
+    names: Option<Vec<(Utf32String, String)>>,
+    query: Option<String>,
+    matches: Vec<usize>,
+}
+
+impl ProjectSearch {
+    pub fn matches(&mut self, projects: &[ProjectPickerItem], query: &str) -> &[usize] {
+        let query = query.trim();
+        if self.query.as_deref() != Some(query) {
+            self.matches = if query.is_empty() {
+                (0..projects.len()).collect()
+            } else {
+                // Literal fuzzy terms: punctuation in actual project names is
+                // searchable rather than being interpreted as shell operators.
+                let pattern = Pattern::new(
+                    query,
+                    CaseMatching::Ignore,
+                    Normalization::Smart,
+                    AtomKind::Fuzzy,
+                );
+                let text_query = query
+                    .trim_start_matches(|character: char| !character.is_alphanumeric())
+                    .to_lowercase();
+                let names = self.names.get_or_insert_with(|| {
+                    projects
+                        .iter()
+                        .map(|project| {
+                            (
+                                Utf32String::from(project.name.as_str()),
+                                project
+                                    .name
+                                    .trim_start_matches(|character: char| {
+                                        !character.is_alphanumeric()
+                                    })
+                                    .trim_end()
+                                    .to_lowercase(),
+                            )
+                        })
+                        .collect()
+                });
+                let mut ranked = names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, (name, text_name))| {
+                        pattern
+                            .score(name.slice(..), &mut self.matcher)
+                            .map(|score| {
+                                let exact = !text_query.is_empty() && text_name == &text_query;
+                                (index, exact, score)
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                // Stable ties keep cached Todoist order; empty queries do too.
+                ranked.sort_by_key(|(_, exact, score)| (!exact, std::cmp::Reverse(*score)));
+                ranked.into_iter().map(|(index, _, _)| index).collect()
+            };
+            self.query = Some(query.into());
+        }
+        &self.matches
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +300,7 @@ pub struct App {
     pub nav_rows: Vec<NavRow>,
     pub nav_cursor: usize,
     pub tasks: Vec<Task>,
+    pub task_render_cache: crate::ui::TaskRenderCache,
     pub task_cursor: Option<usize>,
     pub focus: Focus,
     pub status: String,
@@ -229,6 +330,11 @@ pub struct App {
     transient_status: Option<(String, Instant)>,
     persistent_status: Option<String>,
     editor_options: EditorOptions,
+    editor_add_fallback: Option<Project>,
+    editor_mutation_committed: bool,
+    clipboard: clipboard::Clipboard,
+    clipboard_success_message: &'static str,
+    outbox_load: Option<std::sync::mpsc::Receiver<Result<OutboxPage>>>,
 }
 
 impl App {
@@ -259,6 +365,7 @@ impl App {
             nav_rows,
             nav_cursor,
             tasks: Vec::new(),
+            task_render_cache: crate::ui::TaskRenderCache::default(),
             task_cursor: None,
             focus: Focus::Navigation,
             status,
@@ -288,6 +395,11 @@ impl App {
             transient_status: None,
             persistent_status,
             editor_options: EditorOptions::default(),
+            editor_add_fallback: None,
+            editor_mutation_committed: false,
+            clipboard: clipboard::Clipboard::default(),
+            clipboard_success_message: "Title copied",
+            outbox_load: None,
         };
         app.force_tasks()?;
         if has_token && app.start_sync_run() {
@@ -322,9 +434,49 @@ impl App {
 
     pub fn tick(&mut self) -> Result<bool> {
         let mut changed = false;
+        let outbox_result =
+            self.outbox_load
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some(Err(anyhow::anyhow!("Outbox diagnostics worker stopped")))
+                    }
+                });
+        if let Some(result) = outbox_result {
+            self.outbox_load = None;
+            if let Some(Overlay::Outbox(view)) = self.overlay.as_mut() {
+                view.loading = false;
+                match result {
+                    Ok(page) => {
+                        let selected_seq = view
+                            .page
+                            .as_ref()
+                            .and_then(|page| page.entries.get(view.cursor))
+                            .map(|entry| entry.seq);
+                        view.cursor = selected_seq
+                            .and_then(|seq| page.entries.iter().position(|entry| entry.seq == seq))
+                            .unwrap_or(view.cursor.min(page.entries.len().saturating_sub(1)));
+                        view.page = Some(page);
+                        view.scroll = 0;
+                        view.error = None;
+                    }
+                    Err(error) => view.error = Some(format!("{error:#}")),
+                }
+                changed = true;
+            }
+        }
         while let Some(event) = self.sync.next_event() {
             changed = true;
             self.handle_sync_event(event)?;
+        }
+        if let Some(result) = self.clipboard.poll() {
+            self.status = match result {
+                Ok(()) => self.clipboard_success_message.into(),
+                Err(error) => error.to_string(),
+            };
+            changed = true;
         }
         let today = Local::now().date_naive();
         if today != self.view_date {
@@ -381,7 +533,10 @@ impl App {
         }
 
         let now = Instant::now();
-        let mut timeout = if self.sync.is_running() {
+        let mut timeout = if self.sync.is_running()
+            || self.clipboard.is_running()
+            || self.outbox_load.is_some()
+        {
             SYNC_POLL_INTERVAL
         } else {
             IDLE_POLL_INTERVAL
@@ -410,6 +565,7 @@ impl App {
                 self.overlay = None;
                 self.pending_add_target = None;
                 self.pending_add_placement = AddPlacement::Natural;
+                self.editor_add_fallback = None;
                 self.status = "Edit cancelled".into();
             }
             return Ok(());
@@ -479,6 +635,10 @@ impl App {
             Action::EditDue => self.open_due()?,
             Action::RemoveDue => self.remove_selected_due()?,
             Action::ShowError => self.show_error_details(),
+            Action::ShowOutbox => {
+                self.overlay = Some(Overlay::Outbox(OutboxView::default()));
+                self.load_outbox_page(0)?;
+            }
             Action::CompleteTask => self.complete()?,
             Action::DeleteTask => self.delete_selected_task()?,
             Action::MoveTask => self.open_project_picker()?,
@@ -502,6 +662,27 @@ impl App {
     }
 
     fn handle_overlay(&mut self, key: KeyEvent) -> Result<()> {
+        if matches!(self.overlay, Some(Overlay::Outbox(_))) {
+            return self.handle_outbox(key);
+        }
+        if matches!(self.overlay, Some(Overlay::EditorRecovery { .. })) {
+            if self.keybindings.matches(Action::Confirm, key)
+                || self.keybindings.matches(Action::EditTask, key)
+            {
+                if let Some(Overlay::EditorRecovery { draft, message }) = self.overlay.take() {
+                    self.reopen_editor_draft(*draft, message);
+                }
+            } else if self.keybindings.matches(Action::CloseDialog, key)
+                || self.keybindings.matches(Action::Cancel, key)
+            {
+                self.overlay = None;
+                self.pending_add_target = None;
+                self.pending_add_placement = AddPlacement::Natural;
+                self.editor_add_fallback = None;
+                self.status = "Draft cancelled".into();
+            }
+            return Ok(());
+        }
         match self.overlay.as_mut() {
             Some(Overlay::Help { .. }) if self.keybindings.matches(Action::CloseDialog, key) => {
                 self.overlay = None;
@@ -518,47 +699,60 @@ impl App {
             {
                 self.overlay = None;
             }
-            Some(Overlay::ErrorDetails { scroll, .. })
-                if self.keybindings.matches(Action::Down, key) =>
-            {
+            Some(
+                Overlay::ErrorDetails { scroll, .. }
+                | Overlay::Details { scroll, .. }
+                | Overlay::FilterDetails { scroll, .. },
+            ) if self.keybindings.matches(Action::Down, key) => {
                 *scroll = scroll.saturating_add(1);
             }
-            Some(Overlay::ErrorDetails { scroll, .. })
-                if self.keybindings.matches(Action::Up, key) =>
-            {
+            Some(
+                Overlay::ErrorDetails { scroll, .. }
+                | Overlay::Details { scroll, .. }
+                | Overlay::FilterDetails { scroll, .. },
+            ) if self.keybindings.matches(Action::Up, key) => {
                 *scroll = scroll.saturating_sub(1);
             }
             Some(Overlay::ErrorDetails { .. }) => {}
-            Some(Overlay::Details(task)) if self.keybindings.matches(Action::EditTask, key) => {
+            Some(Overlay::Details { task, .. })
+                if self.keybindings.matches(Action::EditTask, key) =>
+            {
                 let task_id = task.id.clone();
                 self.open_task_editor(&task_id)?;
             }
-            Some(Overlay::Details(task)) if self.keybindings.matches(Action::EditDue, key) => {
+            Some(Overlay::Details { task, .. })
+                if self.keybindings.matches(Action::EditDue, key) =>
+            {
                 let task_id = task.id.clone();
                 self.open_due_editor(&task_id)?;
             }
-            Some(Overlay::Details(task)) if self.keybindings.matches(Action::RemoveDue, key) => {
+            Some(Overlay::Details { task, .. })
+                if self.keybindings.matches(Action::RemoveDue, key) =>
+            {
                 let task_id = task.id.clone();
                 self.overlay = None;
                 self.remove_due(&task_id)?;
             }
-            Some(Overlay::Details(task)) if self.keybindings.matches(Action::DeleteTask, key) => {
+            Some(Overlay::Details { task, .. })
+                if self.keybindings.matches(Action::DeleteTask, key) =>
+            {
                 let task_id = task.id.clone();
                 self.overlay = None;
                 self.delete_task(&task_id)?;
             }
-            Some(Overlay::FilterDetails(filter))
+            Some(Overlay::FilterDetails { filter, .. })
                 if self.keybindings.matches(Action::EditTask, key) =>
             {
                 let filter_id = filter.id.clone();
                 self.open_filter_editor(&filter_id)?;
             }
-            Some(Overlay::Details(_) | Overlay::FilterDetails(_))
+            Some(Overlay::Details { .. } | Overlay::FilterDetails { .. })
                 if self.keybindings.matches(Action::CloseDialog, key) =>
             {
                 self.overlay = None;
             }
-            Some(Overlay::Details(_) | Overlay::FilterDetails(_)) => {}
+            Some(Overlay::Details { .. } | Overlay::FilterDetails { .. }) => {}
+            Some(Overlay::Outbox(_)) => unreachable!("outbox handled above"),
             Some(Overlay::LabelPicker {
                 task_id,
                 query,
@@ -631,6 +825,7 @@ impl App {
                 cursor,
                 mode,
                 projects,
+                search,
             }) => {
                 if self.keybindings.matches(Action::Cancel, key) {
                     if mode.cancel() {
@@ -642,7 +837,7 @@ impl App {
                         self.status = message.into();
                     }
                 } else if self.keybindings.matches(Action::Confirm, key) {
-                    let matches = filtered_project_indices(projects, query);
+                    let matches = search.matches(projects, query);
                     if let Some(project) = matches
                         .get((*cursor).min(matches.len().saturating_sub(1)))
                         .and_then(|index| projects.get(*index))
@@ -657,13 +852,13 @@ impl App {
                             }
                         }
                     } else {
-                        self.status = "No project matches that prefix".into();
+                        self.status = "No project matches that search".into();
                     }
                 } else if *mode == PickerMode::Selecting {
                     if self.keybindings.matches(Action::Up, key) {
                         *cursor = cursor.saturating_sub(1);
                     } else if self.keybindings.matches(Action::Down, key) {
-                        let count = filtered_project_indices(projects, query).len();
+                        let count = search.matches(projects, query).len();
                         if *cursor + 1 < count {
                             *cursor += 1;
                         }
@@ -704,7 +899,7 @@ impl App {
                         .and_then(|index| tasks.get(*index))
                         .map(|item| item.task.clone())
                     {
-                        self.overlay = Some(Overlay::Details(task));
+                        self.overlay = Some(Overlay::Details { task, scroll: 0 });
                     } else {
                         self.status = "No task matches that prefix".into();
                     }
@@ -753,7 +948,7 @@ impl App {
                         .and_then(|index| filters.get(*index))
                         .map(|item| item.filter.clone())
                     {
-                        self.overlay = Some(Overlay::FilterDetails(filter));
+                        self.overlay = Some(Overlay::FilterDetails { filter, scroll: 0 });
                     } else {
                         self.status = "No filter matches that prefix".into();
                     }
@@ -785,6 +980,82 @@ impl App {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn load_outbox_page(&mut self, offset: usize) -> Result<()> {
+        let store = self.store.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("todoist-tui-outbox".into())
+            .spawn(move || {
+                let _ = sender.send(store.outbox_diagnostics(offset));
+            })
+            .context("start local outbox diagnostics")?;
+        self.outbox_load = Some(receiver);
+        if let Some(Overlay::Outbox(view)) = self.overlay.as_mut() {
+            view.loading = true;
+            view.error = None;
+        }
+        Ok(())
+    }
+
+    fn handle_outbox(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(Overlay::Outbox(view)) = self.overlay.as_mut() else {
+            return Ok(());
+        };
+        let mut load = None;
+        if view.details {
+            if self.keybindings.matches(Action::CloseDialog, key)
+                || self.keybindings.matches(Action::Cancel, key)
+            {
+                view.details = false;
+                view.scroll = 0;
+            } else if self.keybindings.matches(Action::Down, key) {
+                view.scroll = view.scroll.saturating_add(1);
+            } else if self.keybindings.matches(Action::Up, key) {
+                view.scroll = view.scroll.saturating_sub(1);
+            }
+        } else if self.keybindings.matches(Action::Confirm, key) {
+            if !view.loading
+                && view.error.is_none()
+                && view
+                    .page
+                    .as_ref()
+                    .is_some_and(|page| !page.entries.is_empty())
+            {
+                view.details = true;
+                view.scroll = 0;
+            }
+        } else if self.keybindings.matches(Action::CloseDialog, key)
+            || self.keybindings.matches(Action::Cancel, key)
+        {
+            self.overlay = None;
+        } else if !view.loading {
+            let offset = view.page.as_ref().map_or(0, |page| page.offset);
+            if self.keybindings.matches(Action::Down, key) {
+                let len = view.page.as_ref().map_or(0, |page| page.entries.len());
+                view.cursor = (view.cursor + 1).min(len.saturating_sub(1));
+            } else if self.keybindings.matches(Action::Up, key) {
+                view.cursor = view.cursor.saturating_sub(1);
+            } else if self.keybindings.matches(Action::FocusTasks, key)
+                && view
+                    .page
+                    .as_ref()
+                    .is_some_and(|page| page.offset + page.entries.len() < page.total)
+            {
+                view.cursor = 0;
+                load = Some(offset + OUTBOX_PAGE_SIZE);
+            } else if self.keybindings.matches(Action::FocusNavigation, key) && offset > 0 {
+                view.cursor = 0;
+                load = Some(offset.saturating_sub(OUTBOX_PAGE_SIZE));
+            } else if self.keybindings.matches(Action::Sync, key) {
+                load = Some(offset);
+            }
+        }
+        if let Some(offset) = load {
+            self.load_outbox_page(offset)?;
         }
         Ok(())
     }
@@ -990,7 +1261,19 @@ impl App {
     fn force_tasks(&mut self) -> Result<()> {
         self.pending_render = None;
         if let Some(id) = self.selected_nav().cloned() {
+            if self.rendered_nav.as_ref() != Some(&id) {
+                // A failed load must not leave another view's tasks actionable.
+                self.tasks.clear();
+                self.task_render_cache.invalidate();
+                self.task_cursor = None;
+                self.rendered_nav = None;
+            }
             self.load_tasks(id)?;
+        } else {
+            self.tasks.clear();
+            self.task_render_cache.invalidate();
+            self.task_cursor = None;
+            self.rendered_nav = None;
         }
         Ok(())
     }
@@ -1020,6 +1303,7 @@ impl App {
             })
             .or_else(|| (!tasks.is_empty()).then_some(0));
         self.tasks = tasks;
+        self.task_render_cache.invalidate();
         self.task_cursor = cursor;
         self.rendered_nav = Some(nav.clone());
         if let Some(index) = cursor {
@@ -1073,15 +1357,18 @@ impl App {
 
     fn open_details(&mut self) {
         if let Some(task) = self.selected_task().cloned() {
-            self.overlay = Some(Overlay::Details(task));
+            self.overlay = Some(Overlay::Details { task, scroll: 0 });
         }
     }
 
     fn copy_selected_title(&mut self) -> Result<()> {
-        self.copy_selected_title_with(clipboard::copy)
+        self.copy_selected_title_with(|clipboard, text| clipboard.start(text))
     }
 
-    fn copy_selected_title_with(&mut self, copy: impl FnOnce(&str) -> Result<()>) -> Result<()> {
+    fn copy_selected_title_with(
+        &mut self,
+        copy: impl FnOnce(&mut clipboard::Clipboard, String) -> Result<bool>,
+    ) -> Result<()> {
         let (title, success_message) = match self.focus {
             Focus::Navigation => {
                 let Some(NavRow::Item { name, .. }) = self.nav_rows.get(self.nav_cursor) else {
@@ -1100,8 +1387,12 @@ impl App {
             }
         };
 
-        self.status = match copy(&title) {
-            Ok(()) => success_message.into(),
+        self.status = match copy(&mut self.clipboard, title) {
+            Ok(true) => {
+                self.clipboard_success_message = success_message;
+                "Copying title…".into()
+            }
+            Ok(false) => "Clipboard copy is already in progress".into(),
             Err(error) => error.to_string(),
         };
         Ok(())
@@ -1137,7 +1428,6 @@ impl App {
             .projects()?
             .into_iter()
             .map(|project| ProjectPickerItem {
-                search_name: project.name.to_lowercase(),
                 id: project.id,
                 name: project.name,
             })
@@ -1152,6 +1442,7 @@ impl App {
             cursor: 0,
             mode: PickerMode::Filtering,
             projects,
+            search: ProjectSearch::default(),
         });
         Ok(())
     }
@@ -1277,10 +1568,11 @@ impl App {
 
     fn open_add(&mut self, requested: AddPlacement) -> Result<()> {
         self.force_tasks()?;
-        if self.add_target_project()?.is_none() {
+        let Some(project) = self.add_target_project()? else {
             self.status = "No Inbox or selected project is available".into();
             return Ok(());
-        }
+        };
+        self.editor_add_fallback = Some(project);
         self.pending_add_target = None;
         self.pending_add_placement = self.effective_add_placement(requested);
         self.overlay = Some(Overlay::Editor(EmbeddedEditor::open(
@@ -1399,7 +1691,7 @@ impl App {
             return Ok(());
         };
         if filter.is_frozen {
-            self.overlay = Some(Overlay::FilterDetails(filter));
+            self.overlay = Some(Overlay::FilterDetails { filter, scroll: 0 });
             self.status = "This filter is read-only".into();
             return Ok(());
         }
@@ -1464,19 +1756,13 @@ impl App {
             return Ok(());
         };
         let projects = self
-            .nav_rows
-            .iter()
-            .filter_map(|row| match row {
-                NavRow::Item {
-                    id: NavId::Project(id),
-                    name,
-                    ..
-                } if id != &task.project_id => Some(ProjectPickerItem {
-                    id: id.clone(),
-                    name: name.clone(),
-                    search_name: name.to_lowercase(),
-                }),
-                _ => None,
+            .store
+            .projects()?
+            .into_iter()
+            .filter(|project| project.id != task.project_id)
+            .map(|project| ProjectPickerItem {
+                id: project.id,
+                name: project.name,
             })
             .collect::<Vec<_>>();
         if projects.is_empty() {
@@ -1489,6 +1775,7 @@ impl App {
             cursor: 0,
             mode: PickerMode::Filtering,
             projects,
+            search: ProjectSearch::default(),
         });
         Ok(())
     }
@@ -1520,6 +1807,10 @@ impl App {
     }
 
     fn apply_task_move(&mut self, task_id: &str, project: &ProjectPickerItem) -> Result<()> {
+        if let Some(message) = self.store.task_move_restriction(task_id, &project.id)? {
+            self.status = message.into();
+            return Ok(());
+        }
         let previous_index = self.task_cursor.unwrap_or(0);
         let nav = self.selected_nav().cloned();
         let before = self
@@ -1575,6 +1866,7 @@ impl App {
                 !candidate.checked
                     && candidate.project_id == task.project_id
                     && candidate.parent_id == task.parent_id
+                    && candidate.section_id == task.section_id
             });
             let Some(candidate) = candidate else {
                 self.status = "Cannot indent: no preceding sibling can become the parent".into();
@@ -1618,6 +1910,83 @@ impl App {
 
     fn apply_editor_result(&mut self, result: EditorResult) -> Result<()> {
         if !result.accepted {
+            self.editor_add_fallback = None;
+            return self.apply_editor_result_inner(result);
+        }
+        let draft = EditorDraft {
+            result: result.clone(),
+            special_add_target: self.pending_add_target.clone(),
+            fallback: self.editor_add_fallback.clone(),
+            placement: self.pending_add_placement,
+        };
+        let validation = match result.purpose {
+            EditorPurpose::Add | EditorPurpose::AddChild | EditorPurpose::Edit => {
+                if split_task_editor_text(&result.text).0.is_empty() {
+                    Err("Task title cannot be empty".into())
+                } else {
+                    Ok(())
+                }
+            }
+            EditorPurpose::AddFilter | EditorPurpose::EditFilter => {
+                parse_filter_editor(&result.text).map(|_| ())
+            }
+            EditorPurpose::AddProject | EditorPurpose::RenameProject => {
+                parse_project_editor(&result.text).map(|_| ())
+            }
+            EditorPurpose::Due => Ok(()),
+        };
+        if let Err(message) = validation {
+            self.reopen_editor_draft(draft, message);
+            return Ok(());
+        }
+        self.editor_mutation_committed = false;
+        match self.apply_editor_result_inner(result) {
+            Ok(()) => {
+                self.editor_add_fallback = None;
+                Ok(())
+            }
+            Err(error) if !self.editor_mutation_committed => {
+                self.reopen_editor_draft(draft, format!("Save failed: {error:#}"));
+                Ok(())
+            }
+            Err(error) => {
+                // The write succeeded; a failed history/view refresh must never
+                // reopen an add document and duplicate an already-created task.
+                self.editor_add_fallback = None;
+                self.mark_pending_and_sync();
+                Err(error)
+            }
+        }
+    }
+
+    fn reopen_editor_draft(&mut self, draft: EditorDraft, message: String) {
+        self.pending_add_target = draft.special_add_target.clone();
+        self.pending_add_placement = draft.placement;
+        self.editor_add_fallback = draft.fallback.clone();
+        self.status = message.clone();
+        match EmbeddedEditor::open(
+            draft.result.purpose,
+            draft.result.task_id.clone(),
+            &draft.result.text,
+            14,
+            76,
+            self.editor_options,
+        ) {
+            Ok(mut editor) => {
+                editor.set_notice(message);
+                self.overlay = Some(Overlay::Editor(editor));
+            }
+            Err(error) => {
+                self.overlay = Some(Overlay::EditorRecovery {
+                    draft: Box::new(draft),
+                    message: format!("{message}\nCould not reopen Neovim: {error:#}"),
+                });
+            }
+        }
+    }
+
+    fn apply_editor_result_inner(&mut self, result: EditorResult) -> Result<()> {
+        if !result.accepted {
             self.pending_add_target = None;
             self.pending_add_placement = AddPlacement::Natural;
             self.status = "Edit cancelled".into();
@@ -1643,6 +2012,8 @@ impl App {
                     );
                 let project = if let Some(project) = special_project {
                     project
+                } else if let Some(project) = self.editor_add_fallback.clone() {
+                    project
                 } else {
                     self.add_target_project()?
                         .context("selected project and Inbox disappeared")?
@@ -1663,6 +2034,7 @@ impl App {
                         &project,
                     )?,
                 };
+                self.editor_mutation_committed = true;
                 self.record_history(HistoryEntry::Add {
                     expression: expression.to_owned(),
                     description,
@@ -1706,6 +2078,7 @@ impl App {
                     &project,
                     &parent.id,
                 )?;
+                self.editor_mutation_committed = true;
                 self.record_history(HistoryEntry::Add {
                     expression: expression.to_owned(),
                     description,
@@ -1731,6 +2104,7 @@ impl App {
                     .task(&id)?
                     .context("edited task no longer exists")?;
                 self.store.edit_task(&id, title, &description)?;
+                self.editor_mutation_committed = true;
                 self.record_task_change(before, &id, "task edit")?;
                 self.refresh_after_action(Some(&id))?;
                 self.status = "Task updated · pending sync".into();
@@ -1743,6 +2117,7 @@ impl App {
                     .task(&id)?
                     .context("dated task no longer exists")?;
                 self.store.update_due(&id, result.text.trim())?;
+                self.editor_mutation_committed = true;
                 self.record_task_change(before, &id, "due-date change")?;
                 self.refresh_after_action(Some(&id))?;
                 self.status = "Due date updated · pending sync".into();
@@ -1757,7 +2132,9 @@ impl App {
                     }
                 };
                 self.store.add_filter(&name, &query, is_favorite)?;
+                self.editor_mutation_committed = true;
                 self.refresh_nav()?;
+                self.force_tasks()?;
                 self.status = format!("Filter ‘{name}’ added · pending sync");
                 self.mark_pending_and_sync();
             }
@@ -1771,7 +2148,9 @@ impl App {
                     }
                 };
                 self.store.update_filter(&id, &name, &query, is_favorite)?;
+                self.editor_mutation_committed = true;
                 self.refresh_nav()?;
+                self.force_tasks()?;
                 self.status = format!("Filter ‘{name}’ updated · pending sync");
                 self.mark_pending_and_sync();
             }
@@ -1784,6 +2163,7 @@ impl App {
                     }
                 };
                 let id = self.store.add_project(&name)?;
+                self.editor_mutation_committed = true;
                 self.refresh_nav()?;
                 if let Some(index) = self.nav_rows.iter().position(
                     |row| matches!(row, NavRow::Item { id: NavId::Project(row_id), .. } if row_id == &id),
@@ -1805,6 +2185,7 @@ impl App {
                     }
                 };
                 let id = self.store.rename_project(&project_id, &name)?;
+                self.editor_mutation_committed = true;
                 self.refresh_nav()?;
                 if let Some(index) = self.nav_rows.iter().position(
                     |row| matches!(row, NavRow::Item { id: NavId::Project(row_id), .. } if row_id == &id),
@@ -2257,6 +2638,7 @@ impl App {
                 if task.checked
                     || task.project_id != selected.project_id
                     || task.parent_id != selected.parent_id
+                    || task.section_id != selected.section_id
                 {
                     return false;
                 }
@@ -2548,11 +2930,11 @@ impl App {
     pub fn report_runtime_error(&mut self, error: anyhow::Error) {
         // A failed editor or local command must not tear down the terminal.
         // The durable outbox is left intact and a later retry can recover.
-        if self.editor_is_open() {
-            self.overlay = None;
+        if !self.editor_is_open() {
+            self.pending_add_target = None;
+            self.pending_add_placement = AddPlacement::Natural;
+            self.editor_add_fallback = None;
         }
-        self.pending_add_target = None;
-        self.pending_add_placement = AddPlacement::Natural;
         self.pending_render = None;
         let message = format!("Local error: {error:#}");
         self.sync_issue = Some(message.clone());
@@ -2645,13 +3027,9 @@ fn unique_nav_match(mut indices: impl Iterator<Item = usize>) -> NavSearchMatch 
     }
 }
 
-pub fn filtered_project_indices(projects: &[ProjectPickerItem], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    projects
-        .iter()
-        .enumerate()
-        .filter_map(|(index, project)| project.search_name.starts_with(&query).then_some(index))
-        .collect()
+#[cfg(test)]
+fn filtered_project_indices(projects: &[ProjectPickerItem], query: &str) -> Vec<usize> {
+    ProjectSearch::default().matches(projects, query).to_vec()
 }
 
 pub fn filtered_label_indices(labels: &[LabelPickerItem], query: &str) -> Vec<usize> {
@@ -2878,6 +3256,7 @@ mod tests {
             child_order: 0,
             checked: false,
             assignee: None,
+            section_id: None,
         }
     }
 
@@ -2977,7 +3356,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             app.overlay.as_ref(),
-            Some(Overlay::Details(task)) if task.id == expected_id
+            Some(Overlay::Details { task, .. }) if task.id == expected_id
         ));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
@@ -3000,7 +3379,7 @@ mod tests {
             dir.path().join("config.toml"),
         )
         .unwrap();
-        app.overlay = Some(Overlay::Details(task));
+        app.overlay = Some(Overlay::Details { task, scroll: 0 });
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
             .unwrap();
@@ -3027,22 +3406,78 @@ mod tests {
         .unwrap();
 
         let mut copied = String::new();
-        app.copy_selected_title_with(|title| {
+        app.copy_selected_title_with(|clipboard, title| {
             copied = title.to_owned();
-            Ok(())
+            clipboard.start_with(title, |_, _| Ok(()))
         })
         .unwrap();
         assert_eq!(copied, "Inbox");
+        finish_clipboard_copy(&mut app);
         assert_eq!(app.status, "Project or filter title copied");
 
         app.enter_tasks().unwrap();
-        app.copy_selected_title_with(|title| {
+        app.copy_selected_title_with(|clipboard, title| {
             copied = title.to_owned();
-            Ok(())
+            clipboard.start_with(title, |_, _| Ok(()))
         })
         .unwrap();
         assert_eq!(copied, "Copy this task");
+        finish_clipboard_copy(&mut app);
         assert_eq!(app.status, "Task title copied");
+    }
+
+    fn finish_clipboard_copy(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.clipboard.is_running() {
+            app.tick().unwrap();
+            assert!(Instant::now() < deadline, "clipboard worker did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_pending_clipboard_copy_keeps_navigation_and_quitting_responsive() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (_dir, mut app) = draft_test_app();
+        let finish = Arc::new(AtomicBool::new(false));
+        let worker_finish = finish.clone();
+        app.copy_selected_title_with(|clipboard, title| {
+            clipboard.start_with(title, move |text, cancel| {
+                assert_eq!(text, "Inbox");
+                while !worker_finish.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(())
+            })
+        })
+        .unwrap();
+        assert_eq!(app.poll_timeout(), SYNC_POLL_INTERVAL);
+        let started = Instant::now();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_nav(), Some(&NavId::Today));
+        app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.quit);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        finish.store(true, Ordering::Release);
+        finish_clipboard_copy(&mut app);
+        assert_eq!(app.status, "Project or filter title copied");
+    }
+
+    #[test]
+    fn a_clipboard_error_is_reported_without_exiting() {
+        let (_dir, mut app) = draft_test_app();
+        app.copy_selected_title_with(|clipboard, title| {
+            clipboard.start_with(title, |_, _| anyhow::bail!("Clipboard timed out"))
+        })
+        .unwrap();
+        finish_clipboard_copy(&mut app);
+        assert_eq!(app.status, "Clipboard timed out");
+        assert!(!app.quit);
     }
 
     #[test]
@@ -3632,7 +4067,6 @@ mod tests {
             &ProjectPickerItem {
                 id: destination.clone(),
                 name: "Destination".into(),
-                search_name: "destination".into(),
             },
         )
         .unwrap();
@@ -3713,59 +4147,69 @@ mod tests {
 
     #[test]
     fn recurring_completion_stays_active_and_redo_does_not_advance_twice() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("cache.db")).unwrap();
-        let today = Local::now().date_naive();
-        let remote = serde_json::from_value(serde_json::json!({"id":"task","project_id":"inbox","content":"Daily","due":{"date":today.format("%F").to_string(),"string":"every day","is_recurring":true}})).unwrap();
-        store.merge_remote(&[], &[remote], &[], &[]).unwrap();
-        let sync = SyncManager::new(store.clone(), None).unwrap();
-        let mut app = App::new(
-            store.clone(),
-            sync,
-            KeyBindings::defaults(),
-            dir.path().join("config.toml"),
-        )
-        .unwrap();
-        app.focus = Focus::Tasks;
-        app.complete().unwrap();
-        let next = store.task("task").unwrap().unwrap();
-        assert!(!next.checked);
-        assert_eq!(next.due.as_ref().unwrap().concrete_date(), today.succ_opt());
-        let sent = store.claim_next_outbox().unwrap().unwrap();
-        store.finish_outbox(sent.seq).unwrap();
-        app.undo().unwrap();
-        assert_eq!(
-            store
-                .task("task")
-                .unwrap()
-                .unwrap()
-                .due
-                .unwrap()
-                .concrete_date(),
-            Some(today)
-        );
-        app.redo().unwrap();
-        assert_eq!(
-            store
-                .task("task")
-                .unwrap()
-                .unwrap()
-                .due
-                .unwrap()
-                .concrete_date(),
-            today.succ_opt()
-        );
-        let queued = store.outbox().unwrap();
-        assert!(
-            queued
-                .iter()
-                .any(|entry| matches!(entry.operation, Operation::RestoreRecurring { .. }))
-        );
-        assert!(matches!(
-            queued.last().unwrap().operation,
-            Operation::CompleteTask
-        ));
-        assert!(!queued.iter().any(|entry| matches!(&entry.operation, Operation::RestoreDue { due: Some(due) } if due.concrete_date() == today.succ_opt())));
+        for (expression, interval) in [
+            ("every day", 1),
+            ("every 3 days", 3),
+            ("every 2 weeks", 14),
+            ("every week", 7),
+            ("every! 3 days", 3),
+            ("after 2 weeks", 14),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("cache.db")).unwrap();
+            let today = Local::now().date_naive();
+            let expected = Some(today + chrono::Duration::days(interval));
+            let remote = serde_json::from_value(serde_json::json!({"id":"task","project_id":"inbox","content":"Recurring","due":{"date":today.format("%F").to_string(),"string":expression,"is_recurring":true}})).unwrap();
+            store.merge_remote(&[], &[remote], &[], &[]).unwrap();
+            let sync = SyncManager::new(store.clone(), None).unwrap();
+            let mut app = App::new(
+                store.clone(),
+                sync,
+                KeyBindings::defaults(),
+                dir.path().join("config.toml"),
+            )
+            .unwrap();
+            app.focus = Focus::Tasks;
+            app.complete().unwrap();
+            let next = store.task("task").unwrap().unwrap();
+            assert!(!next.checked);
+            assert_eq!(next.due.as_ref().unwrap().concrete_date(), expected);
+            let sent = store.claim_next_outbox().unwrap().unwrap();
+            store.finish_outbox(sent.seq).unwrap();
+            app.undo().unwrap();
+            assert_eq!(
+                store
+                    .task("task")
+                    .unwrap()
+                    .unwrap()
+                    .due
+                    .unwrap()
+                    .concrete_date(),
+                Some(today)
+            );
+            app.redo().unwrap();
+            assert_eq!(
+                store
+                    .task("task")
+                    .unwrap()
+                    .unwrap()
+                    .due
+                    .unwrap()
+                    .concrete_date(),
+                expected
+            );
+            let queued = store.outbox().unwrap();
+            assert!(
+                queued
+                    .iter()
+                    .any(|entry| matches!(entry.operation, Operation::RestoreRecurring { .. }))
+            );
+            assert!(matches!(
+                queued.last().unwrap().operation,
+                Operation::CompleteTask
+            ));
+            assert!(!queued.iter().any(|entry| matches!(&entry.operation, Operation::RestoreDue { due: Some(due) } if due.concrete_date() == expected)));
+        }
     }
 
     #[test]
@@ -3965,27 +4409,432 @@ mod tests {
     }
 
     #[test]
-    fn project_picker_filters_case_insensitive_prefixes() {
+    fn project_picker_ranks_case_insensitive_fuzzy_matches() {
         let projects = vec![
             ProjectPickerItem {
                 id: "1".into(),
                 name: "Inbox".into(),
-                search_name: "inbox".into(),
             },
             ProjectPickerItem {
                 id: "2".into(),
                 name: "Shopping".into(),
-                search_name: "shopping".into(),
             },
             ProjectPickerItem {
                 id: "3".into(),
                 name: "Shared work".into(),
-                search_name: "shared work".into(),
             },
         ];
         assert_eq!(filtered_project_indices(&projects, "sh"), [1, 2]);
         assert_eq!(filtered_project_indices(&projects, "SHOP"), [1]);
         assert!(filtered_project_indices(&projects, "missing").is_empty());
+    }
+
+    #[test]
+    fn fuzzy_project_matching_handles_icons_unicode_gaps_words_and_literal_punctuation() {
+        let projects = [
+            "#💼 Work",
+            "Weekly review",
+            "Project reports",
+            "#✅ Team backlog",
+            "👩‍💻 Entwicklung",
+            "  #团队备忘",
+            "!Important",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| ProjectPickerItem {
+            id: index.to_string(),
+            name: name.into(),
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(filtered_project_indices(&projects, "wk"), [0, 1, 4]);
+        assert_eq!(filtered_project_indices(&projects, "WORK"), [0]);
+        assert_eq!(filtered_project_indices(&projects, "prj rpt"), [2]);
+        assert_eq!(filtered_project_indices(&projects, "rpt prj"), [2]);
+        assert_eq!(filtered_project_indices(&projects, "tbklg"), [3]);
+        assert_eq!(filtered_project_indices(&projects, "ENTW"), [4]);
+        assert_eq!(filtered_project_indices(&projects, "团队"), [5]);
+        assert_eq!(filtered_project_indices(&projects, "!imp"), [6]);
+        assert_eq!(filtered_project_indices(&projects, "💼"), [0]);
+        assert!(filtered_project_indices(&projects, "workz").is_empty());
+        assert_eq!(
+            filtered_project_indices(&projects, "  "),
+            (0..projects.len()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fuzzy_project_ranking_and_cache_update_for_confirm_backspace_and_reopening() {
+        let projects = ["W---o---r---k", "Workbench", "Work", "Work"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ProjectPickerItem {
+                id: index.to_string(),
+                name: name.into(),
+            })
+            .collect::<Vec<_>>();
+        let mut search = ProjectSearch::default();
+        let ranked = search.matches(&projects, "work").to_vec();
+        assert_eq!(&ranked[..2], &[2, 3]);
+        assert!(
+            ranked.iter().position(|index| *index == 1).unwrap()
+                < ranked.iter().position(|index| *index == 0).unwrap()
+        );
+        let cached = search.matches(&projects, "work").as_ptr();
+        assert_eq!(search.matches(&projects, "work").as_ptr(), cached);
+        assert!(search.matches(&projects, "workz").is_empty());
+        assert_eq!(search.matches(&projects, "work"), ranked);
+        assert_eq!(search.matches(&projects, ""), [0, 1, 2, 3]);
+        let changed = vec![ProjectPickerItem {
+            id: "new".into(),
+            name: "Different".into(),
+        }];
+        assert!(
+            ProjectSearch::default()
+                .matches(&changed, "work")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn project_search_and_move_pick_hidden_team_names_by_fuzzy_text_without_icons() {
+        for (name, query) in [
+            ("#Team backlog", "tbklg"),
+            ("💼 Team Work", "tm wk"),
+            ("  #✅ Team reports", "tm rpt"),
+            ("👩‍💻 团队备忘", "团备"),
+        ] {
+            for action in ['p', 'v'] {
+                let (_dir, mut app) = draft_test_app();
+                let projects = serde_json::from_value::<Vec<crate::model::RemoteProject>>(
+                    serde_json::json!([{"id":"team","name":name,"workspace_id":"workspace"}]),
+                )
+                .unwrap();
+                let tasks = serde_json::from_value::<Vec<crate::model::RemoteTask>>(
+                    serde_json::json!([{"id":"source","project_id":"inbox","content":"Move this"}]),
+                )
+                .unwrap();
+                app.store.merge_remote(&projects, &tasks, &[], &[]).unwrap();
+                app.store.toggle_project_hidden("team").unwrap();
+                app.refresh_nav().unwrap();
+                app.enter_tasks().unwrap();
+                app.handle_key(KeyEvent::new(KeyCode::Char(action), KeyModifiers::NONE))
+                    .unwrap();
+                for character in query.chars() {
+                    app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                        .unwrap();
+                }
+                app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+                    .unwrap();
+                if let Some(Overlay::ProjectPicker {
+                    projects,
+                    query,
+                    search,
+                    ..
+                }) = app.overlay.as_mut()
+                {
+                    assert!(search.matches(projects, query).is_empty());
+                } else {
+                    panic!("project picker closed while typing");
+                }
+                app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+                    .unwrap();
+                // The confirmation must use the current ranked query even if
+                // there has been no intervening render to populate its cache.
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .unwrap();
+                assert!(app.overlay.is_none(), "{action}: {name}");
+                assert_eq!(app.store.project("team").unwrap().unwrap().name, name);
+                assert!(app.store.project("team").unwrap().unwrap().is_hidden);
+                if action == 'v' {
+                    assert_eq!(
+                        app.store.task("source").unwrap().unwrap().project_id,
+                        "team"
+                    );
+                } else {
+                    assert_eq!(app.selected_nav(), Some(&NavId::Project("team".into())));
+                    assert_eq!(app.store.outbox_len().unwrap(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v_moves_task_trees_to_hidden_team_projects_and_prevents_unsupported_outbound_moves() {
+        for (source, destination, prefix) in
+            [("team", "personal", "per"), ("personal", "team", "tea")]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("moves.db");
+            let store = Store::open(&path).unwrap();
+            let data = serde_json::json!({"projects":[
+                {"id":"personal","name":"Personal","order_key":"a0"},
+                {"id":"team","name":"Team","workspace_id":"workspace","default_order_key":"a0"}
+            ],"items":[
+                {"id":"root","project_id":source,"section_id":"source-section","content":"Root","order_key":"a0","description":"Keep this note","labels":["Keep"],"priority":4},
+                {"id":"child","project_id":source,"section_id":"source-section","parent_id":"root","content":"Child","order_key":"a0"},
+                {"id":"grandchild","project_id":source,"section_id":"source-section","parent_id":"child","content":"Grandchild","order_key":"a0"},
+                {"id":"stay","project_id":source,"section_id":"source-section","content":"Stay","order_key":"a1"}
+            ]});
+            store.merge_order_metadata(&data, false).unwrap();
+            store
+                .merge_remote_snapshot(
+                    &serde_json::from_value::<Vec<crate::model::RemoteProject>>(
+                        data["projects"].clone(),
+                    )
+                    .unwrap(),
+                    &serde_json::from_value::<Vec<crate::model::RemoteTask>>(data["items"].clone())
+                        .unwrap(),
+                    &[],
+                    &[],
+                    false,
+                    None,
+                )
+                .unwrap();
+            store.toggle_project_hidden(destination).unwrap();
+            let mut app = App::new(
+                store.clone(),
+                SyncManager::new(store.clone(), None).unwrap(),
+                KeyBindings::defaults(),
+                dir.path().join("config.toml"),
+            )
+            .unwrap();
+            assert!(!app.nav_rows.iter().any(
+                |row| matches!(row,NavRow::Item{id:NavId::Project(id),..} if id==destination)
+            ));
+            let index = app
+                .nav_rows
+                .iter()
+                .position(|row| matches!(row,NavRow::Item{id:NavId::Project(id),..} if id==source))
+                .unwrap();
+            app.select_nav(index);
+            app.enter_tasks().unwrap();
+            app.set_task_cursor(app.tasks.iter().position(|task| task.id == "root").unwrap());
+            app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+                .unwrap();
+            assert!(
+                matches!(&app.overlay,Some(Overlay::ProjectPicker{projects,..}) if projects.iter().any(|project|project.id==destination) && !projects.iter().any(|project|project.id==source))
+            );
+            for character in prefix.chars() {
+                app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                    .unwrap();
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            assert!(app.overlay.is_none());
+            assert_eq!(app.focus, Focus::Tasks);
+            if source == "team" {
+                assert!(
+                    app.status
+                        .contains("does not support moving individual tasks")
+                );
+                assert_eq!(store.outbox_len().unwrap(), 0);
+                for id in ["root", "child", "grandchild"] {
+                    assert_eq!(store.task(id).unwrap().unwrap().project_id, source);
+                    assert_eq!(
+                        store.task(id).unwrap().unwrap().section_id.as_deref(),
+                        Some("source-section")
+                    );
+                }
+                continue;
+            }
+            assert_eq!(app.selected_task().unwrap().id, "stay");
+            for id in ["root", "child", "grandchild"] {
+                let task = store.task(id).unwrap().unwrap();
+                assert_eq!(task.project_id, destination);
+                assert!(task.section_id.is_none());
+            }
+            assert_eq!(
+                store.task("child").unwrap().unwrap().parent_id.as_deref(),
+                Some("root")
+            );
+            assert_eq!(
+                store
+                    .task("grandchild")
+                    .unwrap()
+                    .unwrap()
+                    .parent_id
+                    .as_deref(),
+                Some("child")
+            );
+            assert_eq!(
+                store.task("root").unwrap().unwrap().description,
+                "Keep this note"
+            );
+            assert_eq!(store.task("root").unwrap().unwrap().labels, ["Keep"]);
+            assert_eq!(store.task("root").unwrap().unwrap().priority, 4);
+            assert!(store.project(destination).unwrap().unwrap().is_hidden);
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+                .unwrap();
+            for id in ["root", "child", "grandchild"] {
+                let task = store.task(id).unwrap().unwrap();
+                assert_eq!(task.project_id, source);
+                assert_eq!(task.section_id.as_deref(), Some("source-section"));
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+                .unwrap();
+            drop(app);
+            drop(store);
+            let reopened = Store::open(path).unwrap();
+            assert_eq!(reopened.task("stay").unwrap().unwrap().project_id, source);
+            for id in ["root", "child", "grandchild"] {
+                assert_eq!(reopened.task(id).unwrap().unwrap().project_id, destination);
+            }
+            assert!(reopened.outbox().unwrap().iter().any(|entry|matches!(&entry.operation,crate::model::Operation::MoveTask{project_id} if project_id==destination)));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual project-search benchmark; run with --ignored --nocapture"]
+    fn project_search_benchmark() {
+        let projects = (0..10_000)
+            .map(|index| ProjectPickerItem {
+                id: index.to_string(),
+                name: format!("#💼 Team project {index} reports"),
+            })
+            .collect::<Vec<_>>();
+        let mut search = ProjectSearch::default();
+        let started = Instant::now();
+        for _ in 0..20 {
+            for query in ["tm prj", "rpt 42", "PROJECT", "tm rpt 9"] {
+                std::hint::black_box(search.matches(&projects, query));
+            }
+        }
+        eprintln!(
+            "10,000 projects / 80 fuzzy query updates: {:?}",
+            started.elapsed()
+        );
+        let started = Instant::now();
+        for _ in 0..2000 {
+            std::hint::black_box(search.matches(&projects, "tm rpt 9"));
+        }
+        eprintln!("2,000 cached result accesses: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn moving_a_child_from_personal_to_team_detaches_only_that_subtree() {
+        let (_dir, mut app) = draft_test_app();
+        let projects:Vec<crate::model::RemoteProject>=serde_json::from_value(serde_json::json!([
+            {"id":"personal","name":"Personal"},{"id":"team","name":"Team","workspace_id":"workspace"}
+        ])).unwrap();
+        let tasks: Vec<crate::model::RemoteTask> = serde_json::from_value(serde_json::json!([
+            {"id":"root","project_id":"personal","content":"Root"},
+            {"id":"child","project_id":"personal","parent_id":"root","content":"Child"},
+            {"id":"grandchild","project_id":"personal","parent_id":"child","content":"Grandchild"}
+        ]))
+        .unwrap();
+        app.store.merge_remote(&projects, &tasks, &[], &[]).unwrap();
+        app.refresh_nav().unwrap();
+        let index = app
+            .nav_rows
+            .iter()
+            .position(|row| matches!(row,NavRow::Item{id:NavId::Project(id),..} if id=="personal"))
+            .unwrap();
+        app.select_nav(index);
+        app.enter_tasks().unwrap();
+        app.set_task_cursor(
+            app.tasks
+                .iter()
+                .position(|task| task.id == "child")
+                .unwrap(),
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "tea".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.store.task("root").unwrap().unwrap().project_id,
+            "personal"
+        );
+        assert_eq!(app.store.task("child").unwrap().unwrap().project_id, "team");
+        assert!(
+            app.store
+                .task("child")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .is_none()
+        );
+        assert_eq!(
+            app.store.task("grandchild").unwrap().unwrap().project_id,
+            "team"
+        );
+        assert_eq!(
+            app.store
+                .task("grandchild")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some("child")
+        );
+        app.undo().unwrap();
+        assert_eq!(
+            app.store
+                .task("child")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some("root")
+        );
+        assert_eq!(
+            app.store.task("grandchild").unwrap().unwrap().project_id,
+            "personal"
+        );
+    }
+
+    #[test]
+    fn v_recovers_an_old_rejected_workspace_move_and_successful_sync_clears_its_message() {
+        let (_dir, mut app) = draft_test_app();
+        let projects=serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+            {"id":"team","name":"Team","workspace_id":"workspace"},{"id":"personal","name":"Personal"}
+        ])).unwrap();
+        let tasks=serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+            {"id":"root","project_id":"team","content":"Root"},{"id":"child","project_id":"team","parent_id":"root","content":"Child"}
+        ])).unwrap();
+        app.store.merge_remote(&projects, &tasks, &[], &[]).unwrap();
+        app.store.move_task("root", "personal").unwrap();
+        let failed = app.store.claim_next_outbox().unwrap().unwrap();
+        let message = "Moving from a workspace is not implemented.";
+        app.store.fail_outbox(failed.seq, message).unwrap();
+        app.store.toggle_project_hidden("team").unwrap();
+        app.refresh_nav().unwrap();
+        let index = app
+            .nav_rows
+            .iter()
+            .position(|row| matches!(row,NavRow::Item{id:NavId::Project(id),..} if id=="personal"))
+            .unwrap();
+        app.select_nav(index);
+        app.enter_tasks().unwrap();
+        app.sync_issue = Some(message.into());
+        app.sync_status = SyncStatus::Error;
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "tea".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.store.task("root").unwrap().unwrap().project_id, "team");
+        assert_eq!(app.store.task("child").unwrap().unwrap().project_id, "team");
+        assert!(app.store.project("team").unwrap().unwrap().is_hidden);
+        assert!(app.store.outbox_error().unwrap().is_none());
+        assert!(app.store.outbox_len().unwrap() > 0);
+        // The stale error is replaced by actual successful synchronization, not
+        // by dismissing a still-unsent change or deleting its cached task.
+        while let Some(entry) = app.store.next_outbox().unwrap() {
+            app.store.finish_outbox(entry.seq).unwrap();
+        }
+        app.handle_sync_event(SyncEvent::Finished { pending: 0 })
+            .unwrap();
+        assert!(app.sync_issue.is_none());
+        assert_eq!(app.sync_status, SyncStatus::Synced);
     }
 
     #[test]
@@ -4019,6 +4868,236 @@ mod tests {
         );
         assert!(parse_filter_editor("Missing query\n\nfavorite = true").is_err());
         assert!(parse_filter_editor("Title\ntoday\nfavorite = perhaps").is_err());
+    }
+
+    fn draft_test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("drafts.db")).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        (dir, app)
+    }
+
+    fn save_reopened_draft(app: &mut App) -> EditorResult {
+        let Some(Overlay::Editor(mut editor)) = app.overlay.take() else {
+            panic!("draft did not reopen")
+        };
+        assert!(editor.notice().is_some());
+        std::thread::sleep(Duration::from_millis(200));
+        editor
+            .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        editor
+            .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = editor.poll().unwrap() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "reopened draft did not save");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn invalid_filter_submission_reopens_the_exact_draft_without_committing() {
+        let (_dir, mut app) = draft_test_app();
+        let text = "Focus\n(today | overdue) & p1\nfavorite = perhaps\n";
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::AddFilter,
+            task_id: None,
+            accepted: true,
+            text: text.into(),
+        })
+        .unwrap();
+        assert!(app.store.filters().unwrap().is_empty());
+        assert_eq!(app.store.outbox_len().unwrap(), 0);
+        let mut submitted = save_reopened_draft(&mut app);
+        assert_eq!(submitted.text, text);
+        assert_eq!(submitted.purpose, EditorPurpose::AddFilter);
+        submitted.text = text.replace("perhaps", "false");
+        app.apply_editor_result(submitted).unwrap();
+        assert_eq!(app.store.filters().unwrap().len(), 1);
+        assert_eq!(app.store.outbox_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_rejected_task_edit_keeps_its_target_through_id_replacement() {
+        let (_dir, mut app) = draft_test_app();
+        let inbox = app.store.project("inbox").unwrap().unwrap();
+        let id = app.store.add_task("Original", &inbox).unwrap();
+        let add_seq = app.store.next_outbox().unwrap().unwrap().seq;
+        let text = "\nDo not lose this description\n";
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::Edit,
+            task_id: Some(id.clone()),
+            accepted: true,
+            text: text.into(),
+        })
+        .unwrap();
+        let remote = serde_json::from_value(
+            serde_json::json!({"id":"server-task", "project_id":"inbox", "content":"Original"}),
+        )
+        .unwrap();
+        app.store.replace_task_id(&id, &remote).unwrap();
+        app.store.finish_outbox(add_seq).unwrap();
+        let mut submitted = save_reopened_draft(&mut app);
+        assert_eq!(submitted.text, text);
+        assert_eq!(submitted.task_id.as_deref(), Some(id.as_str()));
+        submitted.text = format!("Corrected{text}");
+        app.apply_editor_result(submitted).unwrap();
+        let task = app.store.task("server-task").unwrap().unwrap();
+        assert_eq!(task.content, "Corrected");
+        assert_eq!(task.description, "Do not lose this description");
+        assert_eq!(
+            app.store.next_outbox().unwrap().unwrap().entity_id,
+            "server-task"
+        );
+    }
+
+    #[test]
+    fn a_failed_add_retains_placement_and_destination_when_the_selected_view_changes() {
+        let (dir, mut app) = draft_test_app();
+        let projects =
+            serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+                {"id":"original", "name":"Original"}, {"id":"other", "name":"Other"}
+            ]))
+            .unwrap();
+        app.store.merge_remote(&projects, &[], &[], &[]).unwrap();
+        app.refresh_nav().unwrap();
+        let project = app.store.project("original").unwrap().unwrap();
+        app.editor_add_fallback = Some(project.clone());
+        app.pending_add_target = Some(project);
+        app.pending_add_placement = AddPlacement::Top;
+        let mut writer = rusqlite::Connection::open(dir.path().join("drafts.db")).unwrap();
+        let transaction = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::Add,
+            task_id: None,
+            accepted: true,
+            text: "New task\nDescription\n".into(),
+        })
+        .unwrap();
+        assert_eq!(app.store.outbox_len().unwrap(), 0);
+        assert_eq!(app.pending_add_placement, AddPlacement::Top);
+        assert_eq!(app.pending_add_target.as_ref().unwrap().id, "original");
+        transaction.rollback().unwrap();
+        let index = app
+            .nav_rows
+            .iter()
+            .position(
+                |row| matches!(row, NavRow::Item { id: NavId::Project(id), .. } if id == "other"),
+            )
+            .unwrap();
+        app.select_nav(index);
+        let submitted = save_reopened_draft(&mut app);
+        app.apply_editor_result(submitted).unwrap();
+        let tasks = app
+            .store
+            .tasks_for(&NavId::Project("original".into()))
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].content, "New task");
+        assert_eq!(tasks[0].child_order, 0);
+        assert!(
+            app.store
+                .tasks_for(&NavId::Project("other".into()))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(app.store.outbox_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_committed_add_is_not_reopened_when_the_view_refresh_fails() {
+        let (dir, mut app) = draft_test_app();
+        rusqlite::Connection::open(dir.path().join("drafts.db"))
+            .unwrap()
+            .execute("DROP TABLE filters", [])
+            .unwrap();
+        assert!(
+            app.apply_editor_result(EditorResult {
+                purpose: EditorPurpose::Add,
+                task_id: None,
+                accepted: true,
+                text: "Only once\n".into()
+            })
+            .is_err()
+        );
+        assert!(!matches!(
+            app.overlay,
+            Some(Overlay::Editor(_) | Overlay::EditorRecovery { .. })
+        ));
+        assert_eq!(
+            app.store
+                .tasks_for(&NavId::Project("inbox".into()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(app.store.outbox_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn an_invalid_project_draft_can_be_explicitly_cancelled() {
+        let (_dir, mut app) = draft_test_app();
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::AddProject,
+            task_id: None,
+            accepted: true,
+            text: "Two\nlines\n".into(),
+        })
+        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.store.projects().unwrap().len(), 1);
+        assert_eq!(app.store.outbox_len().unwrap(), 0);
+        assert!(app.editor_add_fallback.is_none());
+    }
+
+    #[test]
+    fn an_unrelated_runtime_error_preserves_the_open_draft_and_its_add_context() {
+        let (_dir, mut app) = draft_test_app();
+        let inbox = app.store.project("inbox").unwrap().unwrap();
+        app.pending_add_target = Some(inbox.clone());
+        app.editor_add_fallback = Some(inbox);
+        app.pending_add_placement = AddPlacement::Top;
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::Add,
+            task_id: None,
+            accepted: true,
+            text: "\nRetained description\n".into(),
+        })
+        .unwrap();
+        app.report_runtime_error(anyhow::anyhow!("background view refresh failed"));
+        assert!(app.editor_is_open());
+        assert_eq!(app.pending_add_placement, AddPlacement::Top);
+        assert!(app.pending_add_target.is_some());
+        assert!(app.editor_add_fallback.is_some());
+        let mut submitted = save_reopened_draft(&mut app);
+        assert_eq!(submitted.text, "\nRetained description\n");
+        submitted.text.insert_str(0, "Recovered");
+        app.apply_editor_result(submitted).unwrap();
+        assert_eq!(app.store.outbox_len().unwrap(), 1);
+        assert_eq!(
+            app.store
+                .tasks_for(&NavId::Project("inbox".into()))
+                .unwrap()[0]
+                .description,
+            "Retained description"
+        );
     }
 
     #[test]
@@ -4063,6 +5142,174 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT))
             .unwrap();
         assert!(matches!(app.overlay, Some(Overlay::FilterPicker { .. })));
+    }
+
+    fn app_with_favorite_filter(inbox_has_tasks: bool) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let mut tasks = vec![
+            serde_json::json!({"id":"filter-first", "project_id":"work", "content":"First filter task", "child_order":1}),
+            serde_json::json!({"id":"filter-second", "project_id":"work", "content":"Second filter task", "child_order":2}),
+        ];
+        if inbox_has_tasks {
+            tasks.extend([
+                serde_json::json!({"id":"inbox-first", "project_id":"inbox", "content":"First Inbox task", "child_order":1}),
+                serde_json::json!({"id":"inbox-second", "project_id":"inbox", "content":"Second Inbox task", "child_order":2}),
+            ]);
+        }
+        let tasks: Vec<crate::model::RemoteTask> =
+            serde_json::from_value(serde_json::Value::Array(tasks)).unwrap();
+        store.merge_remote(
+            &[serde_json::from_value(serde_json::json!({"id":"work", "name":"Work"})).unwrap()],
+            &tasks, &[],
+            &[serde_json::from_value(serde_json::json!({"id":"favorite", "name":"Focus", "query":"#Work", "is_favorite":true})).unwrap()],
+        ).unwrap();
+        store
+            .replace_filter_membership("favorite", &tasks[..2])
+            .unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        if inbox_has_tasks {
+            let index = app
+                .tasks
+                .iter()
+                .position(|task| task.id == "inbox-second")
+                .unwrap();
+            app.set_task_cursor(index);
+        }
+        let filter_index = app
+            .nav_rows
+            .iter()
+            .position(
+                |row| matches!(row, NavRow::Item { id: NavId::Filter(id), .. } if id == "favorite"),
+            )
+            .unwrap();
+        app.select_nav(filter_index);
+        app.force_tasks().unwrap();
+        app.focus = Focus::Tasks;
+        let index = app
+            .tasks
+            .iter()
+            .position(|task| task.id == "filter-second")
+            .unwrap();
+        app.set_task_cursor(index);
+        (dir, app)
+    }
+
+    fn save_filter_favorite(app: &mut App, is_favorite: bool) {
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::EditFilter,
+            task_id: Some("favorite".into()),
+            accepted: true,
+            text: format!("Edited filter\n#Work\nfavorite = {is_favorite}"),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn unfavoriting_current_filter_restores_destination_selection_and_cancels_stale_loads() {
+        let (_dir, mut app) = app_with_favorite_filter(true);
+        // A navigation load can still be pending while the editor is submitted.
+        app.select_nav(app.nav_cursor);
+        assert!(app.pending_render.is_some());
+        save_filter_favorite(&mut app, false);
+
+        assert_eq!(app.selected_nav(), Some(&NavId::Project("inbox".into())));
+        assert_eq!(app.selected_nav_name(), "Inbox");
+        assert_eq!(app.rendered_nav.as_ref(), app.selected_nav());
+        assert!(app.tasks.iter().all(|task| task.project_id == "inbox"));
+        assert_eq!(app.selected_task().unwrap().id, "inbox-second");
+        assert!(app.pending_render.is_none());
+        app.tick().unwrap();
+        assert_eq!(app.selected_task().unwrap().id, "inbox-second");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Details { task, .. }) if task.id == "inbox-second")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.store.task("inbox-second").unwrap().unwrap().checked);
+        assert!(!app.store.task("filter-second").unwrap().unwrap().checked);
+    }
+
+    #[test]
+    fn unfavoriting_current_filter_clears_tasks_for_an_empty_destination() {
+        let (_dir, mut app) = app_with_favorite_filter(false);
+        save_filter_favorite(&mut app, false);
+        assert_eq!(app.selected_nav_name(), "Inbox");
+        assert_eq!(app.rendered_nav.as_ref(), app.selected_nav());
+        assert!(app.tasks.is_empty());
+        assert!(app.task_cursor.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn unfavoriting_the_last_visible_navigation_item_clears_the_task_pane() {
+        let (_dir, mut app) = app_with_favorite_filter(false);
+        for nav in [
+            NavId::Project("inbox".into()),
+            NavId::Today,
+            NavId::Upcoming,
+            NavId::Project("work".into()),
+        ] {
+            app.store.toggle_navigation_hidden(&nav).unwrap();
+        }
+        app.refresh_nav().unwrap();
+        app.force_tasks().unwrap();
+        assert_eq!(app.nav_rows.len(), 1);
+        assert!(!app.tasks.is_empty());
+        app.select_nav(app.nav_cursor);
+
+        save_filter_favorite(&mut app, false);
+        assert!(app.selected_nav().is_none());
+        assert!(app.tasks.is_empty());
+        assert!(app.task_cursor.is_none());
+        assert!(app.rendered_nav.is_none());
+        assert!(app.pending_render.is_none());
+    }
+
+    #[test]
+    fn a_failed_destination_load_does_not_leave_old_filter_tasks_actionable() {
+        let (dir, mut app) = app_with_favorite_filter(true);
+        app.store
+            .update_filter("favorite", "Focus", "#Work", false)
+            .unwrap();
+        app.refresh_nav().unwrap();
+        assert_eq!(app.selected_nav_name(), "Inbox");
+        // Simulate a storage failure after navigation has already changed.
+        rusqlite::Connection::open(dir.path().join("todoist-tui.db"))
+            .unwrap()
+            .execute("DROP TABLE tasks", [])
+            .unwrap();
+        assert!(app.force_tasks().is_err());
+        assert!(app.tasks.is_empty());
+        assert!(app.task_cursor.is_none());
+        assert!(app.rendered_nav.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn editing_a_filter_that_remains_favorite_keeps_its_task_selection() {
+        let (_dir, mut app) = app_with_favorite_filter(true);
+        save_filter_favorite(&mut app, true);
+        assert_eq!(app.selected_nav(), Some(&NavId::Filter("favorite".into())));
+        assert_eq!(app.selected_nav_name(), "Edited filter");
+        assert_eq!(app.selected_task().unwrap().id, "filter-second");
+        assert_eq!(app.rendered_nav.as_ref(), app.selected_nav());
     }
 
     #[test]
@@ -4326,6 +5573,164 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
             .unwrap();
         assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn task_filter_and_error_details_use_configured_scroll_and_close_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[keybindings]\ndown = ['ctrl+n']\nup = ['ctrl+p']\nclose_dialog = ['esc']\n",
+        )
+        .unwrap();
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let inbox = store.project("inbox").unwrap().unwrap();
+        let id = store.add_task("Details", &inbox).unwrap();
+        let task = store.task(&id).unwrap().unwrap();
+        let filter_id = store.add_filter("Filter", "today", true).unwrap();
+        let filter = store.filter(&filter_id).unwrap().unwrap();
+        let mut app = App::new(
+            store.clone(),
+            SyncManager::new(store, None).unwrap(),
+            KeyBindings::load(&path, true).unwrap(),
+            path,
+        )
+        .unwrap();
+        for overlay in [
+            Overlay::Details { task, scroll: 0 },
+            Overlay::FilterDetails { filter, scroll: 0 },
+            Overlay::ErrorDetails {
+                message: "Error".into(),
+                scroll: 0,
+            },
+        ] {
+            app.overlay = Some(overlay);
+            app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+                .unwrap();
+            assert!(matches!(
+                app.overlay,
+                Some(
+                    Overlay::Details { scroll: 1, .. }
+                        | Overlay::FilterDetails { scroll: 1, .. }
+                        | Overlay::ErrorDetails { scroll: 1, .. }
+                )
+            ));
+            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+                .unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+                .unwrap();
+            assert!(matches!(
+                app.overlay,
+                Some(
+                    Overlay::Details { scroll: 0, .. }
+                        | Overlay::FilterDetails { scroll: 0, .. }
+                        | Overlay::ErrorDetails { scroll: 0, .. }
+                )
+            ));
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            assert!(app.overlay.is_none());
+        }
+    }
+
+    fn await_outbox(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.outbox_load.is_some() {
+            app.tick().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "diagnostics worker did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn local_outbox_loads_pages_opens_details_and_refreshes_without_syncing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let inbox = store.project("inbox").unwrap().unwrap();
+        for index in 0..55 {
+            store.add_task(&format!("Task {index}"), &inbox).unwrap();
+        }
+        let mut app = App::new(
+            store.clone(),
+            SyncManager::new(store.clone(), None).unwrap(),
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Outbox(OutboxView { loading: true, .. }))
+        ));
+        await_outbox(&mut app);
+        assert!(
+            matches!(&app.overlay,Some(Overlay::Outbox(view)) if view.page.as_ref().unwrap().entries.len()==50)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .unwrap();
+        await_outbox(&mut app);
+        assert!(
+            matches!(&app.overlay,Some(Overlay::Outbox(view)) if view.page.as_ref().unwrap().offset==50 && view.page.as_ref().unwrap().entries.len()==5)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .unwrap();
+        await_outbox(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        let selected = match &app.overlay {
+            Some(Overlay::Outbox(view)) => view.page.as_ref().unwrap().entries[view.cursor].seq,
+            _ => panic!(),
+        };
+        store
+            .finish_outbox(store.next_outbox().unwrap().unwrap().seq)
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        await_outbox(&mut app);
+        assert!(!app.sync.is_running());
+        assert!(
+            matches!(&app.overlay,Some(Overlay::Outbox(view)) if view.cursor==0 && view.page.as_ref().unwrap().entries[0].seq==selected)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            matches!(&app.overlay,Some(Overlay::Outbox(view)) if view.details && view.scroll==1)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(&app.overlay,Some(Overlay::Outbox(view)) if !view.details));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(store.outbox_len().unwrap(), 54);
+    }
+
+    #[test]
+    fn obsolete_diagnostics_results_do_not_replace_unrelated_dialogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            SyncManager::new(store, None).unwrap(),
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+            .unwrap();
+        await_outbox(&mut app);
+        assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
     }
 
     #[test]

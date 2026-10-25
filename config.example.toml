@@ -5,6 +5,8 @@
 # Modifiers use ctrl+, alt+, shift+, or super+. Named keys include enter, esc,
 # space, arrows, home, end, pageup, pagedown, tab, backtab, insert, delete,
 # backspace, and f1 through f255.
+# Bind symbols using the resolved character (e.g. ? or @); ctrl++ is Ctrl+plus.
+# shift+tab and backtab are equivalent. Neovim forwarding supports xterm F1–F63.
 
 [editor]
 # In Normal mode, make an otherwise-unmapped j/k move by visual wrapped lines.
@@ -56,6 +58,7 @@ outdent_task = ["<"]
 edit_due = ["t"]
 remove_due = ["shift+t"]
 show_error = ["shift+e"]
+show_outbox = ["shift+s"]
 add_task_top = ["a"]
 add_task_bottom = ["q"]
 quit = ["shift+q"]

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::{
@@ -13,9 +13,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
-        App, FilterPickerItem, Focus, LabelPickerItem, Overlay, PickerMode, ProjectPickerItem,
-        ProjectPickerPurpose, SyncStatus, TaskPickerItem, filtered_filter_indices,
-        filtered_label_indices, filtered_project_indices, filtered_task_indices,
+        App, FilterPickerItem, Focus, LabelPickerItem, OutboxView, Overlay, PickerMode,
+        ProjectPickerItem, ProjectPickerPurpose, ProjectSearch, SyncStatus, TaskPickerItem,
+        filtered_filter_indices, filtered_label_indices, filtered_task_indices,
     },
     editor::EditorCellStyle,
     keymap::{Action, KeyBindings},
@@ -38,6 +38,71 @@ const TASK_LOOKAHEAD: usize = 4;
 const LIST_TOP_PADDING: u16 = 1;
 const TASK_RIGHT_PADDING: u16 = 2;
 const DESCRIPTION_MARKER: &str = "\u{2630}";
+
+#[derive(Default)]
+pub struct TaskRenderCache {
+    key: Option<(usize, bool, bool, bool, NaiveDate)>,
+    layout: TaskLayout,
+}
+
+#[derive(Default)]
+struct TaskLayout {
+    lines: Vec<Line<'static>>,
+    positions: Vec<usize>,
+    ends: Vec<usize>,
+}
+
+impl TaskRenderCache {
+    pub fn invalidate(&mut self) {
+        self.key = None;
+    }
+
+    fn ensure(&mut self, tasks: &[Task], width: usize, labels: bool, dates: bool, completed: bool) {
+        let key = (width, labels, dates, completed, Local::now().date_naive());
+        if self.key != Some(key) {
+            self.layout = task_layout(tasks, None, false, labels, dates, completed, width);
+            self.key = Some(key);
+        }
+    }
+
+    fn visible(&self, selected: Option<usize>, focused: bool, height: usize) -> Vec<Line<'static>> {
+        let scroll = task_scroll(&self.layout.positions, selected, height);
+        let selected_range = selected.filter(|_| focused).and_then(|index| {
+            Some((
+                *self.layout.positions.get(index)?,
+                *self.layout.ends.get(index)?,
+            ))
+        });
+        self.layout
+            .lines
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(height)
+            .map(|(row, line)| {
+                let mut line = line.clone();
+                if let Some((start, end)) =
+                    selected_range.filter(|(start, end)| row >= *start && row < *end)
+                {
+                    line.style = line.style.bg(SELECT);
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(SELECT);
+                        if span.style.fg == Some(TEXT) {
+                            span.style = span.style.fg(Color::White).add_modifier(Modifier::BOLD);
+                        } else if span.style.add_modifier.contains(Modifier::CROSSED_OUT) {
+                            span.style = span.style.add_modifier(Modifier::BOLD);
+                        }
+                    }
+                    if row == start {
+                        line.spans[0].content = "▸ ".into();
+                    }
+                    debug_assert!(end > start);
+                }
+                line
+            })
+            .collect()
+    }
+}
 
 fn priority_display(priority: u8) -> (&'static str, Option<Color>) {
     match priority {
@@ -84,6 +149,8 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .nav_rows
         .iter()
         .enumerate()
+        .skip(scroll)
+        .take(height)
         .map(|(index, row)| match row {
             NavRow::Separator => Line::raw(""),
             NavRow::Item {
@@ -126,12 +193,14 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, area: Rect) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                panel(" Projects and Filters ", app.focus == Focus::Navigation)
-                    .padding(Padding::new(0, 0, LIST_TOP_PADDING, 0)),
-            )
-            .scroll((scroll as u16, 0)),
+        Paragraph::new(lines).block(
+            panel(" Projects and Filters ", app.focus == Focus::Navigation).padding(Padding::new(
+                0,
+                0,
+                LIST_TOP_PADDING,
+                0,
+            )),
+        ),
         area,
     );
 }
@@ -143,32 +212,30 @@ fn navigation_selection_color(focus: Focus) -> Color {
     }
 }
 
-fn draw_tasks(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let content_width = area.width.saturating_sub(2 + TASK_RIGHT_PADDING).into();
     let group_by_date = matches!(app.selected_nav(), Some(NavId::Upcoming));
-    let (lines, positions) = task_lines(
+    let title = format!(" {} ", app.selected_nav_name());
+    app.task_render_cache.ensure(
         &app.tasks,
-        app.task_cursor,
-        app.focus == Focus::Tasks,
+        content_width,
         app.group_tasks_by_label && !group_by_date,
         group_by_date,
         app.show_completed_tasks,
-        content_width,
     );
     let inner_height = area.height.saturating_sub(2 + LIST_TOP_PADDING) as usize;
-    let scroll = task_scroll(&positions, app.task_cursor, inner_height);
-    let title = format!(" {} ", app.selected_nav_name());
+    let lines =
+        app.task_render_cache
+            .visible(app.task_cursor, app.focus == Focus::Tasks, inner_height);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                panel(Line::from(title), app.focus == Focus::Tasks).padding(Padding::new(
-                    0,
-                    TASK_RIGHT_PADDING,
-                    LIST_TOP_PADDING,
-                    0,
-                )),
-            )
-            .scroll((scroll as u16, 0)),
+        Paragraph::new(lines).block(
+            panel(Line::from(title), app.focus == Focus::Tasks).padding(Padding::new(
+                0,
+                TASK_RIGHT_PADDING,
+                LIST_TOP_PADDING,
+                0,
+            )),
+        ),
         area,
     );
 }
@@ -191,18 +258,18 @@ fn task_scroll(positions: &[usize], selected: Option<usize>, viewport_height: us
         .min(selected_line)
 }
 
-fn task_lines<'a>(
-    tasks: &'a [Task],
+fn task_layout(
+    tasks: &[Task],
     selected: Option<usize>,
     focused: bool,
     group_by_label: bool,
     group_by_date: bool,
     show_completed: bool,
     content_width: usize,
-) -> (Vec<Line<'a>>, Vec<usize>) {
+) -> TaskLayout {
     if tasks.is_empty() {
-        return (
-            vec![Line::styled(
+        return TaskLayout {
+            lines: vec![Line::styled(
                 if show_completed {
                     "  No tasks"
                 } else {
@@ -210,11 +277,13 @@ fn task_lines<'a>(
                 },
                 Style::default().fg(MUTED),
             )],
-            Vec::new(),
-        );
+            positions: Vec::new(),
+            ends: Vec::new(),
+        };
     }
     let mut lines = Vec::new();
     let mut positions = Vec::with_capacity(tasks.len());
+    let mut ends = Vec::with_capacity(tasks.len());
     let mut previous: Option<Option<String>> = None;
     let today = Local::now().date_naive();
     let task_depths = task_depths(tasks);
@@ -360,34 +429,77 @@ fn task_lines<'a>(
                 .style(line_style),
             );
         }
+        ends.push(lines.len());
     }
-    (lines, positions)
+    TaskLayout {
+        lines,
+        positions,
+        ends,
+    }
 }
 
 fn task_depths(tasks: &[Task]) -> Vec<usize> {
     let by_id = tasks
         .iter()
-        .map(|task| (task.id.as_str(), task))
+        .enumerate()
+        .map(|(index, task)| (task.id.as_str(), index))
         .collect::<HashMap<_, _>>();
-    tasks
-        .iter()
-        .map(|task| {
-            let mut depth = 0;
-            let mut parent_id = task.parent_id.as_deref();
-            let mut seen = HashSet::new();
-            while let Some(parent) = parent_id {
-                if parent == task.id || !seen.insert(parent) {
-                    break;
-                }
-                let Some(parent_task) = by_id.get(parent) else {
-                    break;
-                };
-                depth += 1;
-                parent_id = parent_task.parent_id.as_deref();
+    let mut depths = vec![None; tasks.len()];
+    let mut in_path = vec![None; tasks.len()];
+    let mut path = Vec::new();
+    for start in 0..tasks.len() {
+        if depths[start].is_some() {
+            continue;
+        }
+        let mut current = start;
+        loop {
+            if depths[current].is_some() {
+                break;
             }
-            depth
-        })
-        .collect()
+            if let Some(cycle_start) = in_path[current] {
+                let cycle_depth = path.len() - cycle_start - 1;
+                for &index in &path[cycle_start..] {
+                    depths[index] = Some(cycle_depth);
+                }
+                break;
+            }
+            in_path[current] = Some(path.len());
+            path.push(current);
+            let Some(parent) = tasks[current]
+                .parent_id
+                .as_deref()
+                .and_then(|id| by_id.get(id))
+                .copied()
+            else {
+                depths[current] = Some(0);
+                break;
+            };
+            current = parent;
+        }
+        for &index in path.iter().rev() {
+            if depths[index].is_none() {
+                let parent = by_id[tasks[index].parent_id.as_deref().unwrap()];
+                depths[index] = Some(depths[parent].unwrap_or(0) + 1);
+            }
+            in_path[index] = None;
+        }
+        path.clear();
+    }
+    depths.into_iter().map(Option::unwrap_or_default).collect()
+}
+
+#[cfg(test)]
+fn task_lines(
+    tasks: &[Task],
+    selected: Option<usize>,
+    focused: bool,
+    labels: bool,
+    dates: bool,
+    completed: bool,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let layout = task_layout(tasks, selected, focused, labels, dates, completed, width);
+    (layout.lines, layout.positions)
 }
 
 fn upcoming_date_heading(date: NaiveDate, today: NaiveDate) -> String {
@@ -418,17 +530,19 @@ fn wrap_complete_words(
             continue;
         }
 
-        if current.is_empty() {
-            // There is no way to display this word without splitting it.
-            // Keep the row intact instead of allowing the terminal to clip a
-            // partial word at the border.
-            break;
+        // Metadata can leave less space on the first line than on subsequent
+        // lines. Keep that first (possibly blank) row and retry the whole word.
+        if !current.is_empty() || lines.is_empty() && first_line_width != continuation_width {
+            lines.push(std::mem::take(&mut current));
         }
-
-        lines.push(std::mem::take(&mut current));
         width_limit = continuation_width;
         if word_width > width_limit {
-            break;
+            // Never clip a partial word, and never discard later words. The
+            // complete token remains available in the scrollable details.
+            if width_limit > 0 {
+                lines.push("…".into());
+            }
+            continue;
         }
         current.push_str(word);
     }
@@ -499,19 +613,26 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
     match app.overlay.as_mut() {
         Some(Overlay::Help { scroll }) => draw_help(frame, keybindings, &config_path, scroll),
         Some(Overlay::ErrorDetails { message, scroll }) => {
-            draw_error_details(frame, message, *scroll)
+            let title = scrolling_title("Error details", keybindings);
+            draw_scrolling_dialog(
+                frame,
+                Text::from(message.as_str()),
+                title,
+                centered(frame.area(), 86, 16, 96, 82),
+                scroll,
+            );
         }
-        Some(Overlay::Details(task)) => draw_details(
+        Some(Overlay::Details { task, scroll }) => draw_details(frame, task, keybindings, scroll),
+        Some(Overlay::FilterDetails { filter, scroll }) => {
+            draw_filter_details(frame, filter, keybindings, scroll)
+        }
+        Some(Overlay::Outbox(view)) => draw_outbox(
             frame,
-            task,
-            keybindings.display(Action::EditTask),
-            keybindings.display(Action::EditDue),
-            keybindings.display(Action::RemoveDue),
-            keybindings.display(Action::DeleteTask),
+            view,
+            keybindings,
+            app.sync_status,
+            app.sync.has_token(),
         ),
-        Some(Overlay::FilterDetails(filter)) => {
-            draw_filter_details(frame, filter, keybindings.display(Action::EditTask))
-        }
         Some(Overlay::LabelPicker {
             query,
             cursor,
@@ -525,8 +646,9 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
             cursor,
             mode,
             projects,
+            search,
             ..
-        }) => draw_project_picker(frame, purpose, query, *cursor, *mode, projects),
+        }) => draw_project_picker(frame, purpose, query, *cursor, *mode, projects, search),
         Some(Overlay::TaskPicker {
             query,
             cursor,
@@ -539,6 +661,26 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
             mode,
             filters,
         }) => draw_filter_picker(frame, query, *cursor, *mode, filters),
+        Some(Overlay::EditorRecovery { draft, message }) => {
+            let area = centered(frame.area(), 82, 18, 94, 82);
+            frame.render_widget(Clear, area);
+            let text = format!("{message}\n\nDraft retained:\n{}", draft.result.text);
+            frame.render_widget(
+                Paragraph::new(text).wrap(Wrap { trim: false }).block(
+                    panel(
+                        format!(
+                            " Draft — {} / {} retry; {} discards ",
+                            keybindings.display(Action::Confirm),
+                            keybindings.display(Action::EditTask),
+                            keybindings.display(Action::Cancel)
+                        ),
+                        true,
+                    )
+                    .padding(Padding::new(2, 2, 1, 1)),
+                ),
+                area,
+            );
+        }
         Some(Overlay::Editor(editor)) => {
             let area = centered(frame.area(), 82, 18, 94, 70);
             let title = match (editor.edits_filter(), editor.save_on_enter_in_insert()) {
@@ -547,10 +689,20 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
                 (false, true) => " Neovim — Enter saves; Shift+Enter newline; :cq cancels ",
                 (false, false) => " Neovim — Normal Enter saves; Shift+Enter newline; :cq cancels ",
             };
-            let inner = panel(title, true).inner(area);
-            editor.resize(inner.height, inner.width);
+            let mut inner = panel(title, true).inner(area);
             frame.render_widget(Clear, area);
             frame.render_widget(panel(title, true), area);
+            if let Some(notice) = editor.notice()
+                && inner.height > 0
+            {
+                frame.render_widget(
+                    Paragraph::new(notice).style(Style::default().fg(RED_BRIGHT).bg(PANEL)),
+                    Rect::new(inner.x, inner.y, inner.width, 1),
+                );
+                inner.y = inner.y.saturating_add(1);
+                inner.height = inner.height.saturating_sub(1);
+            }
+            editor.resize(inner.height, inner.width);
             let lines = editor
                 .styled_lines()
                 .into_iter()
@@ -576,15 +728,155 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn draw_error_details(frame: &mut Frame<'_>, message: &str, scroll: usize) {
-    let area = centered(frame.area(), 86, 16, 96, 82);
-    let block = panel(" Error details — j/k scroll; Enter/Esc/q closes ", true)
-        .padding(Padding::new(2, 2, 1, 1));
+fn scrolling_title(name: &str, keys: &KeyBindings) -> String {
+    format!(
+        " {name} — {}/{} scroll; {} closes ",
+        keys.display(Action::Down),
+        keys.display(Action::Up),
+        keys.display(Action::CloseDialog)
+    )
+}
+
+fn draw_outbox(
+    frame: &mut Frame<'_>,
+    view: &mut OutboxView,
+    keys: &KeyBindings,
+    sync: SyncStatus,
+    has_token: bool,
+) {
+    let area = centered(frame.area(), 100, 26, 96, 88);
+    let title = if view.details {
+        scrolling_title("Operation details", keys)
+    } else {
+        format!(
+            " Outbox — {} details; {}/{} pages; {} refresh; {} closes ",
+            keys.display(Action::Confirm),
+            keys.display(Action::FocusNavigation),
+            keys.display(Action::FocusTasks),
+            keys.display(Action::Sync),
+            keys.display(Action::CloseDialog)
+        )
+    };
+    if let Some(error) = &view.error {
+        draw_scrolling_dialog(
+            frame,
+            Text::from(format!("Unable to read the local queue:\n{error}")),
+            title,
+            area,
+            &mut view.scroll,
+        );
+        return;
+    }
+    let Some(page) = &view.page else {
+        draw_scrolling_dialog(
+            frame,
+            Text::from("Loading local queue…"),
+            title,
+            area,
+            &mut view.scroll,
+        );
+        return;
+    };
+    let retry = page.retry_not_before.as_deref().unwrap_or("none");
+    let sync = if has_token {
+        format!("{sync:?}")
+    } else {
+        "Local only (no token)".into()
+    };
+    if view.details {
+        let text = page
+            .entries
+            .get(view.cursor)
+            .map(|entry| {
+                format!(
+                    "Synchronization: {sync}\nQueue retry not before: {retry}\n\n{}",
+                    entry.details
+                )
+            })
+            .unwrap_or_else(|| "This operation is no longer queued. Refresh the queue.".into());
+        draw_scrolling_dialog(frame, Text::from(text), title, area, &mut view.scroll);
+        return;
+    }
+    let block = panel(title, true).padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let mut lines = vec![
+        Line::raw(format!(
+            "{} queued; {} rejected — {sync}",
+            page.total, page.rejected
+        )),
+        Line::raw(format!("Retry not before: {retry}")),
+        Line::styled(
+            format!(
+                "Entries {}–{} of {} — {}/{} select{}",
+                if page.entries.is_empty() {
+                    0
+                } else {
+                    page.offset + 1
+                },
+                page.offset + page.entries.len(),
+                page.total,
+                keys.display(Action::Down),
+                keys.display(Action::Up),
+                if view.loading {
+                    " — refreshing…"
+                } else {
+                    ""
+                }
+            ),
+            Style::default().fg(MUTED),
+        ),
+        Line::raw(""),
+    ];
+    let height = (inner.height as usize).saturating_sub(lines.len());
+    let start = view.cursor.saturating_sub(height.saturating_sub(1));
+    if page.entries.is_empty() {
+        lines.push(Line::raw("No queued operations"));
+    }
+    for (index, entry) in page.entries.iter().enumerate().skip(start).take(height) {
+        let selected = index == view.cursor;
+        let content = format!(
+            "{}#{} {} — {}: {}",
+            if selected { "▸ " } else { "  " },
+            entry.seq,
+            entry.state,
+            entry.operation,
+            entry.title
+        );
+        lines.push(Line::styled(
+            complete_words_within(&content, inner.width as usize),
+            if selected {
+                Style::default().bg(SELECT).fg(Color::White)
+            } else if entry.state == "Rejected" {
+                Style::default().fg(RED_BRIGHT)
+            } else {
+                Style::default().fg(TEXT)
+            },
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_scrolling_dialog(
+    frame: &mut Frame<'_>,
+    text: Text<'_>,
+    title: String,
+    area: Rect,
+    scroll: &mut usize,
+) {
+    let block = panel(title, true).padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(area);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    *scroll = (*scroll).min(
+        paragraph
+            .line_count(inner.width)
+            .saturating_sub(inner.height as usize),
+    );
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(message)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+        paragraph
+            .scroll(((*scroll).min(u16::MAX as usize) as u16, 0))
             .block(block),
         area,
     );
@@ -656,7 +948,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         ),
         (
             keys.display(Action::SearchProjects).into(),
-            "search all projects, including hidden projects",
+            "fuzzy search all projects",
         ),
         (
             keys.display(Action::SearchTasks).into(),
@@ -730,7 +1022,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         (keys.display(Action::Redo).into(), "redo last undone change"),
         (
             keys.display(Action::MoveTask).into(),
-            "move task to another project",
+            "fuzzy search a move destination",
         ),
         (
             format!(
@@ -771,6 +1063,10 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         (
             keys.display(Action::ShowError).into(),
             "show complete synchronization error",
+        ),
+        (
+            keys.display(Action::ShowOutbox).into(),
+            "inspect queued/rejected operations locally",
         ),
         (
             keys.display(Action::ToggleHiddenProjects).into(),
@@ -870,14 +1166,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
     );
 }
 
-fn draw_details(
-    frame: &mut Frame<'_>,
-    task: &Task,
-    edit_key: &str,
-    due_key: &str,
-    remove_due_key: &str,
-    delete_key: &str,
-) {
+fn draw_details(frame: &mut Frame<'_>, task: &Task, keys: &KeyBindings, scroll: &mut usize) {
     let area = centered(frame.area(), 72, 18, 94, 82);
     let due = task
         .due
@@ -891,7 +1180,7 @@ fn draw_details(
     };
     let assignee = task.assignee.as_deref().unwrap_or("—");
     let (priority_label, priority_color) = priority_display(task.priority);
-    let text = Text::from(vec![
+    let mut text = Text::from(vec![
         Line::styled(
             "Title",
             Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
@@ -922,28 +1211,31 @@ fn draw_details(
             "Description",
             Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
         ),
-        Line::raw(if task.description.is_empty() {
-            "—".into()
-        } else {
-            task.description.clone()
-        }),
     ]);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            panel(
-                format!(
-                    " Task details — {edit_key} edit; {due_key} date; {remove_due_key} clear; {delete_key} delete "
-                ),
-                true,
-            )
-            .padding(Padding::new(2, 2, 1, 1)),
+    text.extend(Text::from(if task.description.is_empty() {
+        "—"
+    } else {
+        &task.description
+    }));
+    let title = scrolling_title(
+        &format!(
+            "Task — {} edit; {} date; {} clear; {} delete",
+            keys.display(Action::EditTask),
+            keys.display(Action::EditDue),
+            keys.display(Action::RemoveDue),
+            keys.display(Action::DeleteTask)
         ),
-        area,
+        keys,
     );
+    draw_scrolling_dialog(frame, text, title, area, scroll);
 }
 
-fn draw_filter_details(frame: &mut Frame<'_>, filter: &Filter, edit_key: &str) {
+fn draw_filter_details(
+    frame: &mut Frame<'_>,
+    filter: &Filter,
+    keys: &KeyBindings,
+    scroll: &mut usize,
+) {
     let area = centered(frame.area(), 72, 14, 94, 72);
     let scope = if filter.workspace_id.is_some() {
         "Workspace"
@@ -980,18 +1272,12 @@ fn draw_filter_details(frame: &mut Frame<'_>, filter: &Filter, edit_key: &str) {
             }),
         ]),
     ]);
-    frame.render_widget(Clear, area);
     let title = if filter.is_frozen {
-        " Filter details — read-only ".to_owned()
+        "Filter — read-only".to_owned()
     } else {
-        format!(" Filter details — {edit_key} edits ")
+        format!("Filter — {} edit", keys.display(Action::EditTask))
     };
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(panel(title, true).padding(Padding::new(2, 2, 1, 1))),
-        area,
-    );
+    draw_scrolling_dialog(frame, text, scrolling_title(&title, keys), area, scroll);
 }
 
 fn draw_task_picker(
@@ -1247,6 +1533,7 @@ fn draw_project_picker(
     cursor: usize,
     mode: PickerMode,
     projects: &[ProjectPickerItem],
+    search: &mut ProjectSearch,
 ) {
     let area = centered(frame.area(), 62, 18, 76, 70);
     let action = match purpose {
@@ -1254,12 +1541,12 @@ fn draw_project_picker(
         ProjectPickerPurpose::MoveTask { .. } => "Move task",
     };
     let title = match mode {
-        PickerMode::Filtering => format!(" {action} — type prefix; Esc selects "),
+        PickerMode::Filtering => format!(" {action} — fuzzy search; Esc selects "),
         PickerMode::Selecting => format!(" {action} — j/k select; Esc cancels "),
     };
     let block = panel(title, true);
     let inner = block.inner(area);
-    let matches = filtered_project_indices(projects, query);
+    let matches = search.matches(projects, query);
     let list_height = inner.height.saturating_sub(2) as usize;
     let selected = cursor.min(matches.len().saturating_sub(1));
     let scroll = selected.saturating_sub(list_height.saturating_sub(1));
@@ -1359,6 +1646,7 @@ mod tests {
             child_order: 0,
             checked: false,
             assignee: None,
+            section_id: None,
         }
     }
 
@@ -1366,6 +1654,113 @@ mod tests {
     fn navigation_selection_is_red_when_focused_and_grey_when_tasks_are_focused() {
         assert_eq!(navigation_selection_color(Focus::Navigation), SELECT);
         assert_eq!(navigation_selection_color(Focus::Tasks), INACTIVE_SELECT);
+    }
+
+    fn large_task_fixture() -> Vec<Task> {
+        (0..10_000).map(|index| {
+            let mut item = task(&format!("Task {index}: a long title with enough words to wrap over multiple visual rows"), &["Work"]);
+            item.id = index.to_string();
+            item.parent_id = (index % 20 != 0).then(|| (index - 1).to_string());
+            item
+        }).collect()
+    }
+
+    #[test]
+    #[ignore = "manual rendering benchmark; run with --ignored --nocapture"]
+    fn render_benchmark() {
+        let tasks = large_task_fixture();
+        let started = std::time::Instant::now();
+        for selected in 0..20 {
+            std::hint::black_box(task_lines(
+                &tasks,
+                Some(selected),
+                true,
+                true,
+                false,
+                false,
+                80,
+            ));
+        }
+        eprintln!(
+            "10,000 tasks / depth 20 / 20 uncached layouts: {:?}",
+            started.elapsed()
+        );
+        let mut cache = TaskRenderCache::default();
+        let started = std::time::Instant::now();
+        cache.ensure(&tasks, 80, true, false, false);
+        eprintln!("Initial cached layout: {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        for selected in 0..20 {
+            cache.ensure(&tasks, 80, true, false, false);
+            std::hint::black_box(cache.visible(Some(selected + 5000), true, 30));
+        }
+        eprintln!("20 cached viewport redraws: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn cached_viewport_matches_full_layout_selection_headings_and_completed_styling() {
+        let mut tasks = vec![
+            task("First title wraps over several rows", &["Home"]),
+            task("Completed title wraps too", &["Work"]),
+            task("Last", &["Work"]),
+        ];
+        tasks[1].checked = true;
+        tasks[1].priority = 4;
+        let mut cache = TaskRenderCache::default();
+        cache.ensure(&tasks, 18, true, false, true);
+        for focused in [false, true] {
+            for selected in 0..tasks.len() {
+                let (full, positions) =
+                    task_lines(&tasks, Some(selected), focused, true, false, true, 18);
+                let scroll = task_scroll(&positions, Some(selected), 5);
+                assert_eq!(
+                    cache.visible(Some(selected), focused, 5),
+                    full.into_iter().skip(scroll).take(5).collect::<Vec<_>>()
+                );
+            }
+        }
+        tasks[0].content = "Changed locally".into();
+        cache.invalidate();
+        cache.ensure(&tasks, 40, false, false, true);
+        assert_eq!(
+            cache.visible(None, false, 30),
+            task_lines(&tasks, None, false, false, false, true, 40).0
+        );
+    }
+
+    #[test]
+    fn viewport_offsets_beyond_u16_still_show_the_selected_task() {
+        let tasks = vec![task(&"word ".repeat(70_000), &[]), task("LAST", &[])];
+        let mut cache = TaskRenderCache::default();
+        cache.ensure(&tasks, 8, false, false, false);
+        assert!(cache.layout.positions[1] > u16::MAX as usize);
+        let visible = cache.visible(Some(1), true, 6);
+        assert!(
+            visible
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.content == "LAST"))
+        );
+        assert!(
+            visible
+                .iter()
+                .any(|line| line.spans.first().is_some_and(|span| span.content == "▸ "))
+        );
+    }
+
+    #[test]
+    fn memoized_depths_handle_deep_trees_orphans_and_cycles() {
+        let mut tasks = (0..5000)
+            .map(|index| {
+                let mut item = task(&index.to_string(), &[]);
+                item.parent_id = (index > 0).then(|| (index - 1).to_string());
+                item
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(task_depths(&tasks), (0..5000).collect::<Vec<_>>());
+        tasks.truncate(5);
+        tasks[0].parent_id = Some("2".into());
+        tasks[4].parent_id = Some("missing".into());
+        assert_eq!(task_depths(&tasks), [2, 2, 2, 3, 0]);
     }
 
     #[test]
@@ -1580,7 +1975,114 @@ mod tests {
 
     #[test]
     fn oversized_first_word_is_not_rendered_partially() {
-        assert_eq!(wrap_complete_words("extraordinary", 6, 5), [""]);
+        assert_eq!(wrap_complete_words("extraordinary", 6, 5), ["", "…"]);
+        assert_eq!(
+            wrap_complete_words("extraordinary next", 6, 5),
+            ["", "…", "next"]
+        );
+        assert_eq!(
+            wrap_complete_words("ok extraordinary next", 6, 5),
+            ["ok", "…", "next"]
+        );
+    }
+
+    #[test]
+    fn detail_scrolling_reaches_multiline_description_and_clamps_after_resize() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(45, 12)).unwrap();
+        let mut item = task("A complete title that wraps across several lines", &[]);
+        item.description = (0..40)
+            .map(|index| format!("Description line {index}\n"))
+            .collect::<String>()
+            + "Final description line";
+        let mut scroll = usize::MAX;
+        terminal
+            .draw(|frame| draw_details(frame, &item, &KeyBindings::defaults(), &mut scroll))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Final description line"));
+        assert!(scroll > 0 && scroll < 100);
+        item.description = "Short description".into();
+        terminal.backend_mut().resize(120, 40);
+        terminal.autoresize().unwrap();
+        terminal
+            .draw(|frame| draw_details(frame, &item, &KeyBindings::defaults(), &mut scroll))
+            .unwrap();
+        assert_eq!(scroll, 0);
+    }
+
+    #[test]
+    fn scrolling_dialog_bounds_use_wrapped_rows_and_configured_hints() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.toml");
+        std::fs::write(
+            &path,
+            "[keybindings]\ndown = ['ctrl+n']\nup = ['ctrl+p']\nclose_dialog = ['esc']\n",
+        )
+        .unwrap();
+        let keys = KeyBindings::load(&path, true).unwrap();
+        let title = scrolling_title("Error details", &keys);
+        assert!(
+            title.contains(keys.display(Action::Down)) && title.contains(keys.display(Action::Up))
+        );
+        assert!(!title.contains("j/k") && !title.contains("Enter/Esc/q"));
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        let mut scroll = usize::MAX;
+        let message = "wrapped error ".repeat(40) + "FINAL";
+        terminal
+            .draw(|frame| {
+                draw_scrolling_dialog(
+                    frame,
+                    Text::from(message.as_str()),
+                    title.clone(),
+                    frame.area(),
+                    &mut scroll,
+                )
+            })
+            .unwrap();
+        let bounded = scroll;
+        assert!(bounded > 0);
+        scroll += 10;
+        terminal
+            .draw(|frame| {
+                draw_scrolling_dialog(
+                    frame,
+                    Text::from(message.as_str()),
+                    title.clone(),
+                    frame.area(),
+                    &mut scroll,
+                )
+            })
+            .unwrap();
+        assert_eq!(scroll, bounded);
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains("FINAL")
+        );
+    }
+
+    #[test]
+    fn words_move_whole_to_wider_continuations_including_unicode_and_zero_title_space() {
+        assert_eq!(
+            wrap_complete_words("longword next", 3, 10),
+            ["", "longword", "next"]
+        );
+        assert_eq!(wrap_complete_words("世界 next", 0, 5), ["", "世界", "next"]);
+        assert_eq!(wrap_complete_words("anything afterwards", 0, 0), [""]);
+        assert_eq!(wrap_complete_words("a oversized z", 1, 1), ["a", "…", "z"]);
     }
 
     #[test]

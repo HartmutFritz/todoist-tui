@@ -38,6 +38,7 @@ pub enum Action {
     EditDue,
     RemoveDue,
     ShowError,
+    ShowOutbox,
     AddTaskTop,
     AddTaskBottom,
     Quit,
@@ -69,7 +70,7 @@ pub enum Action {
 }
 
 impl Action {
-    const ALL: [Self; 53] = [
+    const ALL: [Self; 54] = [
         Self::Down,
         Self::Up,
         Self::DownFive,
@@ -96,6 +97,7 @@ impl Action {
         Self::EditDue,
         Self::RemoveDue,
         Self::ShowError,
+        Self::ShowOutbox,
         Self::AddTaskTop,
         Self::AddTaskBottom,
         Self::Quit,
@@ -189,6 +191,7 @@ struct BindingConfig {
     edit_due: Vec<String>,
     remove_due: Vec<String>,
     show_error: Vec<String>,
+    show_outbox: Vec<String>,
     add_task_top: Vec<String>,
     add_task_bottom: Vec<String>,
     // Compatibility with the former single add action. When present, these
@@ -255,6 +258,7 @@ impl Default for BindingConfig {
             edit_due: strings(&["t"]),
             remove_due: strings(&["shift+t"]),
             show_error: strings(&["shift+e"]),
+            show_outbox: strings(&["shift+s"]),
             add_task_top: strings(&["a"]),
             add_task_bottom: strings(&["q"]),
             add_task: None,
@@ -434,6 +438,7 @@ impl KeyBindings {
             (Action::EditDue, config.edit_due),
             (Action::RemoveDue, config.remove_due),
             (Action::ShowError, config.show_error),
+            (Action::ShowOutbox, config.show_outbox),
             (Action::AddTaskTop, add_task_top),
             (Action::AddTaskBottom, add_task_bottom),
             (Action::Quit, config.quit),
@@ -517,6 +522,9 @@ impl KeyBindings {
                 bail!("special-add binding '{display}' must name a project");
             }
             if bindings.main.contains_key(&stroke)
+                || bindings.parsed[&Action::RenameProject]
+                    .iter()
+                    .any(|sequence| sequence.as_slice() == [stroke.clone()])
                 || bindings
                     .special_add
                     .iter()
@@ -635,6 +643,7 @@ impl Action {
             Self::EditDue => "edit_due",
             Self::RemoveDue => "remove_due",
             Self::ShowError => "show_error",
+            Self::ShowOutbox => "show_outbox",
             Self::AddTaskTop => "add_task_top",
             Self::AddTaskBottom => "add_task_bottom",
             Self::Quit => "quit",
@@ -701,21 +710,35 @@ impl Action {
 
 impl KeyStroke {
     fn from_event(event: KeyEvent) -> Self {
-        let mut modifiers = event.modifiers
+        Self::normalized(event.code, event.modifiers)
+    }
+
+    fn normalized(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        let mut modifiers = modifiers
             & (KeyModifiers::SHIFT
                 | KeyModifiers::CONTROL
                 | KeyModifiers::ALT
                 | KeyModifiers::SUPER);
-        let code = match event.code {
-            KeyCode::Char(c) if c.is_ascii_uppercase() => {
+        let code = match code {
+            KeyCode::Char(c) if c.is_uppercase() => {
                 modifiers.insert(KeyModifiers::SHIFT);
-                KeyCode::Char(c.to_ascii_lowercase())
+                let mut lowercase = c.to_lowercase();
+                let first = lowercase.next().unwrap_or(c);
+                KeyCode::Char(if lowercase.next().is_none() { first } else { c })
             }
             KeyCode::Char(c) => {
-                if !c.is_alphabetic() {
+                if !c.is_alphabetic() && c != ' ' {
                     modifiers.remove(KeyModifiers::SHIFT);
                 }
                 KeyCode::Char(c)
+            }
+            KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
+                modifiers.remove(KeyModifiers::SHIFT);
+                KeyCode::BackTab
+            }
+            KeyCode::BackTab => {
+                modifiers.remove(KeyModifiers::SHIFT);
+                KeyCode::BackTab
             }
             code => code,
         };
@@ -735,10 +758,20 @@ fn parse_sequence(value: &str) -> Result<Sequence> {
 }
 
 fn parse_stroke(value: &str) -> Result<KeyStroke> {
-    let parts = value.split('+').collect::<Vec<_>>();
-    let key = parts.last().copied().unwrap_or_default().trim();
+    let (prefix, key) = if value == "+" {
+        ("", "+")
+    } else if let Some(prefix) = value.strip_suffix("++").filter(|prefix| !prefix.is_empty()) {
+        (prefix, "+")
+    } else {
+        value.rsplit_once('+').unwrap_or(("", value))
+    };
+    let key = key.trim();
+    anyhow::ensure!(
+        !prefix.is_empty() || !value.contains('+') || value == "+",
+        "missing key modifier in '{value}'"
+    );
     let mut modifiers = KeyModifiers::NONE;
-    for modifier in &parts[..parts.len().saturating_sub(1)] {
+    for modifier in prefix.split('+').filter(|_| !prefix.is_empty()) {
         match modifier.trim().to_ascii_lowercase().as_str() {
             "shift" => modifiers.insert(KeyModifiers::SHIFT),
             "ctrl" | "control" => modifiers.insert(KeyModifiers::CONTROL),
@@ -766,24 +799,22 @@ fn parse_stroke(value: &str) -> Result<KeyStroke> {
         "backtab" => KeyCode::BackTab,
         "space" => KeyCode::Char(' '),
         _ if lower.starts_with('f') && lower[1..].parse::<u8>().is_ok() => {
-            KeyCode::F(lower[1..].parse()?)
+            let number = lower[1..].parse()?;
+            anyhow::ensure!(number != 0, "function keys must be F1 through F255");
+            KeyCode::F(number)
         }
         _ => {
             let mut chars = key.chars();
-            let Some(mut character) = chars.next() else {
+            let Some(character) = chars.next() else {
                 bail!("missing key in '{value}'");
             };
             if chars.next().is_some() {
                 bail!("unknown key '{key}' in '{value}'");
             }
-            if character.is_ascii_uppercase() {
-                modifiers.insert(KeyModifiers::SHIFT);
-                character.make_ascii_lowercase();
-            }
             KeyCode::Char(character)
         }
     };
-    Ok(KeyStroke { code, modifiers })
+    Ok(KeyStroke::normalized(code, modifiers))
 }
 
 fn strings(values: &[&str]) -> Vec<String> {
@@ -809,6 +840,82 @@ mod tests {
             Action::Down,
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
         ));
+    }
+
+    #[test]
+    fn configuration_and_input_share_symbol_unicode_and_backtab_normalization() {
+        for (binding, event) in [
+            (
+                "shift+?",
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            ),
+            (
+                "shift+@",
+                KeyEvent::new(KeyCode::Char('@'), KeyModifiers::SHIFT),
+            ),
+            ("Ä", KeyEvent::new(KeyCode::Char('Ä'), KeyModifiers::SHIFT)),
+            ("Ä", KeyEvent::new(KeyCode::Char('ä'), KeyModifiers::SHIFT)),
+            (
+                "ctrl++",
+                KeyEvent::new(
+                    KeyCode::Char('+'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+            ),
+            ("+", KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE)),
+            (
+                "backtab",
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            ),
+            (
+                "shift+tab",
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            ),
+            (
+                "shift+space",
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT),
+            ),
+        ] {
+            assert_eq!(
+                parse_stroke(binding).unwrap(),
+                KeyStroke::from_event(event),
+                "{binding}"
+            );
+        }
+        assert_ne!(
+            parse_stroke("Ä").unwrap(),
+            KeyStroke::from_event(KeyEvent::new(KeyCode::Char('ä'), KeyModifiers::NONE))
+        );
+        assert!(parse_stroke("ctrl+").is_err());
+        assert!(parse_stroke("+a").is_err());
+        assert!(parse_stroke("f0").is_err());
+        assert!(parse_stroke("f255").is_ok());
+    }
+
+    #[test]
+    fn equivalent_symbol_bindings_are_detected_as_conflicts() {
+        let config: FileConfig =
+            toml::from_str("[keybindings]\nhelp = ['shift+?']\nquit = ['?']\n").unwrap();
+        assert!(KeyBindings::from_file_config(config).is_err());
+    }
+
+    #[test]
+    fn special_add_rejects_rename_only_bindings_and_allows_explicit_unbinding() {
+        for source in [
+            "[special_add]\nR = '#week'\n",
+            "[keybindings]\nrename_project = ['alt+n']\n[special_add]\n'alt+n' = '#week'\n",
+        ] {
+            let config: FileConfig = toml::from_str(source).unwrap();
+            assert!(KeyBindings::from_file_config(config).is_err());
+        }
+        let config: FileConfig =
+            toml::from_str("[keybindings]\nrename_project = []\n[special_add]\nR = '#week'\n")
+                .unwrap();
+        let keys = KeyBindings::from_file_config(config).unwrap();
+        assert_eq!(
+            keys.special_add_project(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            Some("week")
+        );
     }
 
     #[test]

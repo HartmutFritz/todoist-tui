@@ -25,16 +25,24 @@
 *.sqlite3-journal
 
 # AI and coding-agent instructions or workspace data
-/AGENTS.md
+AGENTS.md
+agents.md
 /TODO.md
-/.agents/
-/.codex/
-/CLAUDE.md
-/.claude/
-/.cursor/
-/.aider*
+.agents/
+.codex/
+CLAUDE.md
+.claude/
+.cursor/
+.aider*
+.opencode/
+opencode.json
+opencode.jsonc
+/.github/agents/
+/.github/prompts/
+/.github/copilot-instructions.md
 
 # Runtime logs and diagnostics
+nvim.log
 *.log
 *.profraw
 *.profdata

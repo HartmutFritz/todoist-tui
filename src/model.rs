@@ -17,6 +17,7 @@ pub struct Project {
     pub can_assign_tasks: bool,
     pub space_override: Option<u8>,
     pub is_hidden: bool,
+    pub folder_id: Option<String>,
 }
 
 impl Project {
@@ -51,6 +52,16 @@ pub struct Due {
     pub datetime: Option<String>,
     pub timezone: Option<String>,
     pub is_recurring: bool,
+    /// Local-only calendar phase, retained in snapshots but never sent to Todoist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_anchor: Option<RecurrenceAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecurrenceAnchor {
+    pub expression: String,
+    pub origin: NaiveDate,
+    pub expected: NaiveDate,
 }
 
 impl Due {
@@ -113,66 +124,36 @@ impl Due {
     }
 
     pub(crate) fn next_occurrence(&self) -> Self {
-        let mut next = self.clone();
-        let Some(date) = self.concrete_date() else {
-            return next;
-        };
-        // Timed rules require Todoist's recurrence timezone/DST policy. Keep
-        // the task active with its cached due value until the background reply
-        // confirms that schedule, rather than guessing by adding 24 UTC hours.
-        if self.display().is_some_and(|value| value.len() > 10) {
-            return next;
-        }
-        let expression = self.string.as_deref().unwrap_or_default().to_lowercase();
-        let from = date.max(Local::now().date_naive());
-        let date = if matches!(expression.as_str(), "every day" | "daily") {
-            from.succ_opt()
-        } else if matches!(expression.as_str(), "every week" | "weekly") {
-            let weeks = (from.signed_duration_since(date).num_days() / 7 + 1).max(1);
-            date.checked_add_signed(chrono::Duration::weeks(weeks))
-        } else if matches!(expression.as_str(), "every month" | "monthly") {
-            next_calendar_occurrence(date, from, 1)
-        } else if matches!(expression.as_str(), "every year" | "yearly") {
-            next_calendar_occurrence(date, from, 12)
-        } else {
-            let weekdays = [
-                "monday",
-                "tuesday",
-                "wednesday",
-                "thursday",
-                "friday",
-                "saturday",
-                "sunday",
-            ];
-            (1..=7)
-                .filter_map(|days| from.checked_add_signed(chrono::Duration::days(days)))
-                .find(|candidate| {
-                    expression.strip_prefix("every ").is_some_and(|value| {
-                        value == weekdays[candidate.weekday().num_days_from_monday() as usize]
-                            || (value == "weekday"
-                                && candidate.weekday().num_days_from_monday() < 5)
-                    })
-                })
-        };
-        if let Some(date) = date {
-            next.date = Some(date.format("%F").to_string());
-        }
-        next
+        crate::recurrence::next(self, Local::now().fixed_offset())
     }
-}
 
-fn next_calendar_occurrence(
-    anchor: NaiveDate,
-    after: NaiveDate,
-    interval: u32,
-) -> Option<NaiveDate> {
-    let mut months = interval;
-    loop {
-        let next = anchor.checked_add_months(chrono::Months::new(months))?;
-        if next > after {
-            return Some(next);
-        }
-        months = months.checked_add(interval)?;
+    #[cfg(test)]
+    fn next_occurrence_on(&self, today: NaiveDate) -> Self {
+        use chrono::TimeZone;
+        let now = chrono::Utc
+            .from_utc_datetime(&today.and_hms_opt(12, 0, 0).unwrap())
+            .fixed_offset();
+        crate::recurrence::next(self, now)
+    }
+
+    pub(crate) fn preserve_preview_anchor(&mut self, previous: Option<&Due>) {
+        self.preview_anchor = previous
+            .filter(|old| {
+                old.is_recurring
+                    && self.is_recurring
+                    && old.string == self.string
+                    && old.timezone == self.timezone
+            })
+            .and_then(|old| old.preview_anchor.as_ref())
+            .filter(|anchor| {
+                self.datetime.is_none()
+                    && self
+                        .date
+                        .as_deref()
+                        .and_then(|date| NaiveDate::parse_from_str(date, "%F").ok())
+                        == Some(anchor.expected)
+            })
+            .cloned();
     }
 }
 
@@ -189,6 +170,8 @@ pub struct Task {
     pub child_order: i64,
     pub checked: bool,
     pub assignee: Option<String>,
+    #[serde(default)]
+    pub section_id: Option<String>,
 }
 
 impl Task {
@@ -233,6 +216,8 @@ pub enum Operation {
         parent_id: Option<String>,
         #[serde(default)]
         target_order: Option<i64>,
+        #[serde(default)]
+        placement: Option<crate::ordering::Placement>,
     },
     UpdateTask {
         content: String,
@@ -273,6 +258,8 @@ pub enum Operation {
         parent_id: Option<String>,
         #[serde(default)]
         project_id: String,
+        #[serde(default)]
+        section_id: Option<String>,
     },
     CompleteTask,
     UncompleteTask,
@@ -299,6 +286,9 @@ pub enum Operation {
     },
     ReorderTasks {
         tasks: Vec<TaskOrder>,
+    },
+    OrderResources {
+        plans: Vec<crate::ordering::OrderPlan>,
     },
 }
 
@@ -478,7 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn recurrence_previews_preserve_calendar_anchors_and_leave_timed_rules_to_todoist() {
+    fn recurrence_previews_follow_documented_dynamic_weekly_rules_and_leave_timed_rules_to_todoist()
+    {
         let today = Local::now().date_naive();
         let anchor = today - chrono::Duration::days(10);
         let weekly = Due {
@@ -489,7 +480,7 @@ mod tests {
         };
         let next = weekly.next_occurrence().concrete_date().unwrap();
         assert!(next > today);
-        assert_eq!(next.weekday(), anchor.weekday());
+        assert_eq!(next, today + chrono::Duration::days(7));
         let timed = Due {
             date: Some("2026-10-24T08:00:00Z".into()),
             string: Some("every day".into()),
@@ -498,6 +489,70 @@ mod tests {
             ..Due::default()
         };
         assert_eq!(timed.next_occurrence(), timed);
+    }
+
+    #[test]
+    fn recurring_day_and_week_intervals_skip_elapsed_occurrences_without_losing_the_anchor() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        for (expression, anchor, expected) in [
+            ("every 3 days", "2026-10-10", "2026-10-22"),
+            ("every other day", "2026-10-10", "2026-10-20"),
+            ("every 2 weeks", "2026-10-01", "2026-10-29"),
+            ("ev other week", "2026-10-01", "2026-10-29"),
+            ("every 1 day", "2026-10-25", "2026-10-20"),
+            ("weekly", "2026-10-25", "2026-10-26"),
+            ("every 1 week", "2026-10-01", "2026-10-26"),
+        ] {
+            let due = Due {
+                date: Some(anchor.into()),
+                string: Some(expression.into()),
+                is_recurring: true,
+                ..Due::default()
+            };
+            let next = due.next_occurrence_on(today);
+            assert_eq!(next.date.as_deref(), Some(expected), "{expression}");
+            assert_eq!(next.string, due.string);
+            assert!(next.is_recurring && next.datetime.is_none());
+        }
+    }
+
+    #[test]
+    fn recurring_weekday_lists_support_aliases_and_preserve_unsupported_schedules() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 23).unwrap(); // Friday
+        for (expression, expected) in [
+            ("every mon, fri", "2026-10-26"),
+            (" EVERY   MONDAY, friday ", "2026-10-26"),
+            ("every tues, wed, and fri", "2026-10-27"),
+            ("every workday", "2026-10-26"),
+            ("ev sat, sun", "2026-10-24"),
+        ] {
+            let due = Due {
+                date: Some("2026-10-16".into()),
+                string: Some(expression.into()),
+                is_recurring: true,
+                ..Due::default()
+            };
+            assert_eq!(
+                due.next_occurrence_on(today).date.as_deref(),
+                Some(expected),
+                "{expression}"
+            );
+        }
+        for expression in [
+            "every 0 days",
+            "every 999999999999999999 days",
+            "every 3 days until Dec 1",
+            "every mon, nonsense",
+            "every fri at 9",
+        ] {
+            let due = Due {
+                date: Some("2026-10-16".into()),
+                string: Some(expression.into()),
+                is_recurring: true,
+                ..Due::default()
+            };
+            assert_eq!(due.next_occurrence_on(today), due, "{expression}");
+        }
     }
 
     #[test]
@@ -514,6 +569,7 @@ mod tests {
             child_order: 0,
             checked: false,
             assignee: None,
+            section_id: None,
         };
         assert_eq!(task.display_group(), Some("alpha"));
     }

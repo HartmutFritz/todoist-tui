@@ -8,6 +8,16 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Rust 1.88 compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check all targets with locked dependencies
+        run: cargo check --locked --all-targets --all-features
+
   test:
     runs-on: ubuntu-latest
     steps:
