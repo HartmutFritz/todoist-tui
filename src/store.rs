@@ -22,6 +22,22 @@ mod order_storage;
 use crate::ordering::{OrderScope, Placement};
 pub use diagnostics::{OUTBOX_PAGE_SIZE, OutboxPage};
 
+// Shared by claiming and auxiliary yield checks. Rejected operations and their
+// blocked dependants must not prevent unrelated cached views from refreshing.
+const READY_OUTBOX: &str = "o.error IS NULL AND NOT EXISTS (
+    SELECT 1 FROM outbox blocked WHERE blocked.error IS NOT NULL
+    AND (blocked.entity_id=o.entity_id OR instr(o.payload,json_quote(blocked.entity_id))>0))
+    AND NOT EXISTS (
+    SELECT 1 FROM outbox creation WHERE creation.entity_id=o.entity_id
+    AND o.entity_id LIKE 'local:%' AND creation.seq<>o.seq
+    AND json_extract(creation.payload,'$.kind') IN ('quick_add','add_project','add_filter')
+    AND json_extract(o.payload,'$.kind') NOT IN ('quick_add','add_project','add_filter'))
+    AND NOT EXISTS (
+    SELECT 1 FROM json_tree(o.payload) reference JOIN outbox creation ON creation.entity_id=reference.value
+    WHERE reference.key IN ('id','parent_id','project_id') AND reference.type='text'
+    AND reference.value LIKE 'local:%' AND creation.seq<>o.seq
+    AND json_extract(creation.payload,'$.kind') IN ('quick_add','add_project','add_filter'))";
+
 #[derive(Debug, Clone)]
 pub struct Store {
     path: PathBuf,
@@ -30,16 +46,12 @@ pub struct Store {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskViewPreferences {
     pub group_by_label: bool,
-    pub sort_alphabetically: bool,
-    pub show_completed: bool,
 }
 
 impl Default for TaskViewPreferences {
     fn default() -> Self {
         Self {
             group_by_label: true,
-            sort_alphabetically: false,
-            show_completed: false,
         }
     }
 }
@@ -129,10 +141,16 @@ impl Store {
              CREATE TABLE IF NOT EXISTS project_id_aliases (
                old_id TEXT PRIMARY KEY, new_id TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS hidden_navigation (
+              CREATE TABLE IF NOT EXISTS hidden_navigation (
                kind TEXT NOT NULL, id TEXT NOT NULL,
-               PRIMARY KEY(kind, id)
-             );
+                PRIMARY KEY(kind, id)
+              );
+              CREATE TABLE IF NOT EXISTS view_preferences (
+                kind TEXT NOT NULL, id TEXT NOT NULL,
+                show_completed INTEGER NOT NULL CHECK(show_completed IN (0,1)),
+                sort_alphabetically INTEGER NOT NULL DEFAULT 0 CHECK(sort_alphabetically IN (0,1)),
+                PRIMARY KEY(kind,id)
+              );
              CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              COMMIT;",
         )?;
@@ -219,6 +237,12 @@ impl Store {
         ensure_column(&conn, "outbox", "error", "TEXT")?;
         ensure_column(
             &conn,
+            "view_preferences",
+            "sort_alphabetically",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(sort_alphabetically IN (0,1))",
+        )?;
+        ensure_column(
+            &conn,
             "task_id_aliases",
             "rewrite_pending",
             "INTEGER NOT NULL DEFAULT 1",
@@ -239,9 +263,24 @@ impl Store {
              CREATE INDEX IF NOT EXISTS filter_tasks_filter ON filter_tasks(filter_id);
              CREATE INDEX IF NOT EXISTS outbox_entity ON outbox(entity_id);
              INSERT OR IGNORE INTO projects(id, name, is_inbox) VALUES('inbox', 'Inbox', 1);
-               PRAGMA user_version=10;
-             COMMIT;",
+              COMMIT;",
         )?;
+        let tx = conn.unchecked_transaction()?;
+        if previous_schema_version < 11 {
+            // A global flag does not identify which project the user enabled.
+            // Start unconfigured views hidden rather than spreading it to all.
+            tx.execute("DELETE FROM meta WHERE key='task_view_show_completed'", [])?;
+        }
+        if previous_schema_version < 12 {
+            // Likewise, the old global alphabetical flag cannot identify which
+            // projects were sorted. Default every view to Todoist order.
+            tx.execute(
+                "DELETE FROM meta WHERE key='task_view_sort_alphabetically'",
+                [],
+            )?;
+        }
+        tx.pragma_update(None, "user_version", 12)?;
+        tx.commit()?;
         if previous_schema_version < 8 {
             // Older releases did not request collaborator resources or retain
             // assignment IDs. An existing incremental token cannot backfill
@@ -2055,22 +2094,7 @@ impl Store {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let entry = tx.query_row(
-            "SELECT seq,uuid,entity_id,payload,checkpoint FROM outbox o
-             WHERE error IS NULL AND NOT EXISTS (
-               SELECT 1 FROM outbox blocked WHERE blocked.error IS NOT NULL
-               AND (blocked.entity_id=o.entity_id OR
-                    instr(o.payload,json_quote(blocked.entity_id))>0))
-             AND NOT EXISTS (
-               SELECT 1 FROM outbox creation WHERE creation.entity_id=o.entity_id
-               AND o.entity_id LIKE 'local:%' AND creation.seq<>o.seq
-               AND json_extract(creation.payload,'$.kind') IN ('quick_add','add_project','add_filter')
-               AND json_extract(o.payload,'$.kind') NOT IN ('quick_add','add_project','add_filter'))
-             AND NOT EXISTS (
-               SELECT 1 FROM json_tree(o.payload) reference JOIN outbox creation ON creation.entity_id=reference.value
-               WHERE reference.key IN ('id','parent_id','project_id') AND reference.type='text'
-               AND reference.value LIKE 'local:%' AND creation.seq<>o.seq
-               AND json_extract(creation.payload,'$.kind') IN ('quick_add','add_project','add_filter'))
-             ORDER BY seq LIMIT 1", [], row_to_outbox,
+            &format!("SELECT seq,uuid,entity_id,payload,checkpoint FROM outbox o WHERE {READY_OUTBOX} ORDER BY seq LIMIT 1"), [], row_to_outbox,
         ).optional()?;
         if let Some(entry) = &entry {
             tx.execute("UPDATE outbox SET checkpoint=json_set(CASE WHEN checkpoint='null' THEN '{}' ELSE checkpoint END,'$.key_migration',json('true')) WHERE seq=?1 AND claimed=0",[entry.seq])?;
@@ -2088,6 +2112,14 @@ impl Store {
             .transpose()?;
         tx.commit()?;
         Ok(entry)
+    }
+
+    pub fn has_uploadable_changes(&self) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM outbox o WHERE {READY_OUTBOX})"),
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn save_checkpoint(&self, seq: i64, checkpoint: &serde_json::Value) -> Result<()> {
@@ -2309,6 +2341,7 @@ impl Store {
             "UPDATE hidden_navigation SET id=?2 WHERE kind='filter' AND id=?1",
             params![old_id, new_id],
         )?;
+        remap_view_preference(&tx, "filter", old_id, new_id)?;
         tx.execute(
             "UPDATE outbox SET entity_id=?2 WHERE entity_id=?1",
             params![old_id, new_id],
@@ -2430,32 +2463,93 @@ impl Store {
             group_by_label: meta_from(&conn, "task_view_group_by_label")?
                 .and_then(|value| parse_bool(&value))
                 .unwrap_or(defaults.group_by_label),
-            sort_alphabetically: meta_from(&conn, "task_view_sort_alphabetically")?
-                .and_then(|value| parse_bool(&value))
-                .unwrap_or(defaults.sort_alphabetically),
-            show_completed: meta_from(&conn, "task_view_show_completed")?
-                .and_then(|value| parse_bool(&value))
-                .unwrap_or(defaults.show_completed),
         })
     }
 
     pub fn set_task_view_preferences(&self, preferences: TaskViewPreferences) -> Result<()> {
         let mut conn = self.connect()?;
         let transaction = conn.transaction()?;
-        for (key, value) in [
-            ("task_view_group_by_label", preferences.group_by_label),
-            (
-                "task_view_sort_alphabetically",
-                preferences.sort_alphabetically,
-            ),
-            ("task_view_show_completed", preferences.show_completed),
-        ] {
-            transaction.execute(
-                "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![key, if value { "true" } else { "false" }],
-            )?;
-        }
+        transaction.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![
+                "task_view_group_by_label",
+                if preferences.group_by_label {
+                    "true"
+                } else {
+                    "false"
+                }
+            ],
+        )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn completed_task_visibility(&self) -> Result<HashMap<NavId, bool>> {
+        let conn = self.connect()?;
+        let rows = conn
+            .prepare("SELECT kind,id,show_completed FROM view_preferences")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(kind, id, show)| Ok((view_preference_nav(&kind, &id)?, show)))
+            .collect()
+    }
+
+    pub fn alphabetical_sort_preferences(&self) -> Result<HashMap<NavId, bool>> {
+        let conn = self.connect()?;
+        let rows = conn
+            .prepare("SELECT kind,id,sort_alphabetically FROM view_preferences")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(kind, id, sorted)| Ok((view_preference_nav(&kind, &id)?, sorted)))
+            .collect()
+    }
+
+    pub fn set_completed_task_visibility(&self, nav: &NavId, show_completed: bool) -> Result<()> {
+        self.set_view_preference(nav, "show_completed", show_completed)
+    }
+
+    pub fn set_alphabetical_sort(&self, nav: &NavId, sorted: bool) -> Result<()> {
+        self.set_view_preference(nav, "sort_alphabetically", sorted)
+    }
+
+    fn set_view_preference(&self, nav: &NavId, column: &str, value: bool) -> Result<()> {
+        let conn = self.connect()?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let nav = match nav {
+            NavId::Project(id) => {
+                NavId::Project(resolve_project_id_from(&tx, id)?.unwrap_or_else(|| id.clone()))
+            }
+            NavId::Filter(id) => {
+                NavId::Filter(resolve_filter_id_from(&tx, id)?.unwrap_or_else(|| id.clone()))
+            }
+            nav => nav.clone(),
+        };
+        let (kind, id) = view_preference_key(&nav);
+        let sql = match column {
+            "show_completed" => {
+                "INSERT INTO view_preferences(kind,id,show_completed,sort_alphabetically) VALUES(?1,?2,?3,0) ON CONFLICT(kind,id) DO UPDATE SET show_completed=excluded.show_completed"
+            }
+            "sort_alphabetically" => {
+                "INSERT INTO view_preferences(kind,id,show_completed,sort_alphabetically) VALUES(?1,?2,0,?3) ON CONFLICT(kind,id) DO UPDATE SET sort_alphabetically=excluded.sort_alphabetically"
+            }
+            _ => unreachable!("unsupported view preference column"),
+        };
+        tx.execute(sql, params![kind, id, value])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2702,28 +2796,64 @@ impl Store {
         Ok(())
     }
 
+    pub fn filter_active_task_count(&self, filter_id: &str) -> Result<usize> {
+        let count:i64=self.connect()?.query_row("SELECT COUNT(*) FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id WHERE ft.filter_id=?1 AND t.checked=0 AND t.deleted=0",[filter_id],|row|row.get(0))?;
+        Ok(count as usize)
+    }
+
+    #[cfg(test)]
     pub fn replace_filter_membership(&self, filter_id: &str, tasks: &[RemoteTask]) -> Result<()> {
+        self.replace_filter_membership_checked(filter_id, None, tasks)
+            .map(|_| ())
+    }
+
+    pub fn replace_filter_membership_for_query(
+        &self,
+        filter_id: &str,
+        query: &str,
+        tasks: &[RemoteTask],
+    ) -> Result<bool> {
+        self.replace_filter_membership_checked(filter_id, Some(query), tasks)
+    }
+
+    fn replace_filter_membership_checked(
+        &self,
+        filter_id: &str,
+        expected_query: Option<&str>,
+        tasks: &[RemoteTask],
+    ) -> Result<bool> {
         let conn = self.connect()?;
         let tx = conn.unchecked_transaction()?;
+        if let Some(query) = expected_query
+            && !filter_from(&tx, filter_id)?
+                .is_some_and(|filter| filter.is_favorite && filter.query == query)
+        {
+            return Ok(false);
+        }
         let collaborator_names = collaborator_names(&tx)?;
         let (pending_tasks, _, _) = pending_entity_ids(&tx)?;
         let protected_order = order_storage::protected_ordinals(&tx)?;
         // Refresh active matches while retaining cached membership for tasks
         // completed from this filter, so they remain available in its history.
+        // A write can arrive after the worker's yield check: keep memberships
+        // of pending tasks/descendants unchanged until that write is uploaded.
         tx.execute(
             "DELETE FROM filter_tasks
-             WHERE filter_id=?1 AND task_id NOT IN (SELECT id FROM tasks WHERE checked=1)",
-            [filter_id],
+             WHERE filter_id=?1 AND task_id NOT IN (SELECT id FROM tasks WHERE checked=1)
+               AND task_id NOT IN (SELECT value FROM json_each(?2))",
+            params![filter_id, serde_json::to_string(&pending_tasks)?],
         )?;
         for task in tasks {
-            if !pending_tasks.contains(&task.id) {
-                let assignee_name = task
-                    .responsible_uid
-                    .as_ref()
-                    .and_then(|id| collaborator_names.get(id))
-                    .cloned();
-                let due = reconciled_due(&tx, &task.id, task.due.as_ref())?;
-                tx.execute(
+            if pending_tasks.contains(&task.id) {
+                continue;
+            }
+            let assignee_name = task
+                .responsible_uid
+                .as_ref()
+                .and_then(|id| collaborator_names.get(id))
+                .cloned();
+            let due = reconciled_due(&tx, &task.id, task.due.as_ref())?;
+            tx.execute(
                     "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id,responsible_uid,assignee_name)
                      VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                      ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,content=excluded.content,
@@ -2736,7 +2866,6 @@ impl Store {
                         task.checked || task.is_completed,task.is_deleted,task.parent_id,
                         task.responsible_uid,assignee_name,protected_order.contains(&task.id)],
                 )?;
-            }
             if !task.checked && !task.is_deleted {
                 tx.execute(
                     "INSERT OR IGNORE INTO filter_tasks(filter_id,task_id) VALUES(?1,?2)",
@@ -2747,7 +2876,7 @@ impl Store {
         order_storage::hydrate(&tx)?;
         order_storage::reconcile(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -3616,7 +3745,44 @@ fn remap_task_id(tx: &Transaction<'_>, old_id: &str, new_id: &str) -> Result<()>
     Ok(())
 }
 
+fn view_preference_key(nav: &NavId) -> (&str, &str) {
+    match nav {
+        NavId::Project(id) => ("project", id),
+        NavId::Filter(id) => ("filter", id),
+        NavId::Today => ("view", "today"),
+        NavId::Upcoming => ("view", "upcoming"),
+    }
+}
+
+fn view_preference_nav(kind: &str, id: &str) -> Result<NavId> {
+    Ok(match (kind, id) {
+        ("project", _) => NavId::Project(id.into()),
+        ("filter", _) => NavId::Filter(id.into()),
+        ("view", "today") => NavId::Today,
+        ("view", "upcoming") => NavId::Upcoming,
+        _ => bail!("Unrecognized saved task view preference: {kind}/{id}"),
+    })
+}
+
+fn remap_view_preference(
+    tx: &Transaction<'_>,
+    kind: &str,
+    old_id: &str,
+    new_id: &str,
+) -> Result<()> {
+    if old_id == new_id {
+        return Ok(());
+    }
+    tx.execute("INSERT INTO view_preferences(kind,id,show_completed,sort_alphabetically) SELECT kind,?3,show_completed,sort_alphabetically FROM view_preferences WHERE kind=?1 AND id=?2 ON CONFLICT(kind,id) DO NOTHING",params![kind,old_id,new_id])?;
+    tx.execute(
+        "DELETE FROM view_preferences WHERE kind=?1 AND id=?2",
+        params![kind, old_id],
+    )?;
+    Ok(())
+}
+
 fn rewrite_project_references(tx: &Transaction<'_>, old_id: &str, new_id: &str) -> Result<()> {
+    remap_view_preference(tx, "project", old_id, new_id)?;
     let entries = tx
         .prepare("SELECT seq,payload FROM outbox ORDER BY seq")?
         .query_map([], |row| {
@@ -3779,6 +3945,253 @@ mod tests {
             is_favorite: favorite,
             is_frozen: false,
             is_deleted: false,
+        }
+    }
+
+    #[test]
+    fn scoped_completed_visibility_migrates_without_spreading_the_old_global_flag() {
+        let store = store();
+        let mut history = remote_task("history", None);
+        history.checked = true;
+        store.merge_remote(&[], &[history], &[], &[]).unwrap();
+        let inbox = store.project("inbox").unwrap().unwrap();
+        store.add_task("Pending draft", &inbox).unwrap();
+        store
+            .set_task_view_preferences(TaskViewPreferences {
+                group_by_label: false,
+            })
+            .unwrap();
+        store.set_meta("task_view_show_completed", "true").unwrap();
+        store
+            .set_meta("task_view_sort_alphabetically", "true")
+            .unwrap();
+        store.set_sync_token("keep-token").unwrap();
+        let before = store
+            .outbox()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.uuid, serde_json::to_string(&entry.operation).unwrap()))
+            .collect::<Vec<_>>();
+        let conn = store.connect().unwrap();
+        conn.execute_batch("DROP TABLE view_preferences; PRAGMA user_version=10;")
+            .unwrap();
+        drop(conn);
+        let reopened = Store::open(store.path.clone()).unwrap();
+        assert!(reopened.completed_task_visibility().unwrap().is_empty());
+        assert!(reopened.alphabetical_sort_preferences().unwrap().is_empty());
+        assert!(reopened.meta("task_view_show_completed").unwrap().is_none());
+        assert!(
+            reopened
+                .meta("task_view_sort_alphabetically")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reopened.task_view_preferences().unwrap(),
+            TaskViewPreferences {
+                group_by_label: false
+            }
+        );
+        assert_eq!(reopened.sync_token().unwrap(), "keep-token");
+        assert!(
+            reopened
+                .tasks_for_view(&NavId::Project("inbox".into()), true)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == "history" && task.checked)
+        );
+        assert_eq!(
+            reopened
+                .outbox()
+                .unwrap()
+                .into_iter()
+                .map(|entry| (entry.uuid, serde_json::to_string(&entry.operation).unwrap()))
+                .collect::<Vec<_>>(),
+            before
+        );
+        let version: i64 = reopened
+            .connect()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+    }
+
+    #[test]
+    fn alphabetical_sort_is_namespaced_and_follows_project_and_filter_aliases() {
+        let store = store();
+        for (nav, value) in [
+            (NavId::Project("today".into()), true),
+            (NavId::Filter("today".into()), false),
+            (NavId::Today, true),
+            (NavId::Upcoming, false),
+        ] {
+            store.set_alphabetical_sort(&nav, value).unwrap();
+        }
+        let choices = store.alphabetical_sort_preferences().unwrap();
+        assert_eq!(choices.len(), 4);
+        assert_eq!(choices.get(&NavId::Project("today".into())), Some(&true));
+        assert_eq!(choices.get(&NavId::Filter("today".into())), Some(&false));
+        assert_eq!(choices.get(&NavId::Today), Some(&true));
+        assert_eq!(choices.get(&NavId::Upcoming), Some(&false));
+        let project = store.add_project("Work").unwrap();
+        let filter = store.add_filter("Work", "all", true).unwrap();
+        let queued = store.outbox_len().unwrap();
+        store
+            .set_alphabetical_sort(&NavId::Project(project.clone()), true)
+            .unwrap();
+        store
+            .set_alphabetical_sort(&NavId::Filter(filter.clone()), true)
+            .unwrap();
+        store
+            .replace_project_id(&project, "project-server")
+            .unwrap();
+        store.replace_filter_id(&filter, "filter-server").unwrap();
+        let choices = store.alphabetical_sort_preferences().unwrap();
+        assert_eq!(
+            choices.get(&NavId::Project("project-server".into())),
+            Some(&true)
+        );
+        assert_eq!(
+            choices.get(&NavId::Filter("filter-server".into())),
+            Some(&true)
+        );
+        assert!(!choices.contains_key(&NavId::Project(project.clone())));
+        assert!(!choices.contains_key(&NavId::Filter(filter.clone())));
+        store
+            .set_alphabetical_sort(&NavId::Project(project), false)
+            .unwrap();
+        store
+            .set_alphabetical_sort(&NavId::Filter(filter), false)
+            .unwrap();
+        let reopened = Store::open(store.path.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .alphabetical_sort_preferences()
+                .unwrap()
+                .get(&NavId::Project("project-server".into())),
+            Some(&false)
+        );
+        assert_eq!(
+            reopened
+                .alphabetical_sort_preferences()
+                .unwrap()
+                .get(&NavId::Filter("filter-server".into())),
+            Some(&false)
+        );
+        assert_eq!(reopened.outbox_len().unwrap(), queued);
+    }
+
+    #[test]
+    fn canonical_inbox_adopts_placeholder_sort_without_overwriting_an_explicit_choice() {
+        for canonical_choice in [None, Some(false)] {
+            let store = store();
+            store
+                .set_alphabetical_sort(&NavId::Project("inbox".into()), true)
+                .unwrap();
+            if let Some(choice) = canonical_choice {
+                store
+                    .set_alphabetical_sort(&NavId::Project("canonical".into()), choice)
+                    .unwrap();
+            }
+            let mut inbox = remote_project("canonical", "Inbox");
+            inbox.is_inbox_project = true;
+            store.merge_remote(&[inbox], &[], &[], &[]).unwrap();
+            let choices = store.alphabetical_sort_preferences().unwrap();
+            assert_eq!(
+                choices.get(&NavId::Project("canonical".into())),
+                Some(&canonical_choice.unwrap_or(true))
+            );
+            assert!(!choices.contains_key(&NavId::Project("inbox".into())));
+        }
+    }
+
+    #[test]
+    fn completed_visibility_is_namespaced_and_follows_project_and_filter_aliases() {
+        let store = store();
+        for (nav, value) in [
+            (NavId::Project("today".into()), true),
+            (NavId::Filter("today".into()), false),
+            (NavId::Today, false),
+            (NavId::Upcoming, true),
+        ] {
+            store.set_completed_task_visibility(&nav, value).unwrap();
+        }
+        let choices = store.completed_task_visibility().unwrap();
+        assert_eq!(choices.len(), 4);
+        assert_eq!(choices.get(&NavId::Project("today".into())), Some(&true));
+        assert_eq!(choices.get(&NavId::Filter("today".into())), Some(&false));
+        assert_eq!(choices.get(&NavId::Today), Some(&false));
+        assert_eq!(choices.get(&NavId::Upcoming), Some(&true));
+        let project = store.add_project("Work").unwrap();
+        let filter = store.add_filter("Work", "all", true).unwrap();
+        let queued = store.outbox_len().unwrap();
+        store
+            .set_completed_task_visibility(&NavId::Project(project.clone()), true)
+            .unwrap();
+        store
+            .set_completed_task_visibility(&NavId::Filter(filter.clone()), true)
+            .unwrap();
+        store
+            .replace_project_id(&project, "project-server")
+            .unwrap();
+        store.replace_filter_id(&filter, "filter-server").unwrap();
+        let choices = store.completed_task_visibility().unwrap();
+        assert_eq!(
+            choices.get(&NavId::Project("project-server".into())),
+            Some(&true)
+        );
+        assert_eq!(
+            choices.get(&NavId::Filter("filter-server".into())),
+            Some(&true)
+        );
+        assert!(!choices.contains_key(&NavId::Project(project.clone())));
+        assert!(!choices.contains_key(&NavId::Filter(filter.clone())));
+        store
+            .set_completed_task_visibility(&NavId::Project(project), false)
+            .unwrap();
+        store
+            .set_completed_task_visibility(&NavId::Filter(filter), false)
+            .unwrap();
+        let reopened = Store::open(store.path.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .completed_task_visibility()
+                .unwrap()
+                .get(&NavId::Project("project-server".into())),
+            Some(&false)
+        );
+        assert_eq!(
+            reopened
+                .completed_task_visibility()
+                .unwrap()
+                .get(&NavId::Filter("filter-server".into())),
+            Some(&false)
+        );
+        assert_eq!(reopened.outbox_len().unwrap(), queued);
+    }
+
+    #[test]
+    fn canonical_inbox_adopts_placeholder_visibility_without_overwriting_an_explicit_choice() {
+        for canonical_choice in [None, Some(false)] {
+            let store = store();
+            store
+                .set_completed_task_visibility(&NavId::Project("inbox".into()), true)
+                .unwrap();
+            if let Some(choice) = canonical_choice {
+                store
+                    .set_completed_task_visibility(&NavId::Project("canonical".into()), choice)
+                    .unwrap();
+            }
+            let mut inbox = remote_project("canonical", "Inbox");
+            inbox.is_inbox_project = true;
+            store.merge_remote(&[inbox], &[], &[], &[]).unwrap();
+            let choices = store.completed_task_visibility().unwrap();
+            assert_eq!(
+                choices.get(&NavId::Project("canonical".into())),
+                Some(&canonical_choice.unwrap_or(true))
+            );
+            assert!(!choices.contains_key(&NavId::Project("inbox".into())));
         }
     }
 
@@ -4899,6 +5312,88 @@ mod tests {
         let operations = store.outbox().unwrap();
         assert!(matches!(operations[1].operation, Operation::CompleteTask));
         assert!(matches!(operations[2].operation, Operation::UncompleteTask));
+    }
+
+    #[test]
+    fn filter_response_for_an_old_query_or_favorite_state_is_not_applied() {
+        let store = store();
+        let cached = remote_task("cached", None);
+        let fresh = remote_task("fresh", None);
+        store
+            .merge_remote(
+                &[],
+                std::slice::from_ref(&cached),
+                &[],
+                &[remote_filter("f", "Filter", "old", true)],
+            )
+            .unwrap();
+        store.replace_filter_membership("f", &[cached]).unwrap();
+        store.update_filter("f", "Filter", "new", true).unwrap();
+        assert!(
+            !store
+                .replace_filter_membership_for_query("f", "old", std::slice::from_ref(&fresh))
+                .unwrap()
+        );
+        assert!(store.task("fresh").unwrap().is_none());
+        assert_eq!(
+            store.tasks_for(&NavId::Filter("f".into())).unwrap()[0].id,
+            "cached"
+        );
+        assert!(
+            store
+                .replace_filter_membership_for_query("f", "new", std::slice::from_ref(&fresh))
+                .unwrap()
+        );
+        assert_eq!(
+            store.tasks_for(&NavId::Filter("f".into())).unwrap()[0].id,
+            "fresh"
+        );
+        store.update_filter("f", "Filter", "new", false).unwrap();
+        assert!(
+            !store
+                .replace_filter_membership_for_query("f", "new", &[fresh])
+                .unwrap()
+        );
+        assert!(
+            store
+                .tasks_for(&NavId::Filter("f".into()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn filter_refresh_preserves_pending_task_and_descendant_membership_during_a_race() {
+        let store = store();
+        let root = remote_task("root", None);
+        let child = remote_task("child", Some("root"));
+        let other = remote_task("other", None);
+        store
+            .merge_remote(
+                &[remote_project("destination", "Destination")],
+                &[root.clone(), child.clone(), other.clone()],
+                &[],
+                &[remote_filter("f", "Filter", "all", true)],
+            )
+            .unwrap();
+        store
+            .replace_filter_membership("f", &[root, child])
+            .unwrap();
+        store.move_task("root", "destination").unwrap();
+        store.update_labels("other", &["Local".into()]).unwrap();
+        // This stale reply would remove the moving tree and add an edited task
+        // that did not previously belong to this filter.
+        store.replace_filter_membership("f", &[other]).unwrap();
+        let members = store.tasks_for(&NavId::Filter("f".into())).unwrap();
+        assert_eq!(
+            members
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["root", "child"])
+        );
+        assert!(members.iter().all(|task| task.project_id == "destination"));
+        assert_eq!(store.task("other").unwrap().unwrap().labels, ["Local"]);
     }
 
     #[test]

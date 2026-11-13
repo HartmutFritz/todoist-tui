@@ -317,6 +317,8 @@ pub struct App {
     pub config_path: std::path::PathBuf,
     nav_search: Vec<NavSearchEntry>,
     remembered_tasks: HashMap<NavId, String>,
+    completed_task_visibility: HashMap<NavId, bool>,
+    alphabetical_sort: HashMap<NavId, bool>,
     rendered_nav: Option<NavId>,
     pending_render: Option<(NavId, Instant)>,
     pending_add_target: Option<Project>,
@@ -352,6 +354,8 @@ impl App {
         let nav_search = build_nav_search(&nav_rows, &keybindings);
         let has_token = sync.has_token();
         let task_view_preferences = store.task_view_preferences()?;
+        let completed_task_visibility = store.completed_task_visibility()?;
+        let alphabetical_sort = store.alphabetical_sort_preferences()?;
         let (status, sync_status, sync_issue) = if has_token {
             ("Ready".into(), SyncStatus::Pending, None)
         } else {
@@ -376,12 +380,14 @@ impl App {
             quit: false,
             show_hidden_projects: false,
             group_tasks_by_label: task_view_preferences.group_by_label,
-            sort_tasks_alphabetically: task_view_preferences.sort_alphabetically,
-            show_completed_tasks: task_view_preferences.show_completed,
+            sort_tasks_alphabetically: false,
+            show_completed_tasks: false,
             keybindings,
             config_path,
             nav_search,
             remembered_tasks: HashMap::new(),
+            completed_task_visibility,
+            alphabetical_sort,
             rendered_nav: None,
             pending_render: None,
             pending_add_target: None,
@@ -1240,6 +1246,7 @@ impl App {
 
     fn select_nav(&mut self, index: usize) {
         self.nav_cursor = index;
+        self.prioritize_current_filter();
         if let Some(id) = self.selected_nav().cloned() {
             self.pending_render = Some((id, Instant::now() + NAV_DEBOUNCE));
         }
@@ -1274,17 +1281,25 @@ impl App {
             self.task_render_cache.invalidate();
             self.task_cursor = None;
             self.rendered_nav = None;
+            self.show_completed_tasks = false;
+            self.sort_tasks_alphabetically = false;
         }
         Ok(())
     }
 
     fn load_tasks(&mut self, nav: NavId) -> Result<()> {
-        let mut tasks = self.store.tasks_for_view(&nav, self.show_completed_tasks)?;
+        let show_completed = self
+            .completed_task_visibility
+            .get(&nav)
+            .copied()
+            .unwrap_or(false);
+        let sort_alphabetically = self.alphabetical_sort.get(&nav).copied().unwrap_or(false);
+        let mut tasks = self.store.tasks_for_view(&nav, show_completed)?;
         let group_by_date = nav == NavId::Upcoming;
         order_tasks(
             &mut tasks,
             self.group_tasks_by_label && !group_by_date,
-            self.sort_tasks_alphabetically,
+            sort_alphabetically,
             group_by_date,
         );
         let remembered = self.remembered_tasks.get(&nav).cloned();
@@ -1303,6 +1318,8 @@ impl App {
             })
             .or_else(|| (!tasks.is_empty()).then_some(0));
         self.tasks = tasks;
+        self.show_completed_tasks = show_completed;
+        self.sort_tasks_alphabetically = sort_alphabetically;
         self.task_render_cache.invalidate();
         self.task_cursor = cursor;
         self.rendered_nav = Some(nav.clone());
@@ -1314,7 +1331,8 @@ impl App {
     }
 
     fn refresh_nav(&mut self) -> Result<()> {
-        let selected = match self.selected_nav().cloned() {
+        let previous = self.selected_nav().cloned();
+        let selected = match previous.clone() {
             Some(NavId::Filter(id)) => self
                 .store
                 .filter(&id)?
@@ -1325,7 +1343,18 @@ impl App {
                 .map(|project| NavId::Project(project.id)),
             selected => selected,
         };
-        self.nav_rows = self.store.nav_rows(self.show_hidden_projects)?;
+        let nav_rows = self.store.nav_rows(self.show_hidden_projects)?;
+        let completed_task_visibility = self.store.completed_task_visibility()?;
+        let alphabetical_sort = self.store.alphabetical_sort_preferences()?;
+        if let (Some(previous), Some(selected)) = (&previous, &selected)
+            && previous != selected
+            && let Some(task) = self.remembered_tasks.remove(previous)
+        {
+            self.remembered_tasks.insert(selected.clone(), task);
+        }
+        self.nav_rows = nav_rows;
+        self.completed_task_visibility = completed_task_visibility;
+        self.alphabetical_sort = alphabetical_sort;
         self.nav_search = build_nav_search(&self.nav_rows, &self.keybindings);
         self.nav_cursor = selected
             .as_ref()
@@ -2214,11 +2243,21 @@ impl App {
         let tree_before = self
             .store
             .tasks_for_view(&NavId::Project(before.project_id.clone()), true)?;
-        let task_below = if completed {
-            None
-        } else {
-            self.tasks.get(index + 1).map(|task| task.id.clone())
-        };
+        // Preserve the original displayed neighbor by ID: completing can move
+        // the task to a different position or group while it remains visible.
+        let preferred_task = self
+            .tasks
+            .get(index + 1)
+            .or_else(|| {
+                if completed {
+                    index
+                        .checked_sub(1)
+                        .and_then(|previous| self.tasks.get(previous))
+                } else {
+                    None
+                }
+            })
+            .map(|task| task.id.clone());
         self.store.set_task_completed(&id, completed)?;
         self.record_tree_change(
             tree_before,
@@ -2234,7 +2273,7 @@ impl App {
         if let Some(nav) = nav {
             if self.show_completed_tasks || !completed {
                 self.remembered_tasks
-                    .insert(nav.clone(), task_below.unwrap_or(id));
+                    .insert(nav.clone(), preferred_task.unwrap_or(id));
             } else {
                 self.remembered_tasks.remove(&nav);
             }
@@ -2709,34 +2748,55 @@ impl App {
     }
 
     fn toggle_alphabetical_sort(&mut self) -> Result<()> {
-        self.sort_tasks_alphabetically = !self.sort_tasks_alphabetically;
-        self.persist_task_view_preferences()?;
+        // Navigation may still be debounced. Toggle the destination's saved
+        // choice, never the previous pane's rendered state.
         self.force_tasks()?;
-        self.status = if self.sort_tasks_alphabetically {
-            "Tasks sorted alphabetically".into()
-        } else {
-            "Tasks restored to Todoist order".into()
+        let Some(nav) = self.selected_nav().cloned() else {
+            return Ok(());
         };
+        let sorted = !self.sort_tasks_alphabetically;
+        self.store.set_alphabetical_sort(&nav, sorted)?;
+        self.alphabetical_sort.insert(nav, sorted);
+        self.force_tasks()?;
+        self.status = format!(
+            "Tasks {} in {}",
+            if self.sort_tasks_alphabetically {
+                "sorted alphabetically"
+            } else {
+                "restored to Todoist order"
+            },
+            self.selected_nav_name()
+        );
         Ok(())
     }
 
     fn toggle_completed_tasks(&mut self) -> Result<()> {
-        self.show_completed_tasks = !self.show_completed_tasks;
-        self.persist_task_view_preferences()?;
+        // Navigation may still be debounced. Toggle the destination's saved
+        // choice, never the previous pane's rendered state.
         self.force_tasks()?;
-        self.status = if self.show_completed_tasks {
-            "Completed tasks shown".into()
-        } else {
-            "Completed tasks hidden".into()
+        let Some(nav) = self.selected_nav().cloned() else {
+            return Ok(());
         };
+        let show_completed = !self.show_completed_tasks;
+        self.store
+            .set_completed_task_visibility(&nav, show_completed)?;
+        self.completed_task_visibility.insert(nav, show_completed);
+        self.force_tasks()?;
+        self.status = format!(
+            "Completed tasks {} in {}",
+            if self.show_completed_tasks {
+                "shown"
+            } else {
+                "hidden"
+            },
+            self.selected_nav_name()
+        );
         Ok(())
     }
 
     fn persist_task_view_preferences(&self) -> Result<()> {
         self.store.set_task_view_preferences(TaskViewPreferences {
             group_by_label: self.group_tasks_by_label,
-            sort_alphabetically: self.sort_tasks_alphabetically,
-            show_completed: self.show_completed_tasks,
         })
     }
 
@@ -2762,6 +2822,10 @@ impl App {
 
     fn start_sync(&mut self) {
         self.scheduled_sync_running = false;
+        self.prioritize_current_filter();
+        if self.sync.has_token() {
+            self.sync.request_filter_refresh();
+        }
         if !self.sync.has_token() {
             let message = "API token missing: add it to API_TOKEN and restart".to_owned();
             self.sync_status = SyncStatus::Error;
@@ -2805,6 +2869,7 @@ impl App {
     }
 
     fn start_sync_run(&mut self) -> bool {
+        self.prioritize_current_filter();
         if self.sync.start() {
             self.last_sync_started = Instant::now();
             self.scheduled_sync_running = false;
@@ -2815,6 +2880,7 @@ impl App {
     }
 
     fn start_scheduled_sync_run(&mut self) -> bool {
+        self.prioritize_current_filter();
         if self.sync.start() {
             self.last_sync_started = Instant::now();
             self.scheduled_sync_running = true;
@@ -2824,8 +2890,57 @@ impl App {
         }
     }
 
+    fn prioritize_current_filter(&self) {
+        self.sync.prefer_filter(match self.selected_nav() {
+            Some(NavId::Filter(id)) => Some(id.as_str()),
+            _ => None,
+        });
+    }
+
     fn handle_sync_event(&mut self, event: SyncEvent) -> Result<()> {
         match event {
+            SyncEvent::DataRefreshed => {
+                self.refresh_nav()?;
+                if let Some(nav) = self.selected_nav().cloned()
+                    && let Some((pending, _)) = self.pending_render.as_mut()
+                {
+                    *pending = nav;
+                } else {
+                    self.force_tasks()?;
+                }
+            }
+            SyncEvent::FilterRefreshed { filter_id } => {
+                let count = self.store.filter_active_task_count(&filter_id)?;
+                for row in &mut self.nav_rows {
+                    if let NavRow::Item {
+                        id: NavId::Filter(id),
+                        count: row_count,
+                        ..
+                    } = row
+                        && id == &filter_id
+                    {
+                        *row_count = count;
+                    }
+                }
+                if let Some(NavId::Filter(selected)) = self.selected_nav().cloned() {
+                    if selected == filter_id {
+                        if self.pending_render.is_none() {
+                            self.force_tasks()?;
+                        }
+                    } else if self
+                        .store
+                        .filter(&selected)?
+                        .is_some_and(|filter| filter.id == filter_id)
+                    {
+                        self.refresh_nav()?;
+                        if let Some((view, _)) = self.pending_render.as_mut() {
+                            *view = NavId::Filter(filter_id);
+                        } else {
+                            self.force_tasks()?;
+                        }
+                    }
+                }
+            }
             SyncEvent::AuxiliaryWarning { message } => {
                 self.sync_issue = Some(message);
                 self.sync_status = SyncStatus::Error;
@@ -2845,7 +2960,7 @@ impl App {
                 self.sync_issue = None;
                 if self.sync.is_running() {
                     self.sync_status = SyncStatus::Syncing;
-                } else if pending == 0 {
+                } else if pending == 0 && !self.sync.filter_refresh_pending() {
                     let recovered = self.sync_status != SyncStatus::Synced;
                     self.sync_status = SyncStatus::Synced;
                     if !was_scheduled {
@@ -2855,9 +2970,11 @@ impl App {
                     }
                 } else if self.start_sync_run() {
                     self.sync_status = SyncStatus::Syncing;
-                    self.set_persistent_status(format!(
-                        "Syncing {pending} newly queued change(s)…"
-                    ));
+                    self.set_persistent_status(if pending > 0 {
+                        format!("Syncing {pending} newly queued change(s)…")
+                    } else {
+                        "Refreshing filters…".into()
+                    });
                 } else {
                     self.sync_status = SyncStatus::Pending;
                     self.set_persistent_status(format!("Pending sync: {pending}"));
@@ -3632,6 +3749,13 @@ mod tests {
             assert!(!app.group_tasks_by_label);
             assert!(app.sort_tasks_alphabetically);
             assert!(app.show_completed_tasks);
+            assert_eq!(
+                app.store
+                    .completed_task_visibility()
+                    .unwrap()
+                    .get(&NavId::Project("inbox".into())),
+                Some(&true)
+            );
         }
 
         let store = Store::open(database_path).unwrap();
@@ -3640,6 +3764,430 @@ mod tests {
         assert!(!app.group_tasks_by_label);
         assert!(app.sort_tasks_alphabetically);
         assert!(app.show_completed_tasks);
+    }
+
+    fn completed_visibility_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = draft_test_app();
+        let projects =
+            serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+                {"id":"a","name":"Work"},{"id":"b","name":"Work","workspace_id":"team"},
+                {"id":"child","name":"Child","parent_id":"a"}
+            ]))
+            .unwrap();
+        let today = Local::now().date_naive().format("%F").to_string();
+        let tasks=["inbox","a","b","child"].into_iter().flat_map(|project|[false,true].into_iter().map(move |done|(project,done))).map(|(project,done)| {
+            serde_json::from_value::<crate::model::RemoteTask>(serde_json::json!({"id":format!("{project}-{}",if done{"done"}else{"active"}),"project_id":project,"content":if done{"Completed"}else{"Active"},"child_order":i64::from(done),"due":{"date":today,"is_recurring":false}})).unwrap()
+        }).collect::<Vec<_>>();
+        let filters =
+            serde_json::from_value::<Vec<crate::model::RemoteFilter>>(serde_json::json!([
+                {"id":"f1","name":"Filter One","query":"all","is_favorite":true},
+                {"id":"f2","name":"Filter Two","query":"all","is_favorite":true}
+            ]))
+            .unwrap();
+        app.store
+            .merge_remote(&projects, &tasks, &[], &filters)
+            .unwrap();
+        for filter in ["f1", "f2"] {
+            app.store.replace_filter_membership(filter, &tasks).unwrap();
+        }
+        for project in ["inbox", "a", "b", "child"] {
+            app.store
+                .set_task_completed(&format!("{project}-done"), true)
+                .unwrap();
+        }
+        app.refresh_nav().unwrap();
+        app.force_tasks().unwrap();
+        (dir, app)
+    }
+
+    fn enter_view(app: &mut App, nav: &NavId) {
+        let index = app
+            .nav_rows
+            .iter()
+            .position(|row| matches!(row,NavRow::Item{id,..} if id==nav))
+            .unwrap();
+        app.select_nav(index);
+        app.enter_tasks().unwrap();
+    }
+
+    #[test]
+    fn completed_visibility_is_independent_per_project_filter_and_builtin_view_after_restart() {
+        let (dir, mut app) = completed_visibility_app();
+        let a = NavId::Project("a".into());
+        let b = NavId::Project("b".into());
+        let f1 = NavId::Filter("f1".into());
+        let other_views = [
+            b.clone(),
+            NavId::Project("child".into()),
+            NavId::Project("inbox".into()),
+            NavId::Today,
+            NavId::Upcoming,
+            NavId::Filter("f2".into()),
+        ];
+        let queued = app.store.outbox_len().unwrap();
+        enter_view(&mut app, &a);
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.show_completed_tasks && app.tasks.iter().any(|task| task.checked));
+        app.set_task_cursor(app.tasks.iter().position(|task| task.checked).unwrap());
+        for nav in &other_views {
+            enter_view(&mut app, nav);
+            assert!(!app.show_completed_tasks, "{nav:?}");
+            assert!(app.tasks.iter().all(|task| !task.checked));
+        }
+        enter_view(&mut app, &a);
+        assert_eq!(app.selected_task().unwrap().id, "a-done");
+        app.toggle_completed_tasks().unwrap();
+        assert!(!app.selected_task().unwrap().checked);
+        app.toggle_completed_tasks().unwrap();
+        enter_view(&mut app, &f1);
+        app.toggle_completed_tasks().unwrap();
+        enter_view(&mut app, &NavId::Today);
+        app.toggle_completed_tasks().unwrap();
+        enter_view(&mut app, &b);
+        app.toggle_completed_tasks().unwrap();
+        app.toggle_completed_tasks().unwrap();
+        app.toggle_label_grouping().unwrap();
+        app.toggle_alphabetical_sort().unwrap();
+        let renamed = serde_json::from_value::<crate::model::RemoteProject>(
+            serde_json::json!({"id":"a","name":"Renamed Work"}),
+        )
+        .unwrap();
+        app.store.merge_remote(&[renamed], &[], &[], &[]).unwrap();
+        app.refresh_nav().unwrap();
+        enter_view(&mut app, &a);
+        assert!(app.show_completed_tasks);
+        assert_eq!(app.store.outbox_len().unwrap(), queued);
+        drop(app);
+        let store = Store::open(dir.path().join("drafts.db")).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            SyncManager::new(store, None).unwrap(),
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        for nav in [a, f1, NavId::Today] {
+            enter_view(&mut app, &nav);
+            assert!(app.show_completed_tasks, "{nav:?}");
+            assert!(app.tasks.iter().any(|task| task.checked));
+        }
+        for nav in other_views.into_iter().filter(|nav| *nav != NavId::Today) {
+            enter_view(&mut app, &nav);
+            assert!(!app.show_completed_tasks, "{nav:?}");
+            assert!(app.tasks.iter().all(|task| !task.checked));
+        }
+    }
+
+    #[test]
+    fn completed_visibility_toggle_targets_debounced_navigation_and_preserves_aliases() {
+        let (_dir, mut app) = completed_visibility_app();
+        let a = NavId::Project("a".into());
+        let b = NavId::Project("b".into());
+        enter_view(&mut app, &a);
+        app.toggle_completed_tasks().unwrap();
+        let row = app
+            .nav_rows
+            .iter()
+            .position(|row| matches!(row,NavRow::Item{id,..} if id==&b))
+            .unwrap();
+        app.select_nav(row);
+        assert!(app.pending_render.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.pending_render.is_none());
+        assert!(app.show_completed_tasks);
+        assert!(app.tasks.iter().all(|task| task.project_id == "b"));
+        assert!(app.tasks.iter().any(|task| task.checked));
+        app.set_task_cursor(
+            app.tasks
+                .iter()
+                .position(|task| task.id == "b-done")
+                .unwrap(),
+        );
+        app.store.replace_project_id("b", "server-b").unwrap();
+        app.handle_sync_event(SyncEvent::DataRefreshed).unwrap();
+        assert_eq!(app.selected_nav(), Some(&NavId::Project("server-b".into())));
+        assert!(app.show_completed_tasks);
+        assert_eq!(app.selected_task().unwrap().id, "b-done");
+        enter_view(&mut app, &NavId::Filter("f1".into()));
+        app.toggle_completed_tasks().unwrap();
+        app.store.replace_filter_id("f1", "server-f1").unwrap();
+        app.handle_sync_event(SyncEvent::DataRefreshed).unwrap();
+        assert_eq!(app.selected_nav(), Some(&NavId::Filter("server-f1".into())));
+        assert!(app.show_completed_tasks);
+    }
+
+    #[test]
+    fn failed_completed_visibility_save_does_not_toggle_the_display_or_saved_choice() {
+        let (dir, mut app) = completed_visibility_app();
+        enter_view(&mut app, &NavId::Project("a".into()));
+        let lock = rusqlite::Connection::open(dir.path().join("drafts.db")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(app.toggle_completed_tasks().is_err());
+        assert!(!app.show_completed_tasks);
+        assert!(app.tasks.iter().all(|task| !task.checked));
+        lock.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            app.store
+                .completed_task_visibility()
+                .unwrap()
+                .get(&NavId::Project("a".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn completed_visibility_can_be_enabled_in_a_project_with_no_active_tasks() {
+        let (_dir, mut app) = completed_visibility_app();
+        app.store.set_task_completed("a-active", true).unwrap();
+        enter_view(&mut app, &NavId::Project("a".into()));
+        assert!(app.tasks.is_empty());
+        let queued = app.store.outbox_len().unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.tasks.len(), 2);
+        assert!(app.tasks.iter().all(|task| task.checked));
+        assert!(app.selected_task().is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.tasks.is_empty());
+        assert!(app.selected_task().is_none());
+        assert_eq!(app.store.outbox_len().unwrap(), queued);
+    }
+
+    #[test]
+    fn filter_refresh_progress_updates_the_current_alias_view_and_counts_without_resetting_selection()
+     {
+        let (_dir, mut app) = completed_visibility_app();
+        enter_view(&mut app, &NavId::Filter("f1".into()));
+        app.toggle_completed_tasks().unwrap();
+        app.set_task_cursor(
+            app.tasks
+                .iter()
+                .position(|task| task.id == "b-done")
+                .unwrap(),
+        );
+        app.store
+            .replace_filter_id("f1", "canonical-filter")
+            .unwrap();
+        app.handle_sync_event(SyncEvent::FilterRefreshed {
+            filter_id: "canonical-filter".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            app.selected_nav(),
+            Some(&NavId::Filter("canonical-filter".into()))
+        );
+        assert!(app.show_completed_tasks);
+        assert_eq!(app.selected_task().unwrap().id, "b-done");
+        assert!(app.nav_rows.iter().any(|row|matches!(row,NavRow::Item{id:NavId::Filter(id),count:4,..} if id=="canonical-filter")));
+        app.store.replace_filter_membership("f2", &[]).unwrap();
+        app.handle_sync_event(SyncEvent::FilterRefreshed {
+            filter_id: "f2".into(),
+        })
+        .unwrap();
+        assert_eq!(app.selected_task().unwrap().id, "b-done");
+        assert!(
+            app.nav_rows
+                .iter()
+                .any(|row| matches!(row,NavRow::Item{id:NavId::Filter(id),count:0,..} if id=="f2"))
+        );
+    }
+
+    #[test]
+    fn filter_refresh_progress_respects_navigation_debounce_and_retargets_a_remapped_filter() {
+        let (_dir, mut app) = completed_visibility_app();
+        enter_view(&mut app, &NavId::Filter("f1".into()));
+        app.toggle_completed_tasks().unwrap();
+        enter_view(&mut app, &NavId::Project("inbox".into()));
+        let index = app
+            .nav_rows
+            .iter()
+            .position(|row| matches!(row,NavRow::Item{id:NavId::Filter(id),..} if id=="f1"))
+            .unwrap();
+        app.select_nav(index);
+        app.handle_sync_event(SyncEvent::FilterRefreshed {
+            filter_id: "f1".into(),
+        })
+        .unwrap();
+        assert!(app.pending_render.is_some());
+        assert_eq!(app.rendered_nav, Some(NavId::Project("inbox".into())));
+        assert!(app.tasks.iter().all(|task| task.project_id == "inbox"));
+        app.store
+            .replace_filter_id("f1", "canonical-filter")
+            .unwrap();
+        app.handle_sync_event(SyncEvent::FilterRefreshed {
+            filter_id: "canonical-filter".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            app.pending_render.as_ref().unwrap().0,
+            NavId::Filter("canonical-filter".into())
+        );
+        app.pending_render.as_mut().unwrap().1 = Instant::now();
+        app.tick().unwrap();
+        assert!(app.pending_render.is_none());
+        assert_eq!(
+            app.rendered_nav,
+            Some(NavId::Filter("canonical-filter".into()))
+        );
+        assert!(app.show_completed_tasks);
+        assert_eq!(app.tasks.len(), 8);
+    }
+
+    #[test]
+    fn core_refresh_updates_today_before_sync_finishes_without_closing_a_dialog() {
+        let (_dir, mut app) = draft_test_app();
+        let today = Local::now().date_naive();
+        let mut task=serde_json::from_value::<crate::model::RemoteTask>(serde_json::json!({"id":"task","project_id":"inbox","content":"Newly due today","due":{"date":today.succ_opt().unwrap().format("%F").to_string(),"is_recurring":false}})).unwrap();
+        app.store
+            .merge_remote(&[], std::slice::from_ref(&task), &[], &[])
+            .unwrap();
+        app.refresh_nav().unwrap();
+        enter_view(&mut app, &NavId::Today);
+        app.toggle_completed_tasks().unwrap();
+        assert!(app.tasks.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+            .unwrap();
+        task.due.as_mut().unwrap().date = Some(today.format("%F").to_string());
+        app.store.merge_remote(&[], &[task], &[], &[]).unwrap();
+        app.handle_sync_event(SyncEvent::DataRefreshed).unwrap();
+        assert_eq!(app.selected_task().unwrap().id, "task");
+        assert!(app.show_completed_tasks);
+        assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
+        assert!(app.nav_rows.iter().any(|row| matches!(
+            row,
+            NavRow::Item {
+                id: NavId::Today,
+                count: 1,
+                ..
+            }
+        )));
+    }
+
+    fn alphabetical_sort_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = draft_test_app();
+        let projects =
+            serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+                {"id":"a","name":"Work"},{"id":"b","name":"Work","workspace_id":"team"}
+            ]))
+            .unwrap();
+        let tasks = ["a", "b"]
+            .into_iter()
+            .flat_map(|project| {
+                [("zulu", "Zulu"), ("alpha", "Alpha")]
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(order, (suffix, content))| (project, suffix, content, order))
+            })
+            .map(|(project, suffix, content, order)| {
+                serde_json::from_value::<crate::model::RemoteTask>(serde_json::json!({
+                    "id":format!("{project}-{suffix}"),
+                    "project_id":project,
+                    "content":content,
+                    "child_order":order
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let filters = serde_json::from_value::<Vec<crate::model::RemoteFilter>>(
+            serde_json::json!([{"id":"f1","name":"All","query":"all","is_favorite":true}]),
+        )
+        .unwrap();
+        app.store
+            .merge_remote(&projects, &tasks, &[], &filters)
+            .unwrap();
+        app.store.replace_filter_membership("f1", &tasks).unwrap();
+        app.refresh_nav().unwrap();
+        app.force_tasks().unwrap();
+        (dir, app)
+    }
+
+    #[test]
+    fn alphabetical_sort_is_independent_per_view_and_remembered_after_restart() {
+        let (dir, mut app) = alphabetical_sort_app();
+        let a = NavId::Project("a".into());
+        let b = NavId::Project("b".into());
+        let filter = NavId::Filter("f1".into());
+        enter_view(&mut app, &a);
+        assert_eq!(app.tasks[0].id, "a-zulu");
+        app.toggle_alphabetical_sort().unwrap();
+        assert_eq!(app.tasks[0].id, "a-alpha");
+        assert_eq!(app.selected_task().unwrap().id, "a-zulu");
+        assert!(app.sort_tasks_alphabetically);
+
+        // Deferred navigation must apply A to the destination, not the pane
+        // that is still rendered.
+        let row = app
+            .nav_rows
+            .iter()
+            .position(|row| matches!(row,NavRow::Item{id,..} if id==&b))
+            .unwrap();
+        app.select_nav(row);
+        assert!(app.pending_render.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.pending_render.is_none());
+        assert!(app.tasks.iter().all(|task| task.project_id == "b"));
+        assert_eq!(app.tasks[0].id, "b-alpha");
+        assert_eq!(app.selected_task().unwrap().id, "b-zulu");
+        app.toggle_alphabetical_sort().unwrap();
+        assert_eq!(app.tasks[0].id, "b-zulu");
+        assert_eq!(app.selected_task().unwrap().id, "b-zulu");
+        assert!(!app.sort_tasks_alphabetically);
+
+        enter_view(&mut app, &filter);
+        assert_eq!(app.tasks[0].id, "a-zulu");
+        app.toggle_alphabetical_sort().unwrap();
+        assert_eq!(app.tasks[0].id, "a-alpha");
+
+        enter_view(&mut app, &a);
+        assert!(app.sort_tasks_alphabetically);
+        assert_eq!(app.tasks[0].id, "a-alpha");
+        drop(app);
+
+        let store = Store::open(dir.path().join("drafts.db")).unwrap();
+        let mut app = App::new(
+            store.clone(),
+            SyncManager::new(store, None).unwrap(),
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        for (nav, sorted) in [(a.clone(), true), (b.clone(), false), (filter, true)] {
+            enter_view(&mut app, &nav);
+            assert_eq!(app.sort_tasks_alphabetically, sorted, "{nav:?}");
+        }
+        enter_view(&mut app, &a);
+        assert_eq!(app.tasks[0].id, "a-alpha");
+
+        app.store.replace_project_id("a", "server-a").unwrap();
+        app.refresh_nav().unwrap();
+        app.force_tasks().unwrap();
+        assert_eq!(app.selected_nav(), Some(&NavId::Project("server-a".into())));
+        assert!(app.sort_tasks_alphabetically);
+        assert_eq!(app.tasks[0].id, "a-alpha");
+    }
+
+    #[test]
+    fn failed_alphabetical_sort_save_leaves_the_display_and_saved_choice_unchanged() {
+        let (dir, mut app) = alphabetical_sort_app();
+        enter_view(&mut app, &NavId::Project("a".into()));
+        assert_eq!(app.selected_task().unwrap().id, "a-zulu");
+        let lock = rusqlite::Connection::open(dir.path().join("drafts.db")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(app.toggle_alphabetical_sort().is_err());
+        assert!(!app.sort_tasks_alphabetically);
+        assert_eq!(app.selected_task().unwrap().id, "a-zulu");
+        lock.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            app.store
+                .alphabetical_sort_preferences()
+                .unwrap()
+                .get(&NavId::Project("a".into())),
+            None
+        );
     }
 
     #[test]
@@ -3654,10 +4202,7 @@ mod tests {
         store.set_task_completed(&second_id, true).unwrap();
         store.set_task_completed(&third_id, true).unwrap();
         store
-            .set_task_view_preferences(TaskViewPreferences {
-                show_completed: true,
-                ..TaskViewPreferences::default()
-            })
+            .set_completed_task_visibility(&NavId::Project("inbox".into()), true)
             .unwrap();
         let sync = SyncManager::new(store.clone(), None).unwrap();
         let mut app = App::new(
@@ -3689,16 +4234,156 @@ mod tests {
     }
 
     #[test]
+    fn completing_with_history_shown_follows_the_original_next_task_across_views_and_sort_modes() {
+        for nav in [
+            NavId::Project("inbox".into()),
+            NavId::Today,
+            NavId::Upcoming,
+            NavId::Filter("all".into()),
+        ] {
+            for (grouped, alphabetical) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let (_dir, mut app) = draft_test_app();
+                let today = Local::now().date_naive();
+                let gamma_date = if nav == NavId::Upcoming {
+                    today.succ_opt().unwrap()
+                } else {
+                    today
+                };
+                let tasks=serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+                        {"id":"gamma","project_id":"inbox","content":"Gamma","child_order":0,"labels":["B"],"due":{"date":gamma_date.format("%F").to_string(),"is_recurring":false}},
+                        {"id":"alpha","project_id":"inbox","content":"Alpha","child_order":1,"labels":["A"],"due":{"date":today.format("%F").to_string(),"is_recurring":false}},
+                        {"id":"beta","project_id":"inbox","content":"Beta","child_order":2,"labels":["B"],"due":{"date":today.format("%F").to_string(),"is_recurring":false}}
+                ])).unwrap();
+                let projects = serde_json::from_value::<Vec<crate::model::RemoteProject>>(
+                    serde_json::json!([{"id":"other","name":"Other"}]),
+                )
+                .unwrap();
+                let filters = serde_json::from_value::<Vec<crate::model::RemoteFilter>>(
+                    serde_json::json!([{"id":"all","name":"All","query":"all","is_favorite":true}]),
+                )
+                .unwrap();
+                app.store
+                    .merge_remote(&projects, &tasks, &[], &filters)
+                    .unwrap();
+                app.store.replace_filter_membership("all", &tasks).unwrap();
+                app.group_tasks_by_label = grouped;
+                app.sort_tasks_alphabetically = alphabetical;
+                app.refresh_nav().unwrap();
+                let row = app
+                    .nav_rows
+                    .iter()
+                    .position(|row| matches!(row,NavRow::Item{id,..} if id==&nav))
+                    .unwrap();
+                app.select_nav(row);
+                app.enter_tasks().unwrap();
+                app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
+                    .unwrap();
+                let completed = if nav == NavId::Upcoming {
+                    "beta"
+                } else {
+                    "alpha"
+                };
+                let index = app
+                    .tasks
+                    .iter()
+                    .position(|task| task.id == completed)
+                    .unwrap();
+                app.set_task_cursor(index);
+                let below = app.tasks[index + 1].id.clone();
+                app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+                    .unwrap();
+                assert!(app.store.task(completed).unwrap().unwrap().checked);
+                assert_eq!(
+                    app.selected_task().unwrap().id,
+                    below,
+                    "{nav:?}, grouped={grouped}, alphabetical={alphabetical}"
+                );
+                assert_eq!(app.focus, Focus::Tasks);
+                assert_eq!(app.remembered_tasks.get(&nav), Some(&below));
+                app.force_tasks().unwrap();
+                assert_eq!(app.selected_task().unwrap().id, below);
+                let other = app
+                    .nav_rows
+                    .iter()
+                    .position(
+                        |row| matches!(row,NavRow::Item{id:NavId::Project(id),..} if id=="other"),
+                    )
+                    .unwrap();
+                app.select_nav(other);
+                app.enter_tasks().unwrap();
+                let original = app
+                    .nav_rows
+                    .iter()
+                    .position(|row| matches!(row,NavRow::Item{id,..} if id==&nav))
+                    .unwrap();
+                app.select_nav(original);
+                app.enter_tasks().unwrap();
+                assert_eq!(app.selected_task().unwrap().id, below);
+            }
+        }
+    }
+
+    #[test]
+    fn completing_the_last_visible_task_selects_its_predecessor_or_the_only_task() {
+        for count in [1, 3] {
+            let (_dir, mut app) = draft_test_app();
+            let tasks=(0..count).map(|index|serde_json::from_value::<crate::model::RemoteTask>(serde_json::json!({"id":format!("task-{index}"),"project_id":"inbox","content":format!("Task {index}"),"child_order":index})).unwrap()).collect::<Vec<_>>();
+            app.store.merge_remote(&[], &tasks, &[], &[]).unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
+                .unwrap();
+            app.enter_tasks().unwrap();
+            app.set_task_cursor(count - 1);
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+                .unwrap();
+            assert_eq!(
+                app.selected_task().unwrap().id,
+                format!("task-{}", count.saturating_sub(2))
+            );
+            assert_eq!(app.selected_task().unwrap().checked, count == 1);
+        }
+    }
+
+    #[test]
+    fn parent_and_recurring_completion_select_the_original_child_row_when_history_is_shown() {
+        for recurring in [false, true] {
+            let (_dir, mut app) = draft_test_app();
+            let due=recurring.then(||serde_json::json!({"date":Local::now().date_naive().format("%F").to_string(),"string":"every day","is_recurring":true}));
+            let tasks=serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+                {"id":"parent","project_id":"inbox","content":"Parent","child_order":0,"due":due},
+                {"id":"child","project_id":"inbox","parent_id":"parent","content":"Child","child_order":0},
+                {"id":"next","project_id":"inbox","content":"Next","child_order":1}
+            ])).unwrap();
+            app.store.merge_remote(&[], &tasks, &[], &[]).unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
+                .unwrap();
+            app.enter_tasks().unwrap();
+            app.set_task_cursor(
+                app.tasks
+                    .iter()
+                    .position(|task| task.id == "parent")
+                    .unwrap(),
+            );
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+                .unwrap();
+            assert_eq!(app.selected_task().unwrap().id, "child");
+            assert_eq!(
+                app.store.task("parent").unwrap().unwrap().checked,
+                !recurring
+            );
+            assert_eq!(app.selected_task().unwrap().checked, !recurring);
+        }
+    }
+
+    #[test]
     fn completion_can_be_undone_and_redone() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
         let inbox = store.projects().unwrap().remove(0);
         let task_id = store.add_task("Undo me", &inbox).unwrap();
         store
-            .set_task_view_preferences(TaskViewPreferences {
-                show_completed: true,
-                ..TaskViewPreferences::default()
-            })
+            .set_completed_task_visibility(&NavId::Project("inbox".into()), true)
             .unwrap();
         let sync = SyncManager::new(store.clone(), None).unwrap();
         let mut app = App::new(

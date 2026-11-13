@@ -68,7 +68,7 @@ below mean Shift+letter.
 | `@` / `v` | Toggle a label / move a task to another project |
 | `>` / `<` | Indent / promote a task |
 | `u` / Ctrl+r | Undo / redo a task change from this session |
-| `L` / `A` / `C` | Toggle label grouping / alphabetical order / completed tasks |
+| `L` / `A` / `C` | Toggle label grouping / current-view alphabetical order / completed tasks |
 | `P` / Ctrl+f | Add a project / personal filter |
 | `R` | Rename the selected project |
 | `r` | Synchronize |
@@ -102,14 +102,26 @@ keys) to read long titles, queries, and descriptions in small terminals.
 
 Task titles wrap at word boundaries. A word too wide for a row appears as `…`;
 open details to read the complete title.
-Selection stays visible even in very large, heavily wrapped task lists.
+Selection stays visible even in very large, heavily wrapped task lists. The task
+page keeps four rows of context above and below the selection and scrolls only
+when you move past the fifth visible row from either edge.
 
-Tasks are grouped by label by default. Sorting, grouping, and completed-task
-visibility are remembered between runs. Subtasks stay with their parent.
+Tasks are grouped by label by default, and that grouping is remembered between
+runs. `A` sorts alphabetically only in the current project or view; each project,
+filter, Today, and Upcoming remembers its own choice after restart. Views without
+a saved choice use Todoist order. After upgrading from the old global setting,
+enable `A` separately wherever you want alphabetical order. Subtasks stay with
+their parent.
+`C` shows/hides completed tasks only in the current project or view, with the
+same independent saved choices. Views without a saved choice hide completed
+tasks; after upgrading, enable it separately where desired.
+With completed tasks shown, `d` advances selection to the task that was directly
+below the completed task. At the end of the list it selects the preceding task,
+or keeps the sole task selected.
 Alphabetical sorting affects only the displayed order; `a` and `q` still record
 top/bottom placement, which appears once sorting is disabled. In Upcoming,
-date groups determine placement instead. Disable alphabetical sorting before
-using `J`/`K`.
+date groups determine placement instead. Disable alphabetical sorting in the
+current view before using `J`/`K` there.
 
 `J`/`K` keep task moves within the same project, section, and parent; project
 moves stay among siblings in the same workspace and folder. Reordering and
@@ -217,6 +229,14 @@ changes can continue synchronizing. Automatic retries respect server-requested
 delays. Failed filter/history refreshes retain cached results and report
 staleness. Completed history initially includes the previous 89 days and
 refreshes at most every 15 minutes.
+
+Favorite filters refresh after your changes upload. On the main screen, `r`
+requests fresh filter results even within the one-minute polling interval. The
+current filter is refreshed first, and results appear as soon as ready, while
+other background work continues. Unrelated rejected changes do not block these
+refreshes. Interrupted requests are retained, and failed filters keep their
+cached results and staleness messages until refreshed. Server-requested retry
+delays still apply.
 
 For an old “Moving from a workspace is not implemented” rejection, use `u` if
 that move is still in this session's undo history, or find the task at its cached

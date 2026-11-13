@@ -34,7 +34,9 @@ const GOLD: Color = Color::Rgb(209, 166, 73);
 const SYNC_GREEN: Color = Color::Rgb(76, 187, 123);
 const SYNC_ORANGE: Color = Color::Rgb(224, 151, 62);
 const SYNC_RED: Color = Color::Rgb(222, 76, 86);
-const TASK_LOOKAHEAD: usize = 4;
+/// Keep four rows above and below the selection when the viewport is tall
+/// enough. Crossing the fifth visible task scrolls the page by one.
+const TASK_SCROLL_MARGIN: usize = 4;
 const LIST_TOP_PADDING: u16 = 1;
 const TASK_RIGHT_PADDING: u16 = 2;
 const DESCRIPTION_MARKER: &str = "\u{2630}";
@@ -43,6 +45,7 @@ const DESCRIPTION_MARKER: &str = "\u{2630}";
 pub struct TaskRenderCache {
     key: Option<(usize, bool, bool, bool, NaiveDate)>,
     layout: TaskLayout,
+    scroll: usize,
 }
 
 #[derive(Default)]
@@ -55,6 +58,7 @@ struct TaskLayout {
 impl TaskRenderCache {
     pub fn invalidate(&mut self) {
         self.key = None;
+        self.scroll = 0;
     }
 
     fn ensure(&mut self, tasks: &[Task], width: usize, labels: bool, dates: bool, completed: bool) {
@@ -62,11 +66,24 @@ impl TaskRenderCache {
         if self.key != Some(key) {
             self.layout = task_layout(tasks, None, false, labels, dates, completed, width);
             self.key = Some(key);
+            self.scroll = 0;
         }
     }
 
-    fn visible(&self, selected: Option<usize>, focused: bool, height: usize) -> Vec<Line<'static>> {
-        let scroll = task_scroll(&self.layout.positions, selected, height);
+    fn visible(
+        &mut self,
+        selected: Option<usize>,
+        focused: bool,
+        height: usize,
+    ) -> Vec<Line<'static>> {
+        self.scroll = task_scroll(
+            &self.layout.positions,
+            &self.layout.ends,
+            selected,
+            height,
+            self.scroll,
+        );
+        let scroll = self.scroll;
         let selected_range = selected.filter(|_| focused).and_then(|index| {
             Some((
                 *self.layout.positions.get(index)?,
@@ -240,22 +257,66 @@ fn draw_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
 }
 
-fn task_scroll(positions: &[usize], selected: Option<usize>, viewport_height: usize) -> usize {
+fn task_scroll(
+    positions: &[usize],
+    ends: &[usize],
+    selected: Option<usize>,
+    viewport_height: usize,
+    previous_scroll: usize,
+) -> usize {
+    let total = ends
+        .last()
+        .copied()
+        .or_else(|| positions.last().map(|position| position + 1))
+        .unwrap_or(0);
+    let max_scroll = total.saturating_sub(viewport_height);
+    let mut scroll = previous_scroll.min(max_scroll);
     let Some(selected_index) = selected.filter(|index| *index < positions.len()) else {
-        return 0;
+        return scroll;
     };
     if viewport_height == 0 {
         return positions[selected_index];
     }
-    let selected_line = positions[selected_index];
-    let lookahead_index = (selected_index + TASK_LOOKAHEAD).min(positions.len() - 1);
-    let lookahead_line = positions[lookahead_index];
-    // Put the fourth following task at or above the viewport's last row. If
-    // headings make that impossible in a very short terminal, keep the
-    // selected task visible and show as much lookahead as fits.
-    lookahead_line
-        .saturating_sub(viewport_height - 1)
-        .min(selected_line)
+    let selected_start = positions[selected_index];
+    let selected_end = ends
+        .get(selected_index)
+        .copied()
+        .unwrap_or(selected_start + 1);
+    // Keep the selection visible first. A task taller than the viewport shows
+    // its beginning; otherwise show its end when moving upward.
+    if selected_start < scroll {
+        scroll = selected_start;
+    }
+    if selected_end.saturating_sub(selected_start) >= viewport_height {
+        scroll = selected_start;
+    } else if selected_end > scroll.saturating_add(viewport_height) {
+        scroll = selected_end - viewport_height;
+    }
+    if viewport_height > TASK_SCROLL_MARGIN * 2
+        && selected_end.saturating_sub(selected_start) < viewport_height
+    {
+        // Four visual rows of margin: moving within the fifth row from an edge
+        // leaves the page in place; crossing it scrolls by one row.
+        let required_top = selected_start.saturating_sub(TASK_SCROLL_MARGIN);
+        if required_top < scroll {
+            scroll = required_top;
+        }
+        let required_bottom = selected_end.saturating_add(TASK_SCROLL_MARGIN);
+        if required_bottom > scroll.saturating_add(viewport_height) {
+            scroll = required_bottom - viewport_height;
+        }
+    }
+    // Do not scroll the selected task out of view when a per-task margin or a
+    // wrapped neighbor would otherwise make the two requirements conflict.
+    if selected_start < scroll {
+        scroll = selected_start;
+    }
+    if selected_end.saturating_sub(selected_start) < viewport_height
+        && selected_end > scroll.saturating_add(viewport_height)
+    {
+        scroll = selected_end - viewport_height;
+    }
+    scroll.min(max_scroll)
 }
 
 fn task_layout(
@@ -1050,11 +1111,11 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         ),
         (
             keys.display(Action::ToggleAlphabeticalSort).into(),
-            "toggle alphabetical task order",
+            "toggle alphabetical order in current view",
         ),
         (
             keys.display(Action::ToggleCompletedTasks).into(),
-            "show / hide completed tasks",
+            "show / hide completed in current view",
         ),
         (
             keys.display(Action::Sync).into(),
@@ -1706,19 +1767,21 @@ mod tests {
         ];
         tasks[1].checked = true;
         tasks[1].priority = 4;
-        let mut cache = TaskRenderCache::default();
-        cache.ensure(&tasks, 18, true, false, true);
         for focused in [false, true] {
             for selected in 0..tasks.len() {
+                let layout = task_layout(&tasks, None, false, true, false, true, 18);
                 let (full, positions) =
                     task_lines(&tasks, Some(selected), focused, true, false, true, 18);
-                let scroll = task_scroll(&positions, Some(selected), 5);
+                let scroll = task_scroll(&positions, &layout.ends, Some(selected), 5, 0);
+                let mut cache = TaskRenderCache::default();
+                cache.ensure(&tasks, 18, true, false, true);
                 assert_eq!(
                     cache.visible(Some(selected), focused, 5),
                     full.into_iter().skip(scroll).take(5).collect::<Vec<_>>()
                 );
             }
         }
+        let mut cache = TaskRenderCache::default();
         tasks[0].content = "Changed locally".into();
         cache.invalidate();
         cache.ensure(&tasks, 40, false, false, true);
@@ -2086,23 +2149,61 @@ mod tests {
     }
 
     #[test]
-    fn task_scroll_keeps_four_following_tasks_visible() {
-        let positions = (0..12).collect::<Vec<_>>();
-        assert_eq!(task_scroll(&positions, Some(2), 7), 0);
-        assert_eq!(task_scroll(&positions, Some(3), 7), 1);
-        assert_eq!(task_scroll(&positions, Some(7), 7), 5);
+    fn task_scroll_holds_the_page_until_the_fifth_visible_task_is_crossed() {
+        let positions = (0..30).collect::<Vec<_>>();
+        let ends = (1..=30).collect::<Vec<_>>();
+        let mut scroll = 0;
+        for selected in 0..30 {
+            scroll = task_scroll(&positions, &ends, Some(selected), 10, scroll);
+        }
+        assert_eq!(scroll, 20);
+        // Moving up through the bottom portion leaves the page fixed until the
+        // selection crosses the fifth row from the top.
+        for (selected, expected) in [
+            (29, 20),
+            (28, 20),
+            (27, 20),
+            (26, 20),
+            (25, 20),
+            (24, 20),
+            (23, 19),
+            (22, 18),
+        ] {
+            scroll = task_scroll(&positions, &ends, Some(selected), 10, scroll);
+            assert_eq!(scroll, expected, "selected {selected}");
+            assert!(positions[selected] >= scroll);
+            assert!(ends[selected] <= scroll + 10);
+        }
     }
 
     #[test]
-    fn task_scroll_accounts_for_group_heading_rows() {
+    fn task_scroll_uses_visual_rows_for_wrapped_tasks_and_headings() {
         let positions = vec![0, 1, 4, 5, 8, 9, 12];
-        assert_eq!(task_scroll(&positions, Some(0), 9), 0);
-        assert_eq!(task_scroll(&positions, Some(1), 9), 1);
+        let ends = vec![1, 4, 5, 8, 9, 12, 13];
+        assert_eq!(task_scroll(&positions, &ends, Some(0), 9, 0), 0);
+        assert_eq!(task_scroll(&positions, &ends, Some(1), 9, 0), 0);
+        assert_eq!(task_scroll(&positions, &ends, Some(2), 9, 0), 0);
+        let mut scroll = task_scroll(&positions, &ends, Some(3), 9, 0);
+        assert_eq!(scroll, 3);
+        for selected in 4..positions.len() {
+            scroll = task_scroll(&positions, &ends, Some(selected), 9, scroll);
+            assert!(positions[selected] >= scroll);
+            assert!(ends[selected] <= scroll + 9);
+        }
     }
 
     #[test]
-    fn task_scroll_keeps_selection_visible_in_tiny_viewport() {
+    fn tiny_viewports_disable_margins_but_keep_the_selection_visible() {
         let positions = vec![0, 3, 6, 9, 12];
-        assert_eq!(task_scroll(&positions, Some(0), 5), 0);
+        let ends = vec![3, 6, 9, 12, 15];
+        let mut scroll = 0;
+        for selected in 0..positions.len() {
+            scroll = task_scroll(&positions, &ends, Some(selected), 5, scroll);
+            assert!(positions[selected] >= scroll);
+            assert!(ends[selected] <= scroll + 5);
+        }
+        let tall = [0];
+        let tall_end = [50];
+        assert_eq!(task_scroll(&tall, &tall_end, Some(0), 10, 99), 0);
     }
 }

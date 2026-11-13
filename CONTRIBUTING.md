@@ -37,6 +37,14 @@ tokens, personal databases, or terminal recordings containing private tasks.
 Please describe user-visible behavior changes and any database migration in the
 pull request.
 
+Schema versions 11–12 add local completed-task visibility and alphabetical-sort
+preferences keyed by view type and ID. The former global flags are discarded
+because they cannot identify the project where they were enabled; unset views
+default to hidden completed tasks and Todoist order. Task caches, outbox entries,
+and global label-grouping preference are preserved. Project/filter ID remapping
+and canonical Inbox reconciliation transfer both scoped preferences in the same
+transaction, retaining explicit canonical destination choices.
+
 ## Architecture
 
 - `main.rs` owns terminal setup and the adaptive event loop. Input must remain
@@ -58,6 +66,20 @@ Keep hot navigation paths allocation-light. Project movement should update the
 title immediately and defer database-backed task loading through the existing
 debounce. Prefer one SQLite connection per logical store operation and keep
 remote work in the synchronization thread.
+
+Filter refresh cadence is separate from freshness: successful outbox uploads and
+manual sync invalidate favorite-filter membership immediately. Keep that request
+pending through failed pushes/pulls and server backoff; periodic syncs alone use
+the minute timer. Prioritize the selected filter, publish core/filter progress
+before completed-history import finishes, and preserve UI selection and deferred
+navigation when consuming it. History keeps its own persisted 15-minute success
+or failure cooldown. Regression tests use gated mock responses to check visible
+updates while the worker is still running, without sleeping for a polling minute.
+Use the same outbox eligibility predicate for claiming and auxiliary yield
+checks so quarantined operations do not starve unrelated filter refreshes.
+Filter commits validate their query/favorite snapshot in the membership
+transaction. Incomplete passes retain invalidation rather than advancing the
+polling timer, and per-filter warnings survive interruption and restart.
 
 The Todoist ordering migration is described in
 [docs/ordering-migration.md](docs/ordering-migration.md), including API contracts,

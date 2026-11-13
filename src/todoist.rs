@@ -52,6 +52,12 @@ struct Page<T> {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct AuxiliaryRefresh {
+    pub warnings: Vec<String>,
+    pub filters_complete: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TodoistClient {
     http: Client,
@@ -978,49 +984,92 @@ impl TodoistClient {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn pull_auxiliary(&self, store: &Store) -> Result<Vec<String>> {
-        let mut warnings = Vec::new();
+        self.pull_auxiliary_with_progress(store, None, || false, |_| {})
+            .map(|refresh| refresh.warnings)
+    }
+
+    pub fn pull_auxiliary_with_progress(
+        &self,
+        store: &Store,
+        preferred_filter: Option<&str>,
+        should_yield: impl Fn() -> bool,
+        mut filter_ready: impl FnMut(&str),
+    ) -> Result<AuxiliaryRefresh> {
+        initialize_auxiliary_warnings(store)?;
+        let mut filters_complete = true;
         // Each filter is isolated: an unsupported query cannot fail the full refresh.
-        for filter in store.favorite_filters()? {
-            if store.outbox_len()? > 0 {
-                return Ok(warnings);
+        let mut filters = store.favorite_filters()?;
+        filters.sort_by_key(|filter| Some(filter.id.as_str()) != preferred_filter);
+        for filter in filters {
+            if store.has_uploadable_changes()? || should_yield() {
+                return auxiliary_refresh_report(store, false);
             }
-            match self.filtered_tasks(&filter.query, store) {
-                Ok(Some(tasks)) => store.replace_filter_membership(&filter.id, &tasks)?,
-                Ok(None) => return Ok(warnings),
+            let response = match self.filtered_tasks_yielding(&filter.query, store, &should_yield) {
+                Err(error) if retry_delay(&error).is_some() => return Err(error),
+                response => response,
+            };
+            if store.has_uploadable_changes()? || should_yield() {
+                return auxiliary_refresh_report(store, false);
+            }
+            if !store.filter(&filter.id)?.is_some_and(|current| {
+                current.id == filter.id && current.query == filter.query && current.is_favorite
+            }) {
+                filters_complete = false;
+                continue;
+            }
+            match response {
+                Ok(Some(tasks)) => {
+                    if !store.replace_filter_membership_for_query(
+                        &filter.id,
+                        &filter.query,
+                        &tasks,
+                    )? {
+                        filters_complete = false;
+                        continue;
+                    }
+                    store.set_meta(&filter_warning_key(&filter.id), "")?;
+                    filter_ready(&filter.id);
+                }
+                Ok(None) => return auxiliary_refresh_report(store, false),
                 Err(error) => {
                     if retry_delay(&error).is_some() {
                         return Err(error);
                     }
-                    warnings.push(format!("Filter ‘{}’ is stale: {error:#}", filter.name));
+                    store.set_meta(
+                        &filter_warning_key(&filter.id),
+                        &format!("Filter ‘{}’ is stale: {error:#}", filter.name),
+                    )?;
                 }
             }
         }
+        if filters_complete {
+            store.set_meta("auxiliary_legacy_warning", "")?;
+        }
         // Completed history is an auxiliary view. Keep normal synchronization
         // healthy if an account or server does not expose this endpoint.
-        if store.outbox_len()? > 0 {
-            return Ok(warnings);
+        if store.has_uploadable_changes()? || should_yield() {
+            return auxiliary_refresh_report(store, filters_complete);
         }
         let previous = store
             .meta("completed_history_refresh")?
             .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok());
-        if previous.is_some_and(|date| {
-            Utc::now().signed_duration_since(date) < ChronoDuration::minutes(15)
-        }) {
-            // Preserve any history warning until a history request actually
-            // succeeds, rather than clearing it on a filter-only refresh.
-            if let Some(warning) = store
-                .meta("completed_history_warning")?
-                .filter(|value| !value.is_empty())
-            {
-                warnings.push(warning);
-            }
-            return Ok(warnings);
+        let failed = store
+            .meta("completed_history_failed_refresh")?
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok());
+        if [previous, failed]
+            .into_iter()
+            .flatten()
+            .any(|date| Utc::now().signed_duration_since(date) < ChronoDuration::minutes(15))
+        {
+            return auxiliary_refresh_report(store, filters_complete);
         }
-        match self.recent_completed_tasks(store) {
+        match self.recent_completed_tasks_yielding(store, &should_yield) {
             Ok(Some(tasks)) => {
                 store.merge_completed_tasks(&tasks)?;
                 store.set_meta("completed_history_refresh", &Utc::now().to_rfc3339())?;
+                store.set_meta("completed_history_failed_refresh", "")?;
                 store.set_meta("completed_history_warning", "")?;
             }
             Ok(None) => {}
@@ -1029,14 +1078,23 @@ impl TodoistClient {
                     return Err(error);
                 }
                 let warning = format!("Completed history is stale: {error:#}");
+                store.set_meta("completed_history_failed_refresh", &Utc::now().to_rfc3339())?;
                 store.set_meta("completed_history_warning", &warning)?;
-                warnings.push(warning);
             }
         }
-        Ok(warnings)
+        auxiliary_refresh_report(store, filters_complete)
     }
 
+    #[cfg(test)]
     fn recent_completed_tasks(&self, store: &Store) -> Result<Option<Vec<RemoteTask>>> {
+        self.recent_completed_tasks_yielding(store, || false)
+    }
+
+    fn recent_completed_tasks_yielding(
+        &self,
+        store: &Store,
+        should_yield: impl Fn() -> bool,
+    ) -> Result<Option<Vec<RemoteTask>>> {
         let until = Utc::now();
         let previous = store
             .meta("completed_history_refresh")?
@@ -1050,7 +1108,7 @@ impl TodoistClient {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            if store.outbox_len()? > 0 {
+            if store.has_uploadable_changes()? || should_yield() {
                 return Ok(None);
             }
             let mut request = self
@@ -1079,12 +1137,22 @@ impl TodoistClient {
         Ok(Some(all))
     }
 
+    #[cfg(test)]
     fn filtered_tasks(&self, query: &str, store: &Store) -> Result<Option<Vec<RemoteTask>>> {
+        self.filtered_tasks_yielding(query, store, || false)
+    }
+
+    fn filtered_tasks_yielding(
+        &self,
+        query: &str,
+        store: &Store,
+        should_yield: impl Fn() -> bool,
+    ) -> Result<Option<Vec<RemoteTask>>> {
         let query = assignment_negation_compat_query(query);
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            if store.outbox_len()? > 0 {
+            if store.has_uploadable_changes()? || should_yield() {
                 return Ok(None);
             }
             let mut request = self
@@ -1105,6 +1173,48 @@ impl TodoistClient {
         }
         Ok(Some(all))
     }
+}
+
+fn filter_warning_key(id: &str) -> String {
+    format!("filter_refresh_warning:{id}")
+}
+
+fn initialize_auxiliary_warnings(store: &Store) -> Result<()> {
+    if store.meta("filter_warning_state_initialized")?.is_none() {
+        // Keep warnings written by older releases until a complete filter pass
+        // replaces the combined snapshot with independently tracked results.
+        if let Some(previous) = store
+            .meta("auxiliary_warning")?
+            .filter(|warning| !warning.is_empty())
+        {
+            store.set_meta("auxiliary_legacy_warning", &previous)?;
+        }
+        store.set_meta("filter_warning_state_initialized", "true")?;
+    }
+    Ok(())
+}
+
+fn auxiliary_refresh_report(store: &Store, filters_complete: bool) -> Result<AuxiliaryRefresh> {
+    let mut warnings = Vec::new();
+    for filter in store.favorite_filters()? {
+        if let Some(warning) = store
+            .meta(&filter_warning_key(&filter.id))?
+            .filter(|warning| !warning.is_empty())
+        {
+            warnings.push(warning);
+        }
+    }
+    for key in ["completed_history_warning", "auxiliary_legacy_warning"] {
+        if let Some(warning) = store.meta(key)?.filter(|warning| !warning.is_empty())
+            && !warnings.contains(&warning)
+        {
+            warnings.push(warning);
+        }
+    }
+    Ok(AuxiliaryRefresh {
+        warnings,
+        filters_complete,
+    })
 }
 
 fn checkpoint_object(entry: &OutboxEntry) -> Value {
@@ -1309,6 +1419,7 @@ mod tests {
         requests: mpsc::Receiver<String>,
         stop: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
+        gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
     }
 
     impl MockApi {
@@ -1321,6 +1432,8 @@ mod tests {
             let (tx, requests) = mpsc::channel();
             let queued = responses.clone();
             let stopped = stop.clone();
+            let gate = Arc::new(Mutex::new(None::<mpsc::Receiver<()>>));
+            let response_gate = gate.clone();
             let worker = thread::spawn(move || {
                 while !stopped.load(Ordering::Acquire) {
                     let (mut stream, _) = match listener.accept() {
@@ -1358,7 +1471,11 @@ mod tests {
                             }
                         }
                     }
+                    let paused = response_gate.lock().unwrap().take();
                     tx.send(String::from_utf8(request).unwrap()).unwrap();
+                    if let Some(paused) = paused {
+                        let _ = paused.recv_timeout(Duration::from_secs(5));
+                    }
                     let (status, body, retry) = queued
                         .lock()
                         .unwrap()
@@ -1379,6 +1496,7 @@ mod tests {
                 requests,
                 stop,
                 worker: Some(worker),
+                gate,
             }
         }
         fn respond(&self, status: u16, body: Value) {
@@ -1392,6 +1510,11 @@ mod tests {
         }
         fn request(&self) -> String {
             self.requests.recv_timeout(Duration::from_secs(3)).unwrap()
+        }
+        fn pause_next_response(&self) -> mpsc::Sender<()> {
+            let (sender, receiver) = mpsc::channel();
+            *self.gate.lock().unwrap() = Some(receiver);
+            sender
         }
     }
     impl Drop for MockApi {
@@ -2063,6 +2186,645 @@ mod tests {
         }
     }
 
+    fn filter_sync_fixture() -> (tempfile::TempDir, Store, RemoteTask) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("filters.db")).unwrap();
+        let task = serde_json::from_value::<RemoteTask>(
+            json!({"id":"task","project_id":"inbox","content":"Task"}),
+        )
+        .unwrap();
+        let filter = serde_json::from_value::<RemoteFilter>(
+            json!({"id":"filter","name":"Matches","query":"@match","is_favorite":true}),
+        )
+        .unwrap();
+        store
+            .merge_remote(&[], std::slice::from_ref(&task), &[], &[filter])
+            .unwrap();
+        store.set_sync_token("cached").unwrap();
+        (dir, store, task)
+    }
+
+    #[test]
+    fn local_uploads_and_manual_sync_refresh_filters_inside_the_periodic_minute() {
+        use crate::{
+            model::NavId,
+            sync::{SyncEvent, SyncManager},
+        };
+        let api = MockApi::new();
+        let (_dir, store, mut task) = filter_sync_fixture();
+        store.update_labels("task", &["match".into()]).unwrap();
+        let entry = store.next_outbox().unwrap().unwrap();
+        task.labels = vec!["match".into()];
+        api.respond(200, json!({"user":{"id":"account"}}));
+        api.command(&entry.uuid);
+        api.respond(200, json!({"sync_token":"after-upload","items":[task]}));
+        api.respond(200, json!({"results":[task],"next_cursor":null}));
+        // This helper puts periodic refresh an hour in the future. A real
+        // successful upload must still invalidate cached filter membership.
+        let manager = SyncManager::with_test_client(store.clone(), api.client.clone());
+        assert!(manager.start());
+        assert!(matches!(
+            wait_for_sync(&manager),
+            SyncEvent::Finished { pending: 0 }
+        ));
+        assert_eq!(
+            store
+                .tasks_for(&NavId::Filter("filter".into()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(api.request().contains("resource_types="));
+        assert!(api.request().contains("commands="));
+        assert!(api.request().contains("sync_token="));
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+
+        // An idle sync still uses the periodic cadence.
+        api.respond(200, json!({"sync_token":"idle"}));
+        assert!(manager.start());
+        assert!(matches!(
+            wait_for_sync(&manager),
+            SyncEvent::Finished { pending: 0 }
+        ));
+        assert!(api.request().contains("sync_token="));
+        assert!(api.requests.try_recv().is_err());
+
+        // Explicit refresh ignores only the local cadence, even without writes.
+        manager.request_filter_refresh();
+        api.respond(200, json!({"sync_token":"manual","items":[{"id":"task","project_id":"inbox","content":"Task","labels":[]}]}));
+        api.respond(200, json!({"results":[],"next_cursor":null}));
+        assert!(manager.start());
+        assert!(matches!(
+            wait_for_sync(&manager),
+            SyncEvent::Finished { pending: 0 }
+        ));
+        assert!(
+            store
+                .tasks_for(&NavId::Filter("filter".into()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!manager.filter_refresh_pending());
+        assert!(api.request().contains("sync_token="));
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn manual_refresh_during_active_sync_updates_the_filter_before_history_and_repeats_a_late_request()
+     {
+        use crate::{
+            app::{App, Overlay, SyncStatus},
+            keymap::KeyBindings,
+            model::{NavId, NavRow},
+            sync::SyncManager,
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let api = MockApi::new();
+        let (dir, store, mut task) = filter_sync_fixture();
+        store
+            .set_completed_task_visibility(&NavId::Filter("filter".into()), true)
+            .unwrap();
+        let mut app = App::new(
+            store.clone(),
+            SyncManager::new(store.clone(), None).unwrap(),
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.nav_cursor = app
+            .nav_rows
+            .iter()
+            .position(|row| matches!(row,NavRow::Item{id:NavId::Filter(id),..} if id=="filter"))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.tasks.is_empty());
+        app.sync = SyncManager::with_test_client(store.clone(), api.client.clone());
+        store.set_meta("completed_history_refresh", "").unwrap();
+        task.labels = vec!["match".into()];
+        api.respond(200, json!({"user":{"id":"account"}}));
+        api.respond(200, json!({"sync_token":"core","items":[task]}));
+        api.respond(200, json!({"results":[task],"next_cursor":null}));
+        api.respond(
+            200,
+            json!({"items":[],"next_cursor":"old-import-next-page"}),
+        );
+        let account = api.pause_next_response();
+        assert!(app.sync.start());
+        assert!(api.request().contains("resource_types="));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.sync.filter_refresh_pending());
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+            .unwrap();
+        let core = api.pause_next_response();
+        account.send(()).unwrap();
+        assert!(api.request().contains("sync_token="));
+        let filter = api.pause_next_response();
+        core.send(()).unwrap();
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        let history = api.pause_next_response();
+        filter.send(()).unwrap();
+        assert!(
+            api.request()
+                .starts_with("GET /tasks/completed/by_completion_date?")
+        );
+        app.tick().unwrap();
+        assert!(app.sync.is_running());
+        assert_eq!(app.sync_status, SyncStatus::Syncing);
+        assert_eq!(app.selected_task().unwrap().id, "task");
+        assert!(app.show_completed_tasks);
+        assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
+        assert!(app.nav_rows.iter().any(
+            |row| matches!(row,NavRow::Item{id:NavId::Filter(id),count:1,..} if id=="filter")
+        ));
+
+        // A request after the current filter phase must not be lost at Finish.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.sync.start());
+        api.respond(200, json!({"sync_token":"late-manual","items":[{"id":"task","project_id":"inbox","content":"Task","labels":[]}]}));
+        api.respond(200, json!({"results":[],"next_cursor":null}));
+        api.respond(200, json!({"items":[],"next_cursor":null}));
+        history.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            app.tick().unwrap();
+            if app.sync_status == SyncStatus::Synced && !app.sync.is_running() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "app did not finish filter refresh: {:?}",
+                app.sync_issue
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.tasks.is_empty());
+        assert!(app.show_completed_tasks);
+        assert!(!app.sync.filter_refresh_pending());
+        assert!(api.request().contains("sync_token="));
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        let resumed_history = api.request();
+        assert!(resumed_history.starts_with("GET /tasks/completed/by_completion_date?"));
+        assert!(!resumed_history.contains("old-import-next-page"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_late_manual_refresh_yields_an_old_paginated_filter_without_publishing_partial_membership()
+    {
+        use crate::{
+            model::NavId,
+            sync::{SyncEvent, SyncManager},
+        };
+        let api = MockApi::new();
+        let (_dir, store, mut task) = filter_sync_fixture();
+        let previous=serde_json::from_value::<RemoteTask>(json!({"id":"previous","project_id":"inbox","content":"Cached result","labels":["match"]})).unwrap();
+        store
+            .replace_filter_membership("filter", std::slice::from_ref(&previous))
+            .unwrap();
+        task.labels = vec!["match".into()];
+        api.respond(200, json!({"user":{"id":"account"}}));
+        api.respond(200, json!({"sync_token":"first","items":[task]}));
+        api.respond(
+            200,
+            json!({"results":[task],"next_cursor":"cancelled-next-page"}),
+        );
+        let manager = SyncManager::with_test_client(store.clone(), api.client.clone());
+        manager.request_filter_refresh();
+        let account = api.pause_next_response();
+        assert!(manager.start());
+        assert!(api.request().contains("resource_types="));
+        let core = api.pause_next_response();
+        account.send(()).unwrap();
+        assert!(api.request().contains("sync_token="));
+        let page = api.pause_next_response();
+        core.send(()).unwrap();
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        manager.request_filter_refresh();
+        page.send(()).unwrap();
+        assert!(matches!(
+            wait_for_sync(&manager),
+            SyncEvent::Finished { pending: 0 }
+        ));
+        assert!(manager.filter_refresh_pending());
+        assert_eq!(
+            store.tasks_for(&NavId::Filter("filter".into())).unwrap()[0].id,
+            "previous"
+        );
+        assert!(api.requests.try_recv().is_err());
+        api.respond(200, json!({"sync_token":"fresh"}));
+        api.respond(200, json!({"results":[previous,task],"next_cursor":null}));
+        assert!(manager.start());
+        assert!(matches!(
+            wait_for_sync(&manager),
+            SyncEvent::Finished { pending: 0 }
+        ));
+        assert_eq!(
+            store
+                .tasks_for(&NavId::Filter("filter".into()))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(api.request().contains("sync_token="));
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn active_filter_refresh_is_prioritized_before_a_failing_earlier_favorite() {
+        use crate::{
+            model::NavId,
+            sync::{SyncEvent, SyncManager},
+        };
+        let api = MockApi::new();
+        let (_dir, store, mut task) = filter_sync_fixture();
+        let earlier=serde_json::from_value::<RemoteFilter>(json!({"id":"earlier","name":"Earlier","query":"@broken","is_favorite":true,"item_order":-1})).unwrap();
+        store.merge_remote(&[], &[], &[], &[earlier]).unwrap();
+        task.labels = vec!["match".into()];
+        api.respond(200, json!({"user":{"id":"account"}}));
+        api.respond(200, json!({"sync_token":"current","items":[task]}));
+        api.respond(200, json!({"results":[task],"next_cursor":null}));
+        api.respond(400, json!({"error":"Unsupported earlier favorite"}));
+        let manager = SyncManager::with_test_client(store.clone(), api.client.clone());
+        manager.prefer_filter(Some("filter"));
+        manager.request_filter_refresh();
+        assert!(manager.start());
+        assert!(matches!(
+            wait_for_sync(&manager),
+            SyncEvent::Finished { pending: 0 }
+        ));
+        assert!(api.request().contains("resource_types="));
+        assert!(api.request().contains("sync_token="));
+        assert!(api.request().contains("query=%40match"));
+        assert!(api.request().contains("query=%40broken"));
+        assert_eq!(
+            store
+                .tasks_for(&NavId::Filter("filter".into()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .meta("auxiliary_warning")
+                .unwrap()
+                .unwrap()
+                .contains("Earlier")
+        );
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn uploaded_change_keeps_filter_refresh_pending_if_the_following_pull_fails() {
+        use crate::sync::{SyncEvent, SyncManager};
+        let api = MockApi::new();
+        let (_dir, store, _task) = filter_sync_fixture();
+        store.update_labels("task", &["match".into()]).unwrap();
+        let entry = store.next_outbox().unwrap().unwrap();
+        api.respond(200, json!({"user":{"id":"account"}}));
+        api.command(&entry.uuid);
+        api.respond(500, json!({"error":"Pull temporarily unavailable"}));
+        let manager = SyncManager::with_test_client(store.clone(), api.client.clone());
+        assert!(manager.start());
+        assert!(matches!(wait_for_sync(&manager), SyncEvent::Failed { .. }));
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert!(manager.filter_refresh_pending());
+        assert!(api.request().contains("resource_types="));
+        assert!(api.request().contains("commands="));
+        assert!(api.request().contains("sync_token="));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn rate_limited_filter_refresh_retries_after_backoff_without_waiting_for_the_minute() {
+        use crate::{
+            model::NavId,
+            sync::{SyncEvent, SyncManager},
+        };
+        let api = MockApi::new();
+        let (_dir, store, mut task) = filter_sync_fixture();
+        let previous=serde_json::from_value::<RemoteTask>(json!({"id":"previous","project_id":"inbox","content":"Previously cached","labels":["match"]})).unwrap();
+        store
+            .replace_filter_membership("filter", std::slice::from_ref(&previous))
+            .unwrap();
+        task.labels = vec!["match".into()];
+        let manager = SyncManager::with_test_client(store.clone(), api.client.clone());
+        manager.request_filter_refresh();
+        api.respond(200, json!({"user":{"id":"account"}}));
+        api.respond(200, json!({"sync_token":"first","items":[task]}));
+        api.responses
+            .lock()
+            .unwrap()
+            .push_back((429, json!({"error":"Rate limited"}), Some(1)));
+        let account = api.pause_next_response();
+        assert!(manager.start());
+        assert!(api.request().contains("resource_types="));
+        let core = api.pause_next_response();
+        account.send(()).unwrap();
+        assert!(api.request().contains("sync_token="));
+        let filter = api.pause_next_response();
+        core.send(()).unwrap();
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        // A newer explicit request must not swallow this response's backoff
+        // when it causes the old auxiliary pass to yield.
+        manager.request_filter_refresh();
+        filter.send(()).unwrap();
+        assert!(matches!(wait_for_sync(&manager), SyncEvent::Failed { .. }));
+        assert!(manager.filter_refresh_pending());
+        assert_eq!(
+            store.tasks_for(&NavId::Filter("filter".into())).unwrap()[0].id,
+            "previous"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while !manager.retry_after().is_zero() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retry deadline did not expire"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        api.respond(200, json!({"sync_token":"retry","items":[task]}));
+        api.respond(200, json!({"results":[previous,task],"next_cursor":null}));
+        assert!(manager.start());
+        assert!(matches!(
+            wait_for_sync(&manager),
+            SyncEvent::Finished { pending: 0 }
+        ));
+        assert_eq!(
+            store
+                .tasks_for(&NavId::Filter("filter".into()))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!manager.filter_refresh_pending());
+        assert!(api.request().contains("sync_token="));
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn eager_filter_refresh_does_not_repeatedly_retry_failed_completed_history() {
+        let api = MockApi::new();
+        let (dir, store, _task) = filter_sync_fixture();
+        api.respond(200, json!({"results":[],"next_cursor":null}));
+        api.respond(404, json!({"error":"History is unavailable"}));
+        let warnings = api.client.pull_auxiliary(&store).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Completed history is stale"));
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        assert!(
+            api.request()
+                .starts_with("GET /tasks/completed/by_completion_date?")
+        );
+        drop(store);
+        let store = Store::open(dir.path().join("filters.db")).unwrap();
+        api.respond(200, json!({"results":[],"next_cursor":null}));
+        assert_eq!(api.client.pull_auxiliary(&store).unwrap(), warnings);
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn interrupted_refresh_preserves_other_filter_and_history_warnings_after_restart() {
+        let api = MockApi::new();
+        let (dir, store, _task) = filter_sync_fixture();
+        let other=serde_json::from_value::<RemoteFilter>(json!({"id":"other-filter","name":"Other favorite","query":"@other","is_favorite":true,"item_order":1})).unwrap();
+        store.merge_remote(&[], &[], &[], &[other]).unwrap();
+        store
+            .set_meta("completed_history_refresh", &Utc::now().to_rfc3339())
+            .unwrap();
+        api.respond(400, json!({"error":"First filter failed"}));
+        api.respond(400, json!({"error":"Second filter failed"}));
+        assert_eq!(api.client.pull_auxiliary(&store).unwrap().len(), 2);
+        assert!(api.request().contains("query=%40match"));
+        assert!(api.request().contains("query=%40other"));
+        store
+            .set_meta(
+                "completed_history_warning",
+                "Previous history import is stale",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(dir.path().join("filters.db")).unwrap();
+        let interrupt = AtomicBool::new(false);
+        api.respond(200, json!({"results":[],"next_cursor":null}));
+        let refresh = api
+            .client
+            .pull_auxiliary_with_progress(
+                &store,
+                None,
+                || interrupt.load(Ordering::Acquire),
+                |_| interrupt.store(true, Ordering::Release),
+            )
+            .unwrap();
+        assert!(!refresh.filters_complete);
+        assert_eq!(refresh.warnings.len(), 2);
+        assert!(
+            refresh
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Second filter failed"))
+        );
+        assert!(
+            refresh
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Previous history import"))
+        );
+        assert!(
+            refresh
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("First filter failed"))
+        );
+        assert!(api.request().contains("query=%40match"));
+        assert!(api.requests.try_recv().is_err());
+        api.respond(200, json!({"results":[],"next_cursor":null}));
+        api.respond(200, json!({"results":[],"next_cursor":null}));
+        let warnings = api.client.pull_auxiliary(&store).unwrap();
+        assert_eq!(warnings, ["Previous history import is stale"]);
+        assert!(api.request().contains("query=%40match"));
+        assert!(api.request().contains("query=%40other"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn changed_filter_definition_keeps_the_refresh_pending_until_the_current_query_succeeds() {
+        use crate::{
+            model::NavId,
+            sync::{SyncEvent, SyncManager},
+        };
+        let api = MockApi::new();
+        let (_dir, store, task) = filter_sync_fixture();
+        let previous=serde_json::from_value::<RemoteTask>(json!({"id":"previous","project_id":"inbox","content":"Cached result","labels":["match"]})).unwrap();
+        store
+            .replace_filter_membership("filter", std::slice::from_ref(&previous))
+            .unwrap();
+        api.respond(200, json!({"user":{"id":"account"}}));
+        api.respond(200, json!({"sync_token":"old"}));
+        api.respond(200, json!({"results":[task],"next_cursor":null}));
+        let manager = SyncManager::with_test_client(store.clone(), api.client.clone());
+        manager.request_filter_refresh();
+        let account = api.pause_next_response();
+        assert!(manager.start());
+        assert!(api.request().contains("resource_types="));
+        let core = api.pause_next_response();
+        account.send(()).unwrap();
+        assert!(api.request().contains("sync_token="));
+        let result = api.pause_next_response();
+        core.send(()).unwrap();
+        assert!(api.request().contains("query=%40match"));
+        let updated = serde_json::from_value::<RemoteFilter>(
+            json!({"id":"filter","name":"Matches","query":"@other","is_favorite":true}),
+        )
+        .unwrap();
+        store.merge_remote(&[], &[], &[], &[updated]).unwrap();
+        result.send(()).unwrap();
+        assert!(matches!(
+            wait_for_sync(&manager),
+            SyncEvent::Finished { pending: 0 }
+        ));
+        assert!(manager.filter_refresh_pending());
+        assert_eq!(
+            store.tasks_for(&NavId::Filter("filter".into())).unwrap()[0].id,
+            "previous"
+        );
+        let fresh = json!({"id":"fresh","project_id":"inbox","content":"Current result","labels":["other"]});
+        api.respond(200, json!({"sync_token":"current"}));
+        api.respond(200, json!({"results":[fresh],"next_cursor":null}));
+        assert!(manager.start());
+        assert!(matches!(
+            wait_for_sync(&manager),
+            SyncEvent::Finished { pending: 0 }
+        ));
+        assert!(!manager.filter_refresh_pending());
+        assert_eq!(
+            store.tasks_for(&NavId::Filter("filter".into())).unwrap()[0].id,
+            "fresh"
+        );
+        assert!(api.request().contains("sync_token="));
+        assert!(api.request().contains("query=%40other"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn legacy_auxiliary_warning_is_retained_until_a_complete_filter_pass() {
+        let api = MockApi::new();
+        let (_dir, store, _task) = filter_sync_fixture();
+        store
+            .set_meta("auxiliary_warning", "Legacy cached filter warning")
+            .unwrap();
+        store
+            .set_meta("completed_history_refresh", &Utc::now().to_rfc3339())
+            .unwrap();
+        for _ in 0..2 {
+            let refresh = api
+                .client
+                .pull_auxiliary_with_progress(&store, None, || true, |_| {})
+                .unwrap();
+            assert!(!refresh.filters_complete);
+            assert_eq!(refresh.warnings, ["Legacy cached filter warning"]);
+        }
+        assert!(api.requests.try_recv().is_err());
+        api.respond(200, json!({"results":[],"next_cursor":null}));
+        assert!(api.client.pull_auxiliary(&store).unwrap().is_empty());
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn quarantined_changes_do_not_block_filters_for_an_unrelated_successful_upload() {
+        use crate::{
+            model::NavId,
+            sync::{SyncEvent, SyncManager},
+        };
+        let api = MockApi::new();
+        let (_dir, store, mut task) = filter_sync_fixture();
+        let blocked = serde_json::from_value::<RemoteTask>(
+            json!({"id":"blocked","project_id":"inbox","content":"Blocked","labels":["match"]}),
+        )
+        .unwrap();
+        let child=serde_json::from_value::<RemoteTask>(json!({"id":"child","project_id":"inbox","parent_id":"blocked","content":"Child","labels":["match"]})).unwrap();
+        store
+            .merge_remote(&[], &[blocked.clone(), child.clone()], &[], &[])
+            .unwrap();
+        store
+            .replace_filter_membership("filter", &[blocked.clone(), child.clone()])
+            .unwrap();
+        store.update_due("blocked", "invalid").unwrap();
+        let rejected = store.next_outbox().unwrap().unwrap();
+        store
+            .update_labels("blocked", &["Keep local edit".into()])
+            .unwrap();
+        store.set_task_parent("child", Some("blocked")).unwrap();
+        store.update_labels("task", &["match".into()]).unwrap();
+        let upload = store
+            .outbox()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.entity_id == "task")
+            .unwrap();
+        task.labels = vec!["match".into()];
+        api.respond(200, json!({"user":{"id":"account"}}));
+        api.respond(
+            200,
+            json!({"sync_status":{&rejected.uuid:{"http_code":400,"error":"Invalid due value"}}}),
+        );
+        api.command(&upload.uuid);
+        api.respond(
+            200,
+            json!({"sync_token":"current","items":[task,blocked,child]}),
+        );
+        api.respond(
+            200,
+            json!({"results":[task,blocked,child],"next_cursor":null}),
+        );
+        let manager = SyncManager::with_test_client(store.clone(), api.client.clone());
+        assert!(manager.start());
+        assert!(
+            matches!(wait_for_sync(&manager),SyncEvent::Failed{message,..} if message.contains("Invalid due value"))
+        );
+        assert!(!store.has_uploadable_changes().unwrap());
+        assert!(store.outbox_len().unwrap() > 0);
+        let members = store.tasks_for(&NavId::Filter("filter".into())).unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(
+            store.task("blocked").unwrap().unwrap().labels,
+            ["Keep local edit"]
+        );
+        assert_eq!(
+            store
+                .task("blocked")
+                .unwrap()
+                .unwrap()
+                .due
+                .unwrap()
+                .string
+                .as_deref(),
+            Some("invalid")
+        );
+        assert!(
+            store
+                .outbox_error()
+                .unwrap()
+                .unwrap()
+                .contains("Invalid due value")
+        );
+        assert!(api.request().contains("resource_types="));
+        assert!(api.request().contains(&rejected.uuid));
+        assert!(api.request().contains(&upload.uuid));
+        assert!(api.request().contains("sync_token="));
+        assert!(api.request().starts_with("GET /tasks/filter?"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
     #[test]
     fn background_worker_quarantines_a_rejection_pushes_unrelated_changes_and_recovers() {
         use crate::sync::{SyncEvent, SyncManager};
@@ -2125,7 +2887,9 @@ mod tests {
         assert!(manager.start());
         assert!(matches!(wait_for_sync(&manager), SyncEvent::Failed { .. }));
         assert!(manager.retry_after() > Duration::from_secs(110));
+        manager.request_filter_refresh();
         assert!(!manager.start());
+        assert!(manager.filter_refresh_pending());
         store
             .update_labels("task", &["Offline edit".into()])
             .unwrap();

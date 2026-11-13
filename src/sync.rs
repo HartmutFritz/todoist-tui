@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     store::Store,
-    todoist::{TodoistClient, permanent_rejection, retry_delay},
+    todoist::{AuxiliaryRefresh, TodoistClient, permanent_rejection, retry_delay},
 };
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,10 @@ pub enum SyncEvent {
     AuxiliaryWarning {
         message: String,
     },
+    FilterRefreshed {
+        filter_id: String,
+    },
+    DataRefreshed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +46,8 @@ pub struct SyncManager {
     rx: Receiver<SyncEvent>,
     retry: Arc<Mutex<RetryState>>,
     auxiliary_due: Arc<Mutex<Instant>>,
+    filter_refresh_requested: Arc<AtomicBool>,
+    preferred_filter: Arc<Mutex<Option<String>>>,
 }
 
 struct RetryState {
@@ -94,6 +100,8 @@ impl SyncManager {
                     .unwrap_or_else(Instant::now),
             })),
             auxiliary_due: Arc::new(Mutex::new(Instant::now())),
+            filter_refresh_requested: Arc::new(AtomicBool::new(false)),
+            preferred_filter: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -102,6 +110,24 @@ impl SyncManager {
     }
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
+    }
+
+    pub fn request_filter_refresh(&self) {
+        self.filter_refresh_requested.store(true, Ordering::Release);
+    }
+
+    pub fn filter_refresh_pending(&self) -> bool {
+        self.filter_refresh_requested.load(Ordering::Acquire)
+    }
+
+    pub fn prefer_filter(&self, id: Option<&str>) {
+        let mut preferred = self
+            .preferred_filter
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if preferred.as_deref() != id {
+            *preferred = id.map(str::to_owned);
+        }
     }
 
     pub fn start(&self) -> bool {
@@ -123,6 +149,9 @@ impl SyncManager {
         let tx = self.tx.clone();
         let retry = self.retry.clone();
         let auxiliary_due = self.auxiliary_due.clone();
+        let filter_refresh_requested = self.filter_refresh_requested.clone();
+        let preferred_filter = self.preferred_filter.clone();
+        let refresh_epoch = Instant::now();
         let _ = tx.send(SyncEvent::Started);
         let worker = thread::Builder::new()
             .name("todoist-tui-sync".into())
@@ -146,26 +175,69 @@ impl SyncManager {
                             } else {
                                 return Err(error);
                             }
+                        } else {
+                            // Retain invalidation if a later push/pull fails;
+                            // the retry may otherwise have an empty outbox.
+                            filter_refresh_requested.store(true, Ordering::Release);
                         }
                     }
                     client.pull(&store)?;
-                    if store.outbox_len()? == 0
-                        && Instant::now()
-                            >= *auxiliary_due
+                    let _ = tx.send(SyncEvent::DataRefreshed);
+                    let uploads_waiting = store.has_uploadable_changes()?;
+                    let requested =
+                        !uploads_waiting && filter_refresh_requested.swap(false, Ordering::AcqRel);
+                    if !uploads_waiting
+                        && (requested
+                            || Instant::now()
+                                >= *auxiliary_due
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner()))
+                    {
+                        let result = (|| -> anyhow::Result<AuxiliaryRefresh> {
+                            let preferred = preferred_filter
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner())
-                    {
-                        let warnings = client.pull_auxiliary(&store)?;
-                        store.set_meta("auxiliary_warning", &warnings.join("\n\n"))?;
-                        // Membership is cheap enough to refresh every minute;
-                        // immediate task pushes never wait for another history scan.
-                        *auxiliary_due
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner()) =
-                            Instant::now() + Duration::from_secs(60);
-                        if !warnings.is_empty() {
+                                .clone();
+                            let preferred = preferred
+                                .map(|id| {
+                                    store
+                                        .filter(&id)
+                                        .map(|filter| filter.map(|filter| filter.id))
+                                })
+                                .transpose()?
+                                .flatten();
+                            let refresh = client.pull_auxiliary_with_progress(
+                                &store,
+                                preferred.as_deref(),
+                                || filter_refresh_requested.load(Ordering::Acquire),
+                                |id| {
+                                    let _ = tx.send(SyncEvent::FilterRefreshed {
+                                        filter_id: id.into(),
+                                    });
+                                },
+                            )?;
+                            store.set_meta("auxiliary_warning", &refresh.warnings.join("\n\n"))?;
+                            Ok(refresh)
+                        })();
+                        if result.is_err() {
+                            // Retry a rate-limited/failed explicit refresh after
+                            // backoff, even if the periodic deadline is later.
+                            filter_refresh_requested.store(true, Ordering::Release);
+                        }
+                        let refresh = result?;
+                        // Only idle polling is minute-throttled. Successful
+                        // local writes and explicit refreshes bypass this timer.
+                        if refresh.filters_complete {
+                            *auxiliary_due
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) =
+                                refresh_epoch + Duration::from_secs(60);
+                        } else {
+                            filter_refresh_requested.store(true, Ordering::Release);
+                        }
+                        if !refresh.warnings.is_empty() {
                             let _ = tx.send(SyncEvent::AuxiliaryWarning {
-                                message: warnings.join("\n\n"),
+                                message: refresh.warnings.join("\n\n"),
                             });
                         }
                     }
@@ -251,6 +323,13 @@ impl SyncManager {
     pub fn with_test_client(store: Store, client: TodoistClient) -> Self {
         let mut manager = Self::new(store, None).unwrap();
         manager.client = Some(client);
+        manager
+            .store
+            .set_meta(
+                "completed_history_refresh",
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
         *manager.auxiliary_due.lock().unwrap() = Instant::now() + Duration::from_secs(3600);
         manager
     }

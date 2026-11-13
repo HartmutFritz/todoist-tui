@@ -74,7 +74,7 @@ and could lose server-only comments or attachments.
   Unsupported key formats or inconsistent/colliding anchors produce an error
   before sending guessed replacements. There is no invented length limit or
   client-side rebalance policy.
-- Database version 10 stores raw server keys and scope identifiers in
+- Database version 10 introduced raw server keys and scope identifiers in
   `order_meta`, alongside local display ordinals. Task sections, project folders,
   section order, and filter order are cached. Workspace folders are fetched with
   pagination in the background when needed for allocation.

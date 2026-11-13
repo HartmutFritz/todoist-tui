@@ -70,7 +70,9 @@ sync = ["r"]
 undo = ["u"]
 redo = ["ctrl+r"]
 toggle_label_grouping = ["shift+l"]
+# Current project/filter/Today/Upcoming only; saved separately across restarts.
 toggle_alphabetical_sort = ["shift+a"]
+# Current project/filter/Today/Upcoming only; saved separately across restarts.
 toggle_completed_tasks = ["shift+c"]
 toggle_hidden_projects = ["shift+i"]
 toggle_project_hidden = ["ctrl+i"]
