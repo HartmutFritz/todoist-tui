@@ -65,12 +65,13 @@ pub enum Action {
     Space8,
     Space9,
     EditLabels,
+    EditAssignee,
     Help,
     CloseDialog,
 }
 
 impl Action {
-    const ALL: [Self; 54] = [
+    const ALL: [Self; 55] = [
         Self::Down,
         Self::Up,
         Self::DownFive,
@@ -124,6 +125,7 @@ impl Action {
         Self::Space8,
         Self::Space9,
         Self::EditLabels,
+        Self::EditAssignee,
         Self::Help,
     ];
 }
@@ -225,6 +227,7 @@ struct BindingConfig {
     toggle_team: Vec<String>,
     toggle_third: Vec<String>,
     edit_labels: Vec<String>,
+    edit_assignee: Vec<String>,
     help: Vec<String>,
     close_dialog: Vec<String>,
 }
@@ -288,6 +291,7 @@ impl Default for BindingConfig {
             toggle_team: Vec::new(),
             toggle_third: Vec::new(),
             edit_labels: strings(&["@"]),
+            edit_assignee: strings(&["+"]),
             help: strings(&["?"]),
             close_dialog: strings(&["enter", "esc", "q"]),
         }
@@ -468,6 +472,7 @@ impl KeyBindings {
             (Action::Space8, config.space_8),
             (Action::Space9, config.space_9),
             (Action::EditLabels, config.edit_labels),
+            (Action::EditAssignee, config.edit_assignee),
             (Action::Help, config.help),
             (Action::CloseDialog, config.close_dialog),
         ];
@@ -670,6 +675,7 @@ impl Action {
             Self::Space8 => "space_8",
             Self::Space9 => "space_9",
             Self::EditLabels => "edit_labels",
+            Self::EditAssignee => "edit_assignee",
             Self::Help => "help",
             Self::CloseDialog => "close_dialog",
         }
@@ -1322,5 +1328,27 @@ mod tests {
     fn distributed_example_is_valid() {
         let file: FileConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
         KeyBindings::from_file_config(file).unwrap();
+    }
+
+    #[test]
+    fn assignee_plus_binding_is_configurable_and_participates_in_collision_checks() {
+        let plus = KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT);
+        assert_eq!(
+            KeyBindings::defaults().main_action(plus),
+            Some(Action::EditAssignee)
+        );
+        let file: FileConfig = toml::from_str("[keybindings]\nedit_assignee = ['ctrl++']").unwrap();
+        let keys = KeyBindings::from_file_config(file).unwrap();
+        assert_eq!(keys.main_action(plus), None);
+        assert_eq!(
+            keys.main_action(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::CONTROL)),
+            Some(Action::EditAssignee)
+        );
+        let collision: FileConfig = toml::from_str("[special_add]\n'+' = 'Work'").unwrap();
+        assert!(KeyBindings::from_file_config(collision).is_err());
+        let unbound: FileConfig =
+            toml::from_str("[keybindings]\nedit_assignee = []\n[special_add]\n'+' = 'Work'")
+                .unwrap();
+        assert!(KeyBindings::from_file_config(unbound).is_ok());
     }
 }

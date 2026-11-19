@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::model::{
     Due, Filter, INBOX_LOCAL_ID, NavId, NavRow, Operation, OutboxEntry, PROJECT_SPACE_COUNT,
-    Project, RemoteCollaborator, RemoteFilter, RemoteLabel, RemoteProject, RemoteTask, Task,
-    TaskOrder,
+    Project, RemoteCollaborator, RemoteCollaboratorState, RemoteFilter, RemoteLabel, RemoteProject,
+    RemoteTask, Task, TaskOrder,
 };
 
 #[path = "store_diagnostics.rs"]
@@ -113,6 +113,10 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS collaborators (
                id TEXT PRIMARY KEY, full_name TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS project_collaborators (
+               project_id TEXT NOT NULL, user_id TEXT NOT NULL,
+               PRIMARY KEY(project_id,user_id)
              );
              CREATE TABLE IF NOT EXISTS labels (
                id TEXT PRIMARY KEY, name TEXT NOT NULL, item_order INTEGER NOT NULL DEFAULT 0,
@@ -279,12 +283,11 @@ impl Store {
                 [],
             )?;
         }
-        tx.pragma_update(None, "user_version", 12)?;
+        tx.pragma_update(None, "user_version", 13)?;
         tx.commit()?;
-        if previous_schema_version < 8 {
-            // Older releases did not request collaborator resources or retain
-            // assignment IDs. An existing incremental token cannot backfill
-            // that data, so make the next pull a one-time full refresh.
+        if previous_schema_version < 13 {
+            // Backfill project collaborator membership for the offline assignee
+            // picker, without changing cached tasks or queued operations.
             conn.execute("UPDATE meta SET value='*' WHERE key='sync_token'", [])?;
         }
         compact_pending_due_updates(&conn)?;
@@ -525,10 +528,10 @@ impl Store {
         let conn = self.connect()?;
         if matches!(nav, NavId::Today | NavId::Upcoming) {
             let sql = if show_completed {
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
                  FROM tasks WHERE deleted=0 ORDER BY checked,child_order,id"
             } else {
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
                  FROM tasks WHERE checked=0 AND deleted=0 ORDER BY child_order,id"
             };
             let mut stmt = conn.prepare(sql)?;
@@ -564,17 +567,17 @@ impl Store {
         }
         let (sql, id) = match (nav, show_completed) {
             (NavId::Project(id), true) => (
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
                  FROM tasks WHERE project_id=?1 AND deleted=0 ORDER BY checked,child_order,id", id),
             (NavId::Filter(id), true) => (
-                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id
+                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id,t.responsible_uid
                  FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
                  WHERE ft.filter_id=?1 AND t.deleted=0 ORDER BY t.checked,t.child_order,t.id", id),
             (NavId::Project(id), false) => (
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
+                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
                  FROM tasks WHERE project_id=?1 AND checked=0 AND deleted=0 ORDER BY child_order,id", id),
             (NavId::Filter(id), false) => (
-                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id
+                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id,t.responsible_uid
                  FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
                  WHERE ft.filter_id=?1 AND t.checked=0 AND t.deleted=0 ORDER BY t.child_order,t.id", id),
             (NavId::Today | NavId::Upcoming, _) => unreachable!(),
@@ -590,7 +593,7 @@ impl Store {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,
-                    t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id,COALESCE(p.name,'Unknown project')
+                    t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id,COALESCE(p.name,'Unknown project'),t.responsible_uid
              FROM tasks t LEFT JOIN projects p ON p.id=t.project_id AND p.deleted=0
              WHERE t.deleted=0
              ORDER BY t.checked,lower(t.content),t.child_order,t.id",
@@ -1075,6 +1078,69 @@ impl Store {
         Ok(())
     }
 
+    pub fn project_collaborators(&self, project_id: &str) -> Result<Vec<RemoteCollaborator>> {
+        let conn = self.connect()?;
+        let id = resolve_project_id_from(&conn, project_id)?.unwrap_or_else(|| project_id.into());
+        collaborators_for_project(&conn, &id)
+    }
+
+    pub fn collaborator_name(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .connect()?
+            .query_row(
+                "SELECT full_name FROM collaborators WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn update_assignee(&self, id: &str, responsible_uid: Option<&str>) -> Result<bool> {
+        let conn = self.connect()?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let id = resolve_task_id_from(&tx, id)?.unwrap_or_else(|| id.into());
+        let task = task_from(&tx, &id)?.context("selected task no longer exists")?;
+        let project =
+            project_from(&tx, &task.project_id)?.context("task project no longer exists")?;
+        anyhow::ensure!(
+            project.can_assign_tasks || project.is_shared || project.workspace_id.is_some(),
+            "Assignees are available only in team or shared projects"
+        );
+        let assignee = if let Some(uid) = responsible_uid {
+            Some(collaborators_for_project(&tx, &task.project_id)?.into_iter()
+                .find(|person| person.id == uid).context("Collaborator is no longer available in this project; synchronize and retry")?)
+        } else {
+            None
+        };
+        let rejected: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind')='update_assignee')",
+            [&id], |row| row.get(0))?;
+        if task.responsible_uid.as_deref() == responsible_uid
+            && !rejected
+            && !has_pending_assignee_edit(&tx, &id)?
+        {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE tasks SET responsible_uid=?2,assignee_name=?3 WHERE id=?1",
+            params![
+                id,
+                responsible_uid,
+                assignee.as_ref().map(|person| &person.full_name)
+            ],
+        )?;
+        supersede_rejected_assignments(&tx, &id)?;
+        queue(
+            &tx,
+            &id,
+            Operation::UpdateAssignee {
+                responsible_uid: responsible_uid.map(str::to_owned),
+            },
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn set_task_completed(&self, id: &str, completed: bool) -> Result<()> {
         let conn = self.connect()?;
         let tx = conn.unchecked_transaction()?;
@@ -1169,7 +1235,7 @@ impl Store {
         {
             tx.execute(
                 "UPDATE tasks SET project_id=?2,content=?3,description=?4,labels_json=?5,
-                  due_json=?6,priority=?7,parent_id=?8,section_id=?9 WHERE id=?1",
+                  due_json=?6,priority=?7,parent_id=?8,section_id=?9,responsible_uid=?10,assignee_name=?11 WHERE id=?1",
                 params![
                     task.id,
                     task.project_id,
@@ -1180,6 +1246,8 @@ impl Store {
                     task.priority,
                     task.parent_id,
                     task.section_id,
+                    task.responsible_uid,
+                    task.assignee,
                 ],
             )?;
         }
@@ -1369,7 +1437,7 @@ impl Store {
         }
         tx.execute(
             "UPDATE tasks SET project_id=?2,content=?3,description=?4,labels_json=?5,
-             due_json=?6,priority=?7,child_order=?8,checked=?9,parent_id=?10,section_id=?11,deleted=0 WHERE id=?1",
+             due_json=?6,priority=?7,child_order=?8,checked=?9,parent_id=?10,section_id=?11,responsible_uid=?12,assignee_name=?13,deleted=0 WHERE id=?1",
             params![
                 id,
                 target_project_id,
@@ -1380,7 +1448,7 @@ impl Store {
                 target.priority,
                 target.child_order,
                 target.checked,
-                target_parent_id,target.section_id
+                target_parent_id,target.section_id,target.responsible_uid,target.assignee
             ],
         )?;
         if !target.checked {
@@ -1467,6 +1535,22 @@ impl Store {
                 },
             )?;
         }
+        // A pending Quick Edit may still resolve +name remotely after this undo.
+        // Queue a compensating assignment even when the IDs currently agree,
+        // and assign only once the task is back in its snapshot's project.
+        if current.responsible_uid != target.responsible_uid
+            || (current.project_id != target_project_id && target.responsible_uid.is_some())
+            || has_pending_assignee_edit(tx, &id)?
+        {
+            supersede_rejected_assignments(tx, &id)?;
+            queue(
+                tx,
+                &id,
+                Operation::UpdateAssignee {
+                    responsible_uid: target.responsible_uid.clone(),
+                },
+            )?;
+        }
         if !current.checked && target.checked {
             queue(
                 tx,
@@ -1521,7 +1605,7 @@ impl Store {
         let root = task_from(&conn, &id)?.context("selected task no longer exists")?;
         let mut stmt = conn.prepare(
             "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,
-                    checked,parent_id,assignee_name,section_id
+                    checked,parent_id,assignee_name,section_id,responsible_uid
              FROM tasks WHERE project_id=?1 AND deleted=0 ORDER BY child_order,id",
         )?;
         let project_tasks = stmt
@@ -1638,6 +1722,15 @@ impl Store {
                             priority: task.priority,
                         },
                     )?;
+                    if task.responsible_uid.is_some() {
+                        queue(
+                            &tx,
+                            &task.id,
+                            Operation::UpdateAssignee {
+                                responsible_uid: task.responsible_uid.clone(),
+                            },
+                        )?;
+                    }
                     if task.checked {
                         queue(
                             &tx,
@@ -1785,14 +1878,7 @@ impl Store {
             }
             let old_id =
                 resolve_task_id_from(&tx, &snapshot.id)?.unwrap_or_else(|| snapshot.id.clone());
-            let responsible_uid: Option<String> = tx
-                .query_row(
-                    "SELECT responsible_uid FROM tasks WHERE id=?1",
-                    [&old_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
+            let responsible_uid = snapshot.responsible_uid.clone();
             tx.execute(
                 "UPDATE tasks SET responsible_uid=?2 WHERE id=?1",
                 params![id, responsible_uid],
@@ -2154,6 +2240,7 @@ impl Store {
                 &entry.operation,
                 Operation::MoveTask { .. } | Operation::MoveTaskParent { .. }
             );
+            let rejected_assignment = matches!(&entry.operation, Operation::UpdateAssignee { .. });
             let mut checkpoint = if entry.checkpoint.is_object() {
                 entry.checkpoint
             } else {
@@ -2187,6 +2274,11 @@ impl Store {
             // to unblock only once the original move is definitely rejected.
             if rejected_move && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind') IN ('move_task','move_task_parent'))",params![entry.entity_id,seq],|row|row.get::<_,bool>(0))? {
                 supersede_rejected_task_moves(&tx,&entry.entity_id)?;
+            }
+            if rejected_assignment && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind')='update_assignee')",params![entry.entity_id,seq],|row|row.get::<_,bool>(0))? {
+                // Discard only this confirmed rejection; newer assignments and
+                // unrelated failed operations remain intact.
+                tx.execute("DELETE FROM outbox WHERE seq=?1", [seq])?;
             }
         }
         tx.commit()?;
@@ -2286,6 +2378,7 @@ impl Store {
             child_order: task.child_order,
             checked: task.checked || task.is_completed,
             assignee: assignee_name.clone(),
+            responsible_uid: task.responsible_uid.clone(),
             section_id: self
                 .task_order_section(&task.id)
                 .unwrap_or_else(|_| current.section_id.clone()),
@@ -2566,6 +2659,33 @@ impl Store {
                 "UPDATE tasks SET assignee_name=?2 WHERE responsible_uid=?1",
                 params![collaborator.id, collaborator.full_name],
             )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn merge_collaborator_states(
+        &self,
+        states: &[RemoteCollaboratorState],
+        full: bool,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        if full {
+            tx.execute("DELETE FROM project_collaborators", [])?;
+        }
+        for state in states {
+            if state.is_deleted || state.state != "active" {
+                tx.execute(
+                    "DELETE FROM project_collaborators WHERE project_id=?1 AND user_id=?2",
+                    params![state.project_id, state.user_id],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT OR IGNORE INTO project_collaborators(project_id,user_id) VALUES(?1,?2)",
+                    params![state.project_id, state.user_id],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -3093,7 +3213,7 @@ fn project_from(conn: &Connection, id: &str) -> Result<Option<Project>> {
 fn task_from(conn: &Connection, id: &str) -> Result<Option<Task>> {
     Ok(conn
         .query_row(
-            "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id
+             "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
              FROM tasks WHERE id=?1 AND deleted=0",
             [id],
             row_to_task,
@@ -3102,7 +3222,7 @@ fn task_from(conn: &Connection, id: &str) -> Result<Option<Task>> {
 }
 
 fn task_from_including_deleted(conn: &Connection, id: &str) -> Result<Option<Task>> {
-    Ok(conn.query_row("SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id FROM tasks WHERE id=?1", [id], row_to_task).optional()?)
+    Ok(conn.query_row("SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid FROM tasks WHERE id=?1", [id], row_to_task).optional()?)
 }
 
 fn preserve_pending_task_fields(
@@ -3165,7 +3285,10 @@ fn preserve_pending_task_fields(
             | Operation::RestoreRecurring { .. } => remote.due.clone_from(&local.due),
             Operation::UpdateLabels { .. } => remote.labels.clone_from(&local.labels),
             Operation::UpdatePriority { .. } => remote.priority = local.priority,
-            Operation::UpdateAssignee { .. } => remote.assignee.clone_from(&local.assignee),
+            Operation::UpdateAssignee { .. } => {
+                remote.assignee.clone_from(&local.assignee);
+                remote.responsible_uid.clone_from(&local.responsible_uid);
+            }
             Operation::MoveTask { .. } => {
                 remote.project_id.clone_from(&local.project_id);
                 remote.parent_id.clone_from(&local.parent_id);
@@ -3205,6 +3328,39 @@ fn collaborator_names(conn: &Connection) -> Result<HashMap<String, String>> {
     let mut stmt = conn.prepare("SELECT id,full_name FROM collaborators")?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn collaborators_for_project(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<RemoteCollaborator>> {
+    let mut statement = conn.prepare(
+        "SELECT c.id,c.full_name FROM collaborators c WHERE EXISTS (
+           SELECT 1 FROM project_collaborators p WHERE p.project_id=?1 AND p.user_id=c.id
+         ) OR c.id=(SELECT value FROM meta WHERE key='account_id') ORDER BY lower(c.full_name),c.id"
+    )?;
+    Ok(statement
+        .query_map([project_id], |row| {
+            Ok(RemoteCollaborator {
+                id: row.get(0)?,
+                full_name: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn supersede_rejected_assignments(tx: &Transaction<'_>, id: &str) -> Result<()> {
+    tx.execute("DELETE FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind')='update_assignee'", [id])?;
+    Ok(())
+}
+
+fn has_pending_assignee_edit(conn: &Connection, id: &str) -> Result<bool> {
+    let payloads = conn.prepare(
+        "SELECT payload FROM outbox WHERE entity_id=?1 AND json_extract(payload,'$.kind')='quick_edit'"
+    )?.query_map([id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(payloads.iter().any(|payload| {
+        matches!(serde_json::from_str::<Operation>(payload), Ok(Operation::QuickEdit { expression, .. }) if crate::model::contains_assignee(&expression))
+    }))
 }
 
 fn resolve_task_id_from(conn: &Connection, id: &str) -> Result<Option<String>> {
@@ -3370,6 +3526,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         checked: row.get(8)?,
         parent_id: row.get(9)?,
         assignee: row.get(10)?,
+        responsible_uid: optional_named_column(row, "responsible_uid")?,
         section_id: optional_named_column(row, "section_id")?,
     })
 }
@@ -3783,6 +3940,13 @@ fn remap_view_preference(
 
 fn rewrite_project_references(tx: &Transaction<'_>, old_id: &str, new_id: &str) -> Result<()> {
     remap_view_preference(tx, "project", old_id, new_id)?;
+    if old_id != new_id {
+        tx.execute("INSERT OR IGNORE INTO project_collaborators(project_id,user_id) SELECT ?2,user_id FROM project_collaborators WHERE project_id=?1", params![old_id,new_id])?;
+        tx.execute(
+            "DELETE FROM project_collaborators WHERE project_id=?1",
+            [old_id],
+        )?;
+    }
     let entries = tx
         .prepare("SELECT seq,payload FROM outbox ORDER BY seq")?
         .query_map([], |row| {
@@ -3935,6 +4099,246 @@ mod tests {
         Store::open(dir.join("test.db")).unwrap()
     }
 
+    fn assignment_store() -> Store {
+        let store = store();
+        store
+            .merge_remote(
+                &serde_json::from_value::<Vec<RemoteProject>>(serde_json::json!([
+                    {"id":"team","name":"Team","workspace_id":"workspace","can_assign_tasks":true}
+                ]))
+                .unwrap(),
+                &serde_json::from_value::<Vec<RemoteTask>>(serde_json::json!([
+                    {"id":"task","project_id":"team","content":"Task"}
+                ]))
+                .unwrap(),
+                &[],
+                &[],
+            )
+            .unwrap();
+        store
+            .merge_collaborators(
+                &serde_json::from_value::<Vec<RemoteCollaborator>>(serde_json::json!([
+                    {"id":"ada","full_name":"Ada Lovelace"}, {"id":"bob","full_name":"Bob Example"}
+                ]))
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .merge_collaborator_states(
+                &serde_json::from_value::<Vec<RemoteCollaboratorState>>(serde_json::json!([
+                    {"project_id":"team","user_id":"ada","state":"active"},
+                    {"project_id":"team","user_id":"bob","state":"active"}
+                ]))
+                .unwrap(),
+                true,
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn collaborator_membership_migrates_and_handles_incremental_departures_and_full_snapshots() {
+        let store = assignment_store();
+        store.set_sync_token("before-upgrade").unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute_batch("DROP TABLE project_collaborators; PRAGMA user_version=12;")
+            .unwrap();
+        let migrated = Store::open(store.path.clone()).unwrap();
+        assert_eq!(migrated.sync_token().unwrap(), "*");
+        assert!(migrated.project_collaborators("team").unwrap().is_empty());
+        assert_eq!(migrated.task("task").unwrap().unwrap().content, "Task");
+        migrated
+            .merge_collaborator_states(
+                &serde_json::from_value::<Vec<RemoteCollaboratorState>>(serde_json::json!([
+                    {"project_id":"team","user_id":"ada","state":"active"},
+                    {"project_id":"team","user_id":"bob","state":"active"}
+                ]))
+                .unwrap(),
+                true,
+            )
+            .unwrap();
+        migrated
+            .merge_collaborator_states(
+                &serde_json::from_value::<Vec<RemoteCollaboratorState>>(serde_json::json!([
+                    {"project_id":"team","user_id":"ada","is_deleted":true}
+                ]))
+                .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(migrated.project_collaborators("team").unwrap()[0].id, "bob");
+        migrated.set_sync_token("incremental").unwrap();
+        let reopened = Store::open(store.path.clone()).unwrap();
+        assert_eq!(reopened.sync_token().unwrap(), "incremental");
+        assert_eq!(reopened.project_collaborators("team").unwrap()[0].id, "bob");
+        reopened.merge_collaborator_states(&[], true).unwrap();
+        assert!(reopened.project_collaborators("team").unwrap().is_empty());
+    }
+
+    #[test]
+    fn assignments_are_atomic_and_pending_ids_survive_parsing_creation_and_history() {
+        let store = assignment_store();
+        let before = store.task("task").unwrap().unwrap();
+        assert!(store.update_assignee("task", Some("outsider")).is_err());
+        assert_eq!(store.task("task").unwrap().unwrap(), before);
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        store
+            .edit_task("task", "Edited +Bob", "Description")
+            .unwrap();
+        let edit = store.claim_next_outbox().unwrap().unwrap();
+        store.update_assignee("task", Some("ada")).unwrap();
+        let mut parsed = before.clone();
+        parsed.content = "Edited".into();
+        parsed.responsible_uid = Some("bob".into());
+        parsed.assignee = Some("Bob Example".into());
+        store.apply_synced_task_edit(&parsed, edit.seq).unwrap();
+        let current = store.task("task").unwrap().unwrap();
+        assert_eq!(current.responsible_uid.as_deref(), Some("ada"));
+        assert_eq!(current.assignee.as_deref(), Some("Ada Lovelace"));
+        store.apply_task_snapshot(&before).unwrap();
+        assert!(
+            store
+                .task("task")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .is_none()
+        );
+
+        let project = store.project("team").unwrap().unwrap();
+        let local_id = store.add_task("Pending", &project).unwrap();
+        store.update_assignee(&local_id, Some("ada")).unwrap();
+        let remote: RemoteTask = serde_json::from_value(
+            serde_json::json!({"id":"created","project_id":"team","content":"Pending"}),
+        )
+        .unwrap();
+        store.replace_task_id(&local_id, &remote).unwrap();
+        let mapped = store.task(&local_id).unwrap().unwrap();
+        assert_eq!(mapped.responsible_uid.as_deref(), Some("ada"));
+        assert_eq!(mapped.assignee.as_deref(), Some("Ada Lovelace"));
+        let mut unassigned = mapped.clone();
+        unassigned.responsible_uid = None;
+        unassigned.assignee = None;
+        store.apply_task_snapshot(&unassigned).unwrap();
+        store.apply_task_snapshot(&mapped).unwrap();
+        assert_eq!(
+            store
+                .task("created")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .as_deref(),
+            Some("ada")
+        );
+    }
+
+    #[test]
+    fn undo_before_an_assignee_edit_upload_queues_a_compensating_assignment() {
+        let store = assignment_store();
+        let before = store.task("task").unwrap().unwrap();
+        store.edit_task("task", "Task +Ada", "").unwrap();
+        store.apply_task_snapshot(&before).unwrap();
+        assert!(store.outbox().unwrap().iter().any(|entry| matches!(
+            entry.operation,
+            Operation::UpdateAssignee {
+                responsible_uid: None
+            }
+        )));
+    }
+
+    #[test]
+    fn restoring_an_assignment_snapshot_moves_to_the_project_before_assigning() {
+        let store = assignment_store();
+        store
+            .merge_remote(
+                &serde_json::from_value::<Vec<RemoteProject>>(serde_json::json!([
+                    {"id":"other","name":"Other Team Project","workspace_id":"workspace"}
+                ]))
+                .unwrap(),
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        store
+            .merge_collaborator_states(
+                &serde_json::from_value::<Vec<RemoteCollaboratorState>>(serde_json::json!([
+                    {"project_id":"other","user_id":"ada","state":"active"}
+                ]))
+                .unwrap(),
+                false,
+            )
+            .unwrap();
+        let mut snapshot = store.task("task").unwrap().unwrap();
+        snapshot.project_id = "other".into();
+        snapshot.responsible_uid = Some("ada".into());
+        snapshot.assignee = Some("Ada Lovelace".into());
+        store.apply_task_snapshot(&snapshot).unwrap();
+        let queued = store.outbox().unwrap();
+        let moved = queued
+            .iter()
+            .position(|entry| matches!(entry.operation, Operation::MoveTask { .. }))
+            .unwrap();
+        let assigned = queued
+            .iter()
+            .position(|entry| matches!(entry.operation, Operation::UpdateAssignee { .. }))
+            .unwrap();
+        assert!(moved < assigned);
+    }
+
+    #[test]
+    fn correcting_an_inflight_or_rejected_assignee_preserves_other_edits_and_failures() {
+        let store = assignment_store();
+        store.update_assignee("task", Some("ada")).unwrap();
+        let claimed = store.claim_next_outbox().unwrap().unwrap();
+        store.update_assignee("task", Some("bob")).unwrap();
+        assert_eq!(store.outbox().unwrap()[0].uuid, claimed.uuid);
+        assert!(matches!(&store.outbox().unwrap()[0].operation,
+            Operation::UpdateAssignee { responsible_uid: Some(uid) } if uid=="ada"));
+        store
+            .fail_outbox(claimed.seq, "Collaborator left the project")
+            .unwrap();
+        let correction = store.claim_next_outbox().unwrap().unwrap();
+        assert!(matches!(&correction.operation,
+            Operation::UpdateAssignee { responsible_uid: Some(uid) } if uid=="bob"));
+        store
+            .fail_outbox(correction.seq, "Assignment rejected")
+            .unwrap();
+        store.update_due("task", "invalid date").unwrap();
+        let due = store
+            .outbox()
+            .unwrap()
+            .into_iter()
+            .find(|entry| matches!(entry.operation, Operation::UpdateDue { .. }))
+            .unwrap();
+        store.fail_outbox(due.seq, "Invalid date").unwrap();
+        store.update_assignee("task", None).unwrap();
+        assert!(
+            store
+                .outbox()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.seq == due.seq)
+        );
+        assert!(
+            !store
+                .outbox()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.seq == correction.seq)
+        );
+        assert!(
+            store
+                .task("task")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .is_none()
+        );
+    }
+
     fn remote_filter(id: &str, name: &str, query: &str, favorite: bool) -> RemoteFilter {
         RemoteFilter {
             id: id.into(),
@@ -3992,7 +4396,7 @@ mod tests {
                 group_by_label: false
             }
         );
-        assert_eq!(reopened.sync_token().unwrap(), "keep-token");
+        assert_eq!(reopened.sync_token().unwrap(), "*");
         assert!(
             reopened
                 .tasks_for_view(&NavId::Project("inbox".into()), true)
@@ -4014,7 +4418,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     #[test]

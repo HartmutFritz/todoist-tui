@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 
 use crate::{
     model::{
-        Due, Operation, OutboxEntry, RemoteCollaborator, RemoteFilter, RemoteLabel, RemoteProject,
-        RemoteTask, Task,
+        Due, Operation, OutboxEntry, RemoteCollaborator, RemoteCollaboratorState, RemoteFilter,
+        RemoteLabel, RemoteProject, RemoteTask, Task, contains_assignee,
     },
     store::Store,
 };
@@ -40,6 +40,8 @@ struct SyncResponse {
     workspace_filters: Vec<RemoteFilter>,
     #[serde(default)]
     collaborators: Vec<RemoteCollaborator>,
+    #[serde(default, alias = "collaborators_states")]
+    collaborator_states: Option<Vec<RemoteCollaboratorState>>,
     #[serde(default)]
     user: Option<RemoteCollaborator>,
     sync_token: String,
@@ -505,6 +507,10 @@ impl TodoistClient {
         store.save_checkpoint(entry.seq, checkpoint)?;
         // Todoist's SDK uses X-Request-ID for Quick Add as well. Reuse it on
         // transport retries, and persist the result before any follow-up write.
+        let text = checkpoint
+            .get("parse_text")
+            .and_then(Value::as_str)
+            .unwrap_or(text);
         let response = Self::check(
             self.auth(self.http.post(format!("{}/tasks/quick", self.base)))
                 .header("X-Request-Id", &entry.uuid)
@@ -660,7 +666,14 @@ impl TodoistClient {
             return Ok(());
         }
         let original: Task = if let Some(original) = checkpoint.get("original") {
-            serde_json::from_value(original.clone())?
+            let mut task: Task = serde_json::from_value(original.clone())?;
+            if original.get("responsible_uid").is_none() {
+                // Checkpoints from older releases stored only the display name.
+                task.responsible_uid = store
+                    .task_including_deleted(&entry.entity_id)?
+                    .and_then(|current| current.responsible_uid);
+            }
+            task
         } else {
             let original = store
                 .task_including_deleted(&entry.entity_id)?
@@ -669,14 +682,36 @@ impl TodoistClient {
             store.save_checkpoint(entry.seq, &checkpoint)?;
             original
         };
+        if checkpoint.get("parse_text").is_none() && checkpoint["request_started"] != true {
+            let text = if contains_assignee(expression) && !contains_explicit_project(expression) {
+                let project = store
+                    .project(&original.project_id)?
+                    .context("edited task project no longer exists")?;
+                contextual_assignee_expression(expression, &project.name)
+            } else {
+                expression.to_owned()
+            };
+            checkpoint["parse_text"] = json!(text);
+        }
         let parsed = self.parse_task(store, entry, expression, &mut checkpoint)?;
 
         let parsed_project_selected = store
             .project(&parsed.project_id)?
             .is_some_and(|project| expression_mentions_project(expression, &project.name));
         let parsed_due = parsed.due.is_some();
-        let updated = if let Some(updated) = checkpoint.get("updated") {
-            serde_json::from_value(updated.clone())?
+        let mut updated = if let Some(updated) = checkpoint.get("updated") {
+            let mut task: Task = serde_json::from_value(updated.clone())?;
+            if updated.get("responsible_uid").is_none() {
+                task.responsible_uid = if contains_assignee(expression) {
+                    parsed
+                        .responsible_uid
+                        .clone()
+                        .or_else(|| original.responsible_uid.clone())
+                } else {
+                    original.responsible_uid.clone()
+                };
+            }
+            task
         } else {
             let mut updated = merge_quick_edit(
                 &original,
@@ -695,10 +730,20 @@ impl TodoistClient {
             {
                 updated.section_id = section;
             }
-            checkpoint["updated"] = serde_json::to_value(&updated)?;
-            store.save_checkpoint(entry.seq, &checkpoint)?;
             updated
         };
+        if let Some(uid) = updated.responsible_uid.as_deref() {
+            updated.assignee = store
+                .collaborator_name(uid)?
+                .or_else(|| {
+                    (updated.responsible_uid == original.responsible_uid)
+                        .then(|| original.assignee.clone())
+                        .flatten()
+                })
+                .or_else(|| Some(uid.to_owned()));
+        }
+        checkpoint["updated"] = serde_json::to_value(&updated)?;
+        store.save_checkpoint(entry.seq, &checkpoint)?;
         let move_project = (updated.project_id != original.project_id
             || updated.section_id != original.section_id)
             .then(|| updated.project_id.clone());
@@ -734,6 +779,20 @@ impl TodoistClient {
             )?;
             checkpoint["move"] = json!(true);
             store.save_checkpoint(entry.seq, &checkpoint)?;
+        }
+        if contains_assignee(expression)
+            && let Some(uid) = &parsed.responsible_uid
+        {
+            // A destination collaborator may not belong to the source
+            // project. Assign only after any move has completed.
+            self.step(
+                store,
+                entry,
+                &mut checkpoint,
+                "assignee",
+                "item_update",
+                json!({"id": entry.entity_id, "responsible_uid": uid}),
+            )?;
         }
         if checkpoint["cleanup"] != true {
             self.command_with_uuid(delete_uuid, "item_delete", json!({"id": parsed.id}))
@@ -963,6 +1022,9 @@ impl TodoistClient {
                 sync.collaborators.push(user);
             }
             store.merge_collaborators(&sync.collaborators)?;
+            if let Some(states) = &sync.collaborator_states {
+                store.merge_collaborator_states(states, sync.full_sync)?;
+            }
             store.merge_remote_snapshot(
                 &sync.projects,
                 &sync.items,
@@ -1387,6 +1449,9 @@ fn merge_quick_edit(
     if contains_priority(expression) {
         updated.priority = parsed.priority;
     }
+    if contains_assignee(expression) && parsed.responsible_uid.is_some() {
+        updated.responsible_uid.clone_from(&parsed.responsible_uid);
+    }
     if parsed_project_selected {
         updated.project_id.clone_from(&parsed.project_id);
         if updated.project_id != original.project_id {
@@ -1394,6 +1459,16 @@ fn merge_quick_edit(
         }
     }
     updated
+}
+
+fn contextual_assignee_expression(expression: &str, project_name: &str) -> String {
+    let project = project_name.replace('\\', "\\\\").replace(' ', "\\ ");
+    // Quick Add's inline description must remain the final part of the text.
+    if let Some((title, description)) = expression.split_once(" //") {
+        format!("{title} #{project} //{description}")
+    } else {
+        format!("{expression} #{project}")
+    }
 }
 
 #[cfg(test)]
@@ -2047,6 +2122,289 @@ mod tests {
         assert!(api.request().contains("item_update"));
         assert!(api.request().contains("item_delete"));
         assert!(api.request().contains(delete_uuid));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn quick_edit_resolves_assignees_in_project_context_and_preserves_a_later_picker_choice() {
+        let api = MockApi::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("assignments.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .merge_remote(
+                &serde_json::from_value::<Vec<RemoteProject>>(json!([
+                    {"id":"team","name":"Team Work","workspace_id":"workspace"}
+                ]))
+                .unwrap(),
+                &serde_json::from_value::<Vec<RemoteTask>>(json!([
+                    {"id":"task","project_id":"team","content":"Original","responsible_uid":"bob"}
+                ]))
+                .unwrap(),
+                &[],
+                &[],
+            )
+            .unwrap();
+        store
+            .merge_collaborators(
+                &serde_json::from_value::<Vec<RemoteCollaborator>>(json!([
+                    {"id":"ada","full_name":"Ada Lovelace"}, {"id":"bob","full_name":"Bob Example"}
+                ]))
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .merge_collaborator_states(
+                &serde_json::from_value::<Vec<RemoteCollaboratorState>>(json!([
+                    {"project_id":"team","user_id":"ada","state":"active"},
+                    {"project_id":"team","user_id":"bob","state":"active"}
+                ]))
+                .unwrap(),
+                true,
+            )
+            .unwrap();
+        store
+            .edit_task("task", "Review +Ada", "Keep this description")
+            .unwrap();
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        let Operation::QuickEdit {
+            update_uuid,
+            delete_uuid,
+            ..
+        } = &entry.operation
+        else {
+            panic!()
+        };
+        api.respond(
+            200,
+            json!({"id":"parser","project_id":"team","content":"Review","responsible_uid":"ada"}),
+        );
+        api.command(update_uuid);
+        api.command(&format!("{}-assignee", entry.uuid));
+        api.respond(500, json!({"error":"cleanup temporarily unavailable"}));
+        assert!(api.client.push(&store, &entry).is_err());
+        let request = api.request();
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["text"], "Review +Ada #Team\\ Work");
+        assert_eq!(
+            request_commands(&api.request())[0]["args"]["content"],
+            "Review"
+        );
+        let assignment = request_commands(&api.request());
+        assert_eq!(
+            assignment[0]["args"],
+            json!({"id":"task","responsible_uid":"ada"})
+        );
+        assert!(api.request().contains("item_delete"));
+        assert_eq!(store.outbox().unwrap()[0].checkpoint["assignee"], true);
+        store.update_assignee("task", Some("bob")).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        api.command(delete_uuid);
+        api.client
+            .push(&store, &store.claim_next_outbox().unwrap().unwrap())
+            .unwrap();
+        assert!(api.request().contains(delete_uuid));
+        let task = store.task("task").unwrap().unwrap();
+        assert_eq!(task.content, "Review");
+        assert_eq!(task.description, "Keep this description");
+        assert_eq!(task.responsible_uid.as_deref(), Some("bob"));
+        assert_eq!(task.assignee.as_deref(), Some("Bob Example"));
+        let choice = store.claim_next_outbox().unwrap().unwrap();
+        api.command(&choice.uuid);
+        api.client.push(&store, &choice).unwrap();
+        assert_eq!(
+            request_commands(&api.request())[0]["args"],
+            json!({"id":"task","responsible_uid":"bob"})
+        );
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn assignee_edit_moves_before_assignment_and_keeps_explicit_projects() {
+        let api = MockApi::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("assignments.db")).unwrap();
+        store
+            .merge_remote(
+                &serde_json::from_value::<Vec<RemoteProject>>(json!([
+                    {"id":"team","name":"Team","workspace_id":"workspace"},
+                    {"id":"destination","name":"Other Team","workspace_id":"workspace"}
+                ]))
+                .unwrap(),
+                &serde_json::from_value::<Vec<RemoteTask>>(json!([
+                    {"id":"task","project_id":"team","content":"Original"}
+                ]))
+                .unwrap(),
+                &[],
+                &[],
+            )
+            .unwrap();
+        store
+            .edit_task("task", "Review #Other\\ Team +Ada", "")
+            .unwrap();
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        let Operation::QuickEdit {
+            update_uuid,
+            move_uuid,
+            delete_uuid,
+            ..
+        } = &entry.operation
+        else {
+            panic!()
+        };
+        api.respond(200, json!({"id":"parser","project_id":"destination","content":"Review","responsible_uid":"ada"}));
+        api.command(update_uuid);
+        api.command(move_uuid);
+        api.command(&format!("{}-assignee", entry.uuid));
+        api.command(delete_uuid);
+        api.client.push(&store, &entry).unwrap();
+        let request = api.request();
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["text"], "Review #Other\\ Team +Ada");
+        assert!(api.request().contains(update_uuid));
+        assert!(api.request().contains(move_uuid));
+        assert_eq!(
+            request_commands(&api.request())[0]["args"],
+            json!({"id":"task","responsible_uid":"ada"})
+        );
+        assert!(api.request().contains(delete_uuid));
+        let task = store.task("task").unwrap().unwrap();
+        assert_eq!(task.project_id, "destination");
+        assert_eq!(task.responsible_uid.as_deref(), Some("ada"));
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn sync_caches_project_collaborators_for_the_offline_assignee_picker() {
+        let api = MockApi::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("collaborators.db")).unwrap();
+        api.respond(
+            200,
+            json!({"sync_token":"full","full_sync":true,
+                "projects":[{"id":"team","name":"Team","workspace_id":"workspace"}],
+                "collaborators":[{"id":"ada","full_name":"Ada Lovelace"}],
+                "collaborator_states":[{"project_id":"team","user_id":"ada","state":"active"}]
+            }),
+        );
+        api.respond(200, json!({"sync_token":"incremental","full_sync":false}));
+        api.client.pull(&store).unwrap();
+        assert_eq!(
+            store.project_collaborators("team").unwrap()[0].full_name,
+            "Ada Lovelace"
+        );
+        assert!(api.request().contains("collaborators"));
+        api.request();
+        api.respond(
+            200,
+            json!({"sync_token":"removed","full_sync":false,
+                "collaborator_states":[{"project_id":"team","user_id":"ada","is_deleted":true}]
+            }),
+        );
+        api.client.pull(&store).unwrap();
+        assert!(store.project_collaborators("team").unwrap().is_empty());
+        api.request();
+        assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn assignee_parser_retries_keep_the_original_project_context_after_a_rename() {
+        let api = MockApi::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("context.db");
+        let store = Store::open(&path).unwrap();
+        let mut project: RemoteProject = serde_json::from_value(
+            json!({"id":"team","name":"Original Team","workspace_id":"workspace"}),
+        )
+        .unwrap();
+        let remote: RemoteTask =
+            serde_json::from_value(json!({"id":"task","project_id":"team","content":"Original"}))
+                .unwrap();
+        store
+            .merge_remote(std::slice::from_ref(&project), &[remote], &[], &[])
+            .unwrap();
+        store.edit_task("task", "Review +Ada", "").unwrap();
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        api.respond(500, json!({"error":"temporary failure"}));
+        assert!(api.client.push(&store, &entry).is_err());
+        let first = api.request();
+        project.name = "Renamed Team".into();
+        store.merge_remote(&[project], &[], &[], &[]).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let resumed = store.claim_next_outbox().unwrap().unwrap();
+        let Operation::QuickEdit {
+            update_uuid,
+            delete_uuid,
+            ..
+        } = &resumed.operation
+        else {
+            panic!()
+        };
+        api.respond(
+            200,
+            json!({"id":"parser","project_id":"team","content":"Review","responsible_uid":"ada"}),
+        );
+        api.command(update_uuid);
+        api.command(&format!("{}-assignee", entry.uuid));
+        api.command(delete_uuid);
+        api.client.push(&store, &resumed).unwrap();
+        let second = api.request();
+        assert_eq!(
+            first.split("\r\n\r\n").nth(1),
+            second.split("\r\n\r\n").nth(1)
+        );
+        assert_eq!(resumed.uuid, entry.uuid);
+        assert_eq!(
+            resumed.checkpoint["parse_text"],
+            "Review +Ada #Original\\ Team"
+        );
+        assert_eq!(
+            store
+                .task("task")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .as_deref(),
+            Some("ada")
+        );
+    }
+
+    #[test]
+    fn legacy_quick_edit_checkpoints_keep_existing_assignment_ids() {
+        let api = MockApi::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("legacy.db")).unwrap();
+        let remote: RemoteTask = serde_json::from_value(
+            json!({"id":"task","project_id":"inbox","content":"Original","responsible_uid":"bob"}),
+        )
+        .unwrap();
+        store.merge_remote(&[], &[remote], &[], &[]).unwrap();
+        store.edit_task("task", "Edited", "").unwrap();
+        let entry = store.claim_next_outbox().unwrap().unwrap();
+        let mut snapshot = serde_json::to_value(store.task("task").unwrap().unwrap()).unwrap();
+        snapshot.as_object_mut().unwrap().remove("responsible_uid");
+        store.save_checkpoint(entry.seq, &json!({
+            "original":snapshot,"updated":snapshot,"request_started":true,"update":true,
+            "parsed":{"id":"parser","project_id":"inbox","content":"Edited","responsible_uid":"automatic-default"}
+        })).unwrap();
+        let resumed = store.claim_next_outbox().unwrap().unwrap();
+        let Operation::QuickEdit { delete_uuid, .. } = &resumed.operation else {
+            panic!()
+        };
+        api.command(delete_uuid);
+        api.client.push(&store, &resumed).unwrap();
+        assert_eq!(
+            store
+                .task("task")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .as_deref(),
+            Some("bob")
+        );
+        assert!(api.request().contains("item_delete"));
         assert!(api.requests.try_recv().is_err());
     }
 
@@ -3132,6 +3490,7 @@ mod tests {
             child_order: 7,
             checked: false,
             assignee: None,
+            responsible_uid: None,
             section_id: None,
         }
     }
@@ -3232,8 +3591,12 @@ mod tests {
 
     #[test]
     fn quick_edit_preserves_metadata_that_was_not_present_in_the_expression() {
-        let original = task();
-        let updated = merge_quick_edit(&original, &parsed_task(), "Buy milk", "", false);
+        let mut original = task();
+        original.responsible_uid = Some("existing".into());
+        original.assignee = Some("Existing Person".into());
+        let mut parsed = parsed_task();
+        parsed.responsible_uid = Some("automatic-project-default".into());
+        let updated = merge_quick_edit(&original, &parsed, "Buy milk", "", false);
 
         assert_eq!(updated.content, "Buy milk");
         assert!(updated.description.is_empty());
@@ -3241,6 +3604,21 @@ mod tests {
         assert_eq!(updated.labels, original.labels);
         assert_eq!(updated.due, original.due);
         assert_eq!(updated.priority, original.priority);
+        assert_eq!(updated.responsible_uid, original.responsible_uid);
+        assert_eq!(updated.assignee, original.assignee);
+    }
+
+    #[test]
+    fn contextual_assignment_keeps_inline_descriptions_and_ignores_literal_plus_signs() {
+        assert_eq!(
+            contextual_assignee_expression("Review +Ada // Notes", "Team Work"),
+            "Review +Ada #Team\\ Work // Notes"
+        );
+        assert!(contains_assignee("Review https://example.test +Ada"));
+        assert!(!contains_assignee("C++ + maths"));
+        assert!(!contains_assignee(
+            "Review \\+Ada // +Bob is plain description"
+        ));
     }
 
     #[test]

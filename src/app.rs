@@ -125,6 +125,7 @@ pub struct EditorDraft {
 pub enum ProjectPickerPurpose {
     Jump,
     MoveTask { task_id: String },
+    AssignTask { task_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -607,6 +608,14 @@ impl App {
         }
         match action {
             Action::EditLabels => self.open_labels()?,
+            Action::EditAssignee => {
+                if self.focus == Focus::Tasks {
+                    self.force_tasks()?;
+                    if let Some(task) = self.selected_task().cloned() {
+                        self.open_assignee_picker(&task.id)?;
+                    }
+                }
+            }
             Action::SearchProjects => self.open_project_search()?,
             Action::SearchTasks => self.open_task_search()?,
             Action::SearchFilters => self.open_filter_search()?,
@@ -722,6 +731,12 @@ impl App {
                 *scroll = scroll.saturating_sub(1);
             }
             Some(Overlay::ErrorDetails { .. }) => {}
+            Some(Overlay::Details { task, .. })
+                if self.keybindings.matches(Action::EditAssignee, key) =>
+            {
+                let task_id = task.id.clone();
+                self.open_assignee_picker(&task_id)?;
+            }
             Some(Overlay::Details { task, .. })
                 if self.keybindings.matches(Action::EditTask, key) =>
             {
@@ -840,6 +855,7 @@ impl App {
                         let message = match purpose {
                             ProjectPickerPurpose::Jump => "Project search cancelled",
                             ProjectPickerPurpose::MoveTask { .. } => "Task move cancelled",
+                            ProjectPickerPurpose::AssignTask { .. } => "Assignee change cancelled",
                         };
                         self.overlay = None;
                         self.status = message.into();
@@ -858,9 +874,18 @@ impl App {
                             ProjectPickerPurpose::MoveTask { task_id } => {
                                 self.apply_task_move(&task_id, &project)?;
                             }
+                            ProjectPickerPurpose::AssignTask { task_id } => {
+                                self.apply_assignee(&task_id, &project)?;
+                            }
                         }
                     } else {
-                        self.status = "No project matches that search".into();
+                        self.status = if matches!(purpose, ProjectPickerPurpose::AssignTask { .. })
+                        {
+                            "No assignee matches that search"
+                        } else {
+                            "No project matches that search"
+                        }
+                        .into();
                     }
                 } else if *mode == PickerMode::Selecting {
                     if self.keybindings.matches(Action::Up, key) {
@@ -1594,6 +1619,79 @@ impl App {
                 task_labels: task.labels,
             });
         }
+        Ok(())
+    }
+
+    fn open_assignee_picker(&mut self, task_id: &str) -> Result<()> {
+        let task = self
+            .store
+            .task(task_id)?
+            .context("selected task no longer exists")?;
+        let project = self
+            .store
+            .project(&task.project_id)?
+            .context("task project no longer exists")?;
+        if !(project.can_assign_tasks || project.is_shared || project.workspace_id.is_some()) {
+            self.status = "Assignees are available only in team or shared projects".into();
+            return Ok(());
+        }
+        let people = self.store.project_collaborators(&project.id)?;
+        if people.is_empty() && task.responsible_uid.is_none() {
+            self.status = format!(
+                "No collaborators cached for {}; synchronize to load them",
+                project.name
+            );
+            return Ok(());
+        }
+        let mut projects = people
+            .into_iter()
+            .map(|person| ProjectPickerItem {
+                id: person.id,
+                name: person.full_name,
+            })
+            .collect::<Vec<_>>();
+        projects.insert(
+            0,
+            ProjectPickerItem {
+                id: String::new(),
+                name: "Unassigned".into(),
+            },
+        );
+        let cursor = task
+            .responsible_uid
+            .as_deref()
+            .and_then(|uid| projects.iter().position(|person| person.id == uid))
+            .unwrap_or(0);
+        self.overlay = Some(Overlay::ProjectPicker {
+            purpose: ProjectPickerPurpose::AssignTask { task_id: task.id },
+            query: String::new(),
+            cursor,
+            mode: PickerMode::Filtering,
+            projects,
+            search: ProjectSearch::default(),
+        });
+        Ok(())
+    }
+
+    fn apply_assignee(&mut self, task_id: &str, person: &ProjectPickerItem) -> Result<()> {
+        let before = self
+            .store
+            .task(task_id)?
+            .context("selected task no longer exists")?;
+        let uid = (!person.id.is_empty()).then_some(person.id.as_str());
+        if !self.store.update_assignee(&before.id, uid)? {
+            self.status = "Assignee unchanged".into();
+            return Ok(());
+        }
+        self.record_task_change(before.clone(), &before.id, "assignee change")?;
+        self.refresh_after_action(Some(&before.id))?;
+        self.focus = Focus::Tasks;
+        self.status = if uid.is_some() {
+            format!("Assigned to {} · pending sync", person.name)
+        } else {
+            "Assignee removed · pending sync".into()
+        };
+        self.mark_pending_and_sync();
         Ok(())
     }
 
@@ -3377,6 +3475,7 @@ mod tests {
             child_order: 0,
             checked: false,
             assignee: None,
+            responsible_uid: None,
             section_id: None,
         }
     }
@@ -5116,6 +5215,250 @@ mod tests {
         assert_eq!(filtered_project_indices(&projects, "sh"), [1, 2]);
         assert_eq!(filtered_project_indices(&projects, "SHOP"), [1]);
         assert!(filtered_project_indices(&projects, "missing").is_empty());
+    }
+
+    fn assignee_test_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = draft_test_app();
+        app.store.merge_remote(
+            &serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+                {"id":"team","name":"Team Work","workspace_id":"workspace","can_assign_tasks":true}
+            ])).unwrap(),
+            &serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+                {"id":"root","project_id":"team","content":"Assign this"},
+                {"id":"child","project_id":"team","parent_id":"root","content":"Keep this"}
+            ])).unwrap(), &[], &[]).unwrap();
+        app.store
+            .merge_collaborators(
+                &serde_json::from_value::<Vec<crate::model::RemoteCollaborator>>(
+                    serde_json::json!([
+                        {"id":"ada","full_name":"Ada Lovelace"},
+                        {"id":"bob","full_name":"Bob Example"},
+                        {"id":"outsider","full_name":"Ada Outside"},
+                        {"id":"invited","full_name":"Invited Person"}
+                    ]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        app.store
+            .merge_collaborator_states(
+                &serde_json::from_value::<Vec<crate::model::RemoteCollaboratorState>>(
+                    serde_json::json!([
+                        {"project_id":"team","user_id":"ada","state":"active"},
+                        {"project_id":"team","user_id":"bob","state":"active"},
+                        {"project_id":"other","user_id":"outsider","state":"active"},
+                        {"project_id":"team","user_id":"invited","state":"invited"}
+                    ]),
+                )
+                .unwrap(),
+                true,
+            )
+            .unwrap();
+        app.refresh_nav().unwrap();
+        let index = app
+            .nav_rows
+            .iter()
+            .position(
+                |row| matches!(row, NavRow::Item { id: NavId::Project(id), .. } if id=="team"),
+            )
+            .unwrap();
+        app.select_nav(index);
+        app.enter_tasks().unwrap();
+        (dir, app)
+    }
+
+    #[test]
+    fn plus_picker_assigns_and_clears_offline_with_fuzzy_search_selection_and_undo() {
+        let (dir, mut app) = assignee_test_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT))
+            .unwrap();
+        let Some(Overlay::ProjectPicker {
+            purpose, projects, ..
+        }) = &app.overlay
+        else {
+            panic!("assignee picker missing")
+        };
+        assert!(matches!(purpose, ProjectPickerPurpose::AssignTask { task_id } if task_id=="root"));
+        assert_eq!(
+            projects
+                .iter()
+                .map(|person| person.id.as_str())
+                .collect::<Vec<_>>(),
+            ["", "ada", "bob"]
+        );
+        for character in "lv adz".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+        // Confirm before drawing: ranking must use the latest query.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.focus, Focus::Tasks);
+        assert_eq!(app.selected_task().unwrap().id, "root");
+        let task = app.store.task("root").unwrap().unwrap();
+        assert_eq!(task.content, "Assign this");
+        assert_eq!(task.responsible_uid.as_deref(), Some("ada"));
+        assert_eq!(task.assignee.as_deref(), Some("Ada Lovelace"));
+        assert!(
+            app.store
+                .task("child")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .is_none()
+        );
+        assert!(matches!(&app.store.outbox().unwrap()[0].operation,
+            crate::model::Operation::UpdateAssignee { responsible_uid: Some(uid) } if uid=="ada"));
+        let reopened = Store::open(dir.path().join("drafts.db")).unwrap();
+        assert_eq!(
+            reopened
+                .task("root")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .as_deref(),
+            Some("ada")
+        );
+        app.undo().unwrap();
+        assert!(
+            app.store
+                .task("root")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .is_none()
+        );
+        app.redo().unwrap();
+        assert_eq!(
+            app.store
+                .task("root")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .as_deref(),
+            Some("ada")
+        );
+        app.open_assignee_picker("root").unwrap();
+        for character in "unassigned".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.store.task("root").unwrap().unwrap().assignee.is_none());
+        assert!(
+            app.store
+                .task("root")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .is_none()
+        );
+        app.undo().unwrap();
+        assert_eq!(
+            app.store
+                .task("root")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .as_deref(),
+            Some("ada")
+        );
+    }
+
+    #[test]
+    fn assignee_picker_supports_details_selection_mode_cancel_and_debounced_views() {
+        let (_dir, mut app) = assignee_test_app();
+        app.open_details();
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::ProjectPicker {
+                mode: PickerMode::Selecting,
+                ..
+            })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.store.outbox_len().unwrap(), 0);
+        app.open_assignee_picker("root").unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.store
+                .task("root")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .as_deref(),
+            Some("bob")
+        );
+
+        let inbox = app
+            .nav_rows
+            .iter()
+            .position(
+                |row| matches!(row, NavRow::Item { id: NavId::Project(id), .. } if id=="inbox"),
+            )
+            .unwrap();
+        app.select_nav(inbox);
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert!(app.tasks.is_empty());
+        assert_eq!(app.store.outbox_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn assignee_confirmation_revalidates_membership_without_mutating_the_task() {
+        let (_dir, mut app) = assignee_test_app();
+        app.open_assignee_picker("root").unwrap();
+        for character in "ada".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.store
+            .merge_collaborator_states(
+                &serde_json::from_value::<Vec<crate::model::RemoteCollaboratorState>>(
+                    serde_json::json!([{"project_id":"team","user_id":"ada","is_deleted":true}]),
+                )
+                .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_err()
+        );
+        assert!(
+            app.store
+                .task("root")
+                .unwrap()
+                .unwrap()
+                .responsible_uid
+                .is_none()
+        );
+        assert_eq!(app.store.outbox_len().unwrap(), 0);
+        let task = app
+            .store
+            .add_task("Personal", &app.store.project("inbox").unwrap().unwrap())
+            .unwrap();
+        app.open_assignee_picker(&task).unwrap();
+        assert!(app.overlay.is_none());
+        assert!(app.status.contains("team or shared"));
     }
 
     #[test]

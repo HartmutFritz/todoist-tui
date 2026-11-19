@@ -683,7 +683,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
                 scroll,
             );
         }
-        Some(Overlay::Details { task, scroll }) => draw_details(frame, task, keybindings, scroll),
+        Some(Overlay::Details { task, scroll }) => draw_details(frame, task, scroll),
         Some(Overlay::FilterDetails { filter, scroll }) => {
             draw_filter_details(frame, filter, keybindings, scroll)
         }
@@ -709,7 +709,16 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
             projects,
             search,
             ..
-        }) => draw_project_picker(frame, purpose, query, *cursor, *mode, projects, search),
+        }) => draw_project_picker(
+            frame,
+            purpose,
+            query,
+            *cursor,
+            *mode,
+            projects,
+            search,
+            keybindings,
+        ),
         Some(Overlay::TaskPicker {
             query,
             cursor,
@@ -744,12 +753,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &mut App) {
         }
         Some(Overlay::Editor(editor)) => {
             let area = centered(frame.area(), 82, 18, 94, 70);
-            let title = match (editor.edits_filter(), editor.save_on_enter_in_insert()) {
-                (true, true) => " Neovim — arrows: fields; Enter saves; :cq cancels ",
-                (true, false) => " Neovim — arrows: fields; Normal Enter saves; :cq cancels ",
-                (false, true) => " Neovim — Enter saves; Shift+Enter newline; :cq cancels ",
-                (false, false) => " Neovim — Normal Enter saves; Shift+Enter newline; :cq cancels ",
-            };
+            let title = " Neovim ";
             let mut inner = panel(title, true).inner(area);
             frame.render_widget(Clear, area);
             frame.render_widget(panel(title, true), area);
@@ -1106,6 +1110,10 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
             "search and toggle a task label",
         ),
         (
+            keys.display(Action::EditAssignee).into(),
+            "fuzzy search a team/shared task assignee; Unassigned clears",
+        ),
+        (
             keys.display(Action::ToggleLabelGrouping).into(),
             "toggle label grouping",
         ),
@@ -1227,7 +1235,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
     );
 }
 
-fn draw_details(frame: &mut Frame<'_>, task: &Task, keys: &KeyBindings, scroll: &mut usize) {
+fn draw_details(frame: &mut Frame<'_>, task: &Task, scroll: &mut usize) {
     let area = centered(frame.area(), 72, 18, 94, 82);
     let due = task
         .due
@@ -1278,17 +1286,7 @@ fn draw_details(frame: &mut Frame<'_>, task: &Task, keys: &KeyBindings, scroll: 
     } else {
         &task.description
     }));
-    let title = scrolling_title(
-        &format!(
-            "Task — {} edit; {} date; {} clear; {} delete",
-            keys.display(Action::EditTask),
-            keys.display(Action::EditDue),
-            keys.display(Action::RemoveDue),
-            keys.display(Action::DeleteTask)
-        ),
-        keys,
-    );
-    draw_scrolling_dialog(frame, text, title, area, scroll);
+    draw_scrolling_dialog(frame, text, " Task ".into(), area, scroll);
 }
 
 fn draw_filter_details(
@@ -1587,6 +1585,7 @@ fn draw_label_picker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_project_picker(
     frame: &mut Frame<'_>,
     purpose: &ProjectPickerPurpose,
@@ -1595,15 +1594,25 @@ fn draw_project_picker(
     mode: PickerMode,
     projects: &[ProjectPickerItem],
     search: &mut ProjectSearch,
+    keys: &KeyBindings,
 ) {
     let area = centered(frame.area(), 62, 18, 76, 70);
     let action = match purpose {
         ProjectPickerPurpose::Jump => "Find project",
         ProjectPickerPurpose::MoveTask { .. } => "Move task",
+        ProjectPickerPurpose::AssignTask { .. } => "Assign task",
     };
     let title = match mode {
-        PickerMode::Filtering => format!(" {action} — fuzzy search; Esc selects "),
-        PickerMode::Selecting => format!(" {action} — j/k select; Esc cancels "),
+        PickerMode::Filtering => format!(
+            " {action} — fuzzy search; {} selects ",
+            keys.display(Action::Cancel)
+        ),
+        PickerMode::Selecting => format!(
+            " {action} — {}/{} select; {} cancels ",
+            keys.display(Action::Down),
+            keys.display(Action::Up),
+            keys.display(Action::Cancel)
+        ),
     };
     let block = panel(title, true);
     let inner = block.inner(area);
@@ -1623,7 +1632,11 @@ fn draw_project_picker(
     ];
     if matches.is_empty() {
         lines.push(Line::styled(
-            "  No matching projects",
+            if matches!(purpose, ProjectPickerPurpose::AssignTask { .. }) {
+                "  No matching assignees"
+            } else {
+                "  No matching projects"
+            },
             Style::default().fg(MUTED),
         ));
     } else {
@@ -1707,6 +1720,7 @@ mod tests {
             child_order: 0,
             checked: false,
             assignee: None,
+            responsible_uid: None,
             section_id: None,
         }
     }
@@ -2060,7 +2074,7 @@ mod tests {
             + "Final description line";
         let mut scroll = usize::MAX;
         terminal
-            .draw(|frame| draw_details(frame, &item, &KeyBindings::defaults(), &mut scroll))
+            .draw(|frame| draw_details(frame, &item, &mut scroll))
             .unwrap();
         let screen = terminal
             .backend()
@@ -2075,7 +2089,7 @@ mod tests {
         terminal.backend_mut().resize(120, 40);
         terminal.autoresize().unwrap();
         terminal
-            .draw(|frame| draw_details(frame, &item, &KeyBindings::defaults(), &mut scroll))
+            .draw(|frame| draw_details(frame, &item, &mut scroll))
             .unwrap();
         assert_eq!(scroll, 0);
     }

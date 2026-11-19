@@ -116,6 +116,7 @@ below mean Shift+letter.
 | `D` | Delete a task and its subtasks |
 | `t` / `T` | Edit / remove the due date |
 | `@` / `v` | Toggle a label / move a task to another project |
+| `+` | Fuzzy-search an assignee for a team/shared task; choose Unassigned to clear |
 | `>` / `<` | Indent / promote a task |
 | `u` / Ctrl+r | Undo / redo a task change from this session |
 | `L` / `A` / `C` | Toggle label grouping / current-view alphabetical order / completed tasks |
@@ -130,7 +131,7 @@ below mean Shift+letter.
 | `S` | Inspect queued and rejected synchronization operations |
 | `Q` | Quit |
 
-Project pickers (`p` and `v`) use built-in, case-insensitive fuzzy matching: `wk`
+Project (`p`, `v`) and assignee (`+`) pickers use built-in, case-insensitive fuzzy matching: `wk`
 finds `#💼 Work`, and `prj rpt` finds “Project reports.” Best matches appear first;
 spaces separate search terms. Project search includes hidden projects. Other
 pickers use name prefixes; task search includes cached completed tasks.
@@ -145,7 +146,7 @@ application explains that restriction before applying a known unsupported move.
 
 Help and detail dialogs close with Enter, Esc, or `q`. Tasks that have a
 description show a text indicator (`☰`) on the right; Enter opens the full
-description.
+description in a dialog titled **Task**, without shortcut hints in the title.
 
 Scroll task, filter, and error details with `j`/`k` (or your configured movement
 keys) to read long titles, queries, and descriptions in small terminals.
@@ -200,7 +201,19 @@ Use `e` to edit a task's title and description; metadata not mentioned in the
 edited expression is preserved. Use `t` for a due expression such as `tod`,
 `tomorrow at 9`, or `every Friday`. Empty due input removes the date.
 
-Every editor starts in Insert mode:
+For a task in a team/shared project, add `+Name` to the edited first line, such as
+`Review proposal +Ada`. Todoist resolves the name during synchronization using
+the task's project, or an explicit `#Project` in the expression. Omitting an
+assignee keeps the existing assignment.
+
+From the task list or task details, `+` opens the same fuzzy finder as the project
+picker, listing cached active collaborators for that task's project. Enter
+assigns the highlighted person; **Unassigned** clears the assignment. These
+changes work offline, preserve task selection, and support undo/redo. Synchronize
+once after upgrading to populate the collaborator list. The binding is
+configurable as `[keybindings].edit_assignee`.
+
+The editor window is titled **Neovim**. Every editor starts in Insert mode:
 
 - Enter inserts a newline by default.
 - **Esc, then Enter saves and closes** through Normal mode. `:w` also saves.

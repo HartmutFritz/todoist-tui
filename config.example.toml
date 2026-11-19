@@ -87,5 +87,7 @@ space_7 = ["ctrl+7"]
 space_8 = ["ctrl+8"]
 space_9 = ["ctrl+9"]
 edit_labels = ["@"]
+# Fuzzy-search cached collaborators for a team/shared task; Unassigned clears it.
+edit_assignee = ["+"]
 help = ["?"]
 close_dialog = ["enter", "esc", "q"]

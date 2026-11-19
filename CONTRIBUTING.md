@@ -63,6 +63,16 @@ and global label-grouping preference are preserved. Project/filter ID remapping
 and canonical Inbox reconciliation transfer both scoped preferences in the same
 transaction, retaining explicit canonical destination choices.
 
+Schema 13 caches active project collaborator membership from Sync's
+`collaborator_states` alongside collaborator names. Upgrades request one full
+refresh to backfill membership, retaining tasks, queued changes, and view
+preferences. Task snapshots also retain assignment IDs for undo/redo and
+recreation. The `+` picker reuses project fuzzy matching and revalidates cached
+membership transactionally. Quick Edit supplies the original project context
+for `+Name`, durably retains the parser text, and checkpoints assignment after
+any project move. Replays must preserve later explicit assignment changes and
+hydrate assignment IDs when loading checkpoints written by earlier releases.
+
 ## Architecture
 
 - `main.rs` owns terminal setup and the adaptive event loop. Input must remain

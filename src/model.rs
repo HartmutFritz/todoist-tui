@@ -171,6 +171,8 @@ pub struct Task {
     pub checked: bool,
     pub assignee: Option<String>,
     #[serde(default)]
+    pub responsible_uid: Option<String>,
+    #[serde(default)]
     pub section_id: Option<String>,
 }
 
@@ -378,6 +380,27 @@ pub struct RemoteCollaborator {
     pub full_name: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteCollaboratorState {
+    #[serde(deserialize_with = "string_id")]
+    pub project_id: String,
+    #[serde(deserialize_with = "string_id")]
+    pub user_id: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub is_deleted: bool,
+}
+
+pub(crate) fn contains_assignee(expression: &str) -> bool {
+    expression
+        .split(" //")
+        .next()
+        .unwrap_or(expression)
+        .split_whitespace()
+        .any(|word| word.starts_with('+') && word.len() > 1)
+}
+
 fn default_priority() -> u8 {
     1
 }
@@ -569,6 +592,7 @@ mod tests {
             child_order: 0,
             checked: false,
             assignee: None,
+            responsible_uid: None,
             section_id: None,
         };
         assert_eq!(task.display_group(), Some("alpha"));

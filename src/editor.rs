@@ -84,7 +84,6 @@ pub struct EmbeddedEditor {
     last_escape: Option<Instant>,
     rows: u16,
     cols: u16,
-    options: EditorOptions,
     notice: Option<String>,
 }
 
@@ -100,17 +99,6 @@ impl EmbeddedEditor {
     #[cfg(test)]
     pub fn purpose(&self) -> EditorPurpose {
         self.purpose
-    }
-
-    pub fn edits_filter(&self) -> bool {
-        matches!(
-            self.purpose,
-            EditorPurpose::AddFilter | EditorPurpose::EditFilter
-        )
-    }
-
-    pub fn save_on_enter_in_insert(&self) -> bool {
-        self.options.save_on_enter_in_insert
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -270,7 +258,6 @@ impl EmbeddedEditor {
             last_escape: None,
             rows: rows.max(3),
             cols: cols.max(10),
-            options,
             notice: None,
         })
     }
