@@ -359,7 +359,9 @@ impl App {
         let (status, sync_status, sync_issue) = if has_token {
             ("Ready".into(), SyncStatus::Pending, None)
         } else {
-            let message = "API token missing: add it to API_TOKEN and restart".to_owned();
+            let message =
+                "API token missing: set TODOIST_TUI_TOKEN_PATH to a token file and restart"
+                    .to_owned();
             (message.clone(), SyncStatus::Error, Some(message))
         };
         let persistent_status = Some(status.clone());
@@ -2827,7 +2829,9 @@ impl App {
             self.sync.request_filter_refresh();
         }
         if !self.sync.has_token() {
-            let message = "API token missing: add it to API_TOKEN and restart".to_owned();
+            let message =
+                "API token missing: set TODOIST_TUI_TOKEN_PATH to a token file and restart"
+                    .to_owned();
             self.sync_status = SyncStatus::Error;
             self.sync_issue = Some(message.clone());
             self.set_persistent_status(message);

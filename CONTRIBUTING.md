@@ -26,6 +26,24 @@ an installed Rust 1.88 toolchain when changing dependencies.
 The application works without a Todoist token. Never commit `API_TOKEN`, test
 tokens, personal databases, or terminal recordings containing private tasks.
 
+### Nix packaging
+
+With flakes enabled, `nix build` builds the locked package, including its Rust
+tests. `nix flake check --print-build-logs` also runs installed-runtime checks in
+a PTY: offline task creation/restart, packaged and user-provided Neovim, user
+editor configuration, clipboard tool availability, and certificate overrides.
+CI runs these checks natively on x86_64 Linux and ARM64 Linux.
+
+`flake.lock` pins nixpkgs; `Cargo.lock` pins Cargo dependencies and their vendored
+AWS-LC/SQLite sources. Update nixpkgs with `nix flake update nixpkgs`, then check
+both platforms. `nix/package.nix` is reusable through `pkgs.callPackage`; the
+flake also exports `overlays.default` exposing `pkgs.todoist-tui`.
+`nix/source.nix` allowlists only public build inputs. Keep that list current when
+adding compile-time assets, and never put credentials or local state in it.
+Git-backed local flakes see new files only after they are included in Git;
+avoid `path:.` in a checkout containing private files because Nix copies the
+flake source before applying the package's source filter.
+
 ## Changes
 
 - Keep input handling and local mutations independent of network access.

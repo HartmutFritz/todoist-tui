@@ -15,6 +15,8 @@ and synchronized in the background, so cached tasks remain usable offline.
 
 ## Install and run
 
+### From source
+
 Requirements:
 
 - Rust 1.88 or newer to build the application.
@@ -39,8 +41,56 @@ chmod 600 API_TOKEN
 ./target/release/todoist-tui
 ```
 
-Alternatively, set `TODOIST_API_TOKEN`. Without a token, the application starts
-in local-only mode; add a token and restart to enable synchronization.
+### Nix / NixOS / Home Manager
+
+With flakes enabled, run directly:
+
+```sh
+nix run github:HartmutFritz/todoist-tui
+```
+
+Or add the flake to your system or Home Manager inputs:
+
+```nix
+inputs.todoist-tui = {
+  url = "github:HartmutFritz/todoist-tui";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+Pass `inputs` through your NixOS `specialArgs` or Home Manager `extraSpecialArgs`,
+then add the package in your module:
+
+```nix
+{ inputs, pkgs, ... }: {
+  environment.systemPackages = [
+    inputs.todoist-tui.packages.${pkgs.stdenv.hostPlatform.system}.default
+  ];
+}
+```
+
+For Home Manager, use `home.packages` instead of `environment.systemPackages`.
+Packages support `x86_64-linux` and `aarch64-linux`; following your own nixpkgs
+requires Rust 1.88 or newer. The package includes fallback Neovim and clipboard
+helpers. Your existing `nvim` on `PATH` takes precedence, with your usual config.
+Alternatively, use `inputs.todoist-tui.overlays.default` and install
+`pkgs.todoist-tui`. TLS respects `SSL_CERT_FILE`/`SSL_CERT_DIR`, then
+`NIX_SSL_CERT_FILE` and system CA bundles, with packaged certificates as fallback.
+
+### Authentication
+
+For an installed application, save the token in
+`${XDG_CONFIG_HOME:-$HOME/.config}/todoist-tui/API_TOKEN` and restrict its
+permissions to your user (`chmod 600`). Alternatively, set
+`TODOIST_TUI_TOKEN_PATH` to an existing non-empty token file, including a
+runtime-managed secret. Keep token contents out of Nix expressions and the Nix
+store; only the runtime file path belongs in configuration.
+
+Token precedence is `TODOIST_API_TOKEN`, then `TODOIST_TUI_TOKEN_PATH`, then
+legacy application-root `API_TOKEN`, then the user-config token file. An explicit
+token path that is missing, unreadable, or empty reports an error. Without a
+token, the application starts in local-only mode; add one and restart to sync.
+`TODOIST_TUI_CONFIG_PATH` does not change the default token-file location.
 
 ## Everyday use
 
@@ -269,7 +319,8 @@ ordering information while retaining queued local changes.
 
 | Environment variable | Purpose |
 | --- | --- |
-| `TODOIST_API_TOKEN` | Token override; takes precedence over `API_TOKEN` |
+| `TODOIST_API_TOKEN` | Token override; takes precedence over all token files |
+| `TODOIST_TUI_TOKEN_PATH` | Explicit token file; must exist and contain a token |
 | `TODOIST_TUI_CONFIG_PATH` | Custom configuration file; it must exist |
 | `TODOIST_TUI_DB_PATH` | Custom database path |
 
