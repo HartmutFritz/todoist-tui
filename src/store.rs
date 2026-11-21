@@ -1078,6 +1078,37 @@ impl Store {
         Ok(())
     }
 
+    /// `priority` uses Todoist's own numbering, where 4 is p1 and 1 is p4.
+    /// Returns false when the task already has that priority and nothing
+    /// pending could still change it.
+    pub fn update_priority(&self, id: &str, priority: u8) -> Result<bool> {
+        anyhow::ensure!(
+            (1..=4).contains(&priority),
+            "priority must be between 1 and 4"
+        );
+        let conn = self.connect()?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let id = resolve_task_id_from(&tx, id)?.unwrap_or_else(|| id.to_owned());
+        let task = task_from(&tx, &id)?.context("selected task no longer exists")?;
+        let rejected: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind')='update_priority')",
+            [&id], |row| row.get(0))?;
+        // A queued expression Todoist has not parsed yet can still change the
+        // priority remotely, so an explicit choice must be recorded even when
+        // the cached value already matches it.
+        if task.priority == priority && !rejected && !has_pending_priority_expression(&tx, &id)? {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE tasks SET priority=?2 WHERE id=?1",
+            params![id, priority],
+        )?;
+        remove_pending_priority_updates(&tx, &id)?;
+        queue(&tx, &id, Operation::UpdatePriority { priority })?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn project_collaborators(&self, project_id: &str) -> Result<Vec<RemoteCollaborator>> {
         let conn = self.connect()?;
         let id = resolve_project_id_from(&conn, project_id)?.unwrap_or_else(|| project_id.into());
@@ -2240,7 +2271,13 @@ impl Store {
                 &entry.operation,
                 Operation::MoveTask { .. } | Operation::MoveTaskParent { .. }
             );
-            let rejected_assignment = matches!(&entry.operation, Operation::UpdateAssignee { .. });
+            // Absolute single-field writes whose newest queued value supersedes
+            // a confirmed rejection of the same field.
+            let rejected_field_write = match &entry.operation {
+                Operation::UpdateAssignee { .. } => Some("update_assignee"),
+                Operation::UpdatePriority { .. } => Some("update_priority"),
+                _ => None,
+            };
             let mut checkpoint = if entry.checkpoint.is_object() {
                 entry.checkpoint
             } else {
@@ -2275,9 +2312,11 @@ impl Store {
             if rejected_move && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind') IN ('move_task','move_task_parent'))",params![entry.entity_id,seq],|row|row.get::<_,bool>(0))? {
                 supersede_rejected_task_moves(&tx,&entry.entity_id)?;
             }
-            if rejected_assignment && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind')='update_assignee')",params![entry.entity_id,seq],|row|row.get::<_,bool>(0))? {
-                // Discard only this confirmed rejection; newer assignments and
-                // unrelated failed operations remain intact.
+            if let Some(kind) = rejected_field_write
+                && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind')=?3)",params![entry.entity_id,seq,kind],|row|row.get::<_,bool>(0))?
+            {
+                // Discard only this confirmed rejection; newer values for the
+                // same field and unrelated failed operations remain intact.
                 tx.execute("DELETE FROM outbox WHERE seq=?1", [seq])?;
             }
         }
@@ -3363,6 +3402,17 @@ fn has_pending_assignee_edit(conn: &Connection, id: &str) -> Result<bool> {
     }))
 }
 
+fn has_pending_priority_expression(conn: &Connection, id: &str) -> Result<bool> {
+    let payloads = conn.prepare(
+        "SELECT payload FROM outbox WHERE entity_id=?1 AND json_extract(payload,'$.kind') IN ('quick_edit','quick_add')"
+    )?.query_map([id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(payloads.iter().any(|payload| {
+        matches!(serde_json::from_str::<Operation>(payload),
+            Ok(Operation::QuickEdit { expression, .. } | Operation::QuickAdd { expression, .. })
+            if crate::model::contains_priority(&expression))
+    }))
+}
+
 fn resolve_task_id_from(conn: &Connection, id: &str) -> Result<Option<String>> {
     resolve_alias(conn, "task_id_aliases", id)
 }
@@ -3642,6 +3692,19 @@ fn queue(tx: &Transaction<'_>, entity_id: &str, operation: Operation) -> Result<
             entity_id,
             serde_json::to_string(&operation)?
         ],
+    )?;
+    Ok(())
+}
+
+fn remove_pending_priority_updates(tx: &Transaction<'_>, entity_id: &str) -> Result<()> {
+    // Priority is an absolute field write, so the newest explicit choice
+    // replaces unsent or confirmed rejected earlier attempts. A claimed
+    // operation may already have reached Todoist and is left for the newer
+    // value to follow instead.
+    tx.execute(
+        "DELETE FROM outbox WHERE entity_id=?1 AND (claimed=0 OR error IS NOT NULL)
+         AND json_extract(payload,'$.kind')='update_priority'",
+        [entity_id],
     )?;
     Ok(())
 }
@@ -4232,6 +4295,97 @@ mod tests {
                 .as_deref(),
             Some("ada")
         );
+    }
+
+    fn queued_priorities(store: &Store) -> Vec<u8> {
+        store
+            .outbox()
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry.operation {
+                Operation::UpdatePriority { priority } => Some(priority),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn priority_changes_apply_locally_and_replace_unsent_or_rejected_attempts() {
+        let store = store();
+        store
+            .merge_remote(&[], &[remote_task("task", None)], &[], &[])
+            .unwrap();
+
+        assert!(store.update_priority("task", 4).unwrap());
+        assert_eq!(store.task("task").unwrap().unwrap().priority, 4);
+        assert_eq!(queued_priorities(&store), vec![4]);
+
+        // An unchanged priority is reported without queueing redundant work.
+        assert!(!store.update_priority("task", 4).unwrap());
+        assert_eq!(queued_priorities(&store), vec![4]);
+
+        // A newer choice replaces an attempt that has not been sent yet.
+        assert!(store.update_priority("task", 2).unwrap());
+        assert_eq!(store.task("task").unwrap().unwrap().priority, 2);
+        assert_eq!(queued_priorities(&store), vec![2]);
+
+        // A claimed request may already have reached Todoist, so the newer
+        // value follows it rather than rewriting it.
+        let claimed = store.claim_next_outbox().unwrap().unwrap();
+        assert!(store.update_priority("task", 1).unwrap());
+        assert_eq!(queued_priorities(&store), vec![2, 1]);
+
+        // The confirmed rejection is superseded by that newer value, so the
+        // task stops being blocked without the user repeating the change.
+        store.fail_outbox(claimed.seq, "rejected").unwrap();
+        assert_eq!(queued_priorities(&store), vec![1]);
+        assert!(store.outbox_error().unwrap().is_none());
+        assert!(store.claim_next_outbox().unwrap().is_some());
+
+        assert!(store.update_priority("task", 5).is_err());
+        assert!(store.update_priority("task", 0).is_err());
+        assert!(store.update_priority("missing", 3).is_err());
+    }
+
+    #[test]
+    fn repeating_a_priority_queues_it_again_while_an_expression_could_still_change_it() {
+        let store = store();
+        let inbox = store.projects().unwrap().remove(0);
+        let task = store.add_task("Write report p1", &inbox).unwrap();
+
+        // Todoist has not parsed the expression yet, so an explicit p4 must be
+        // recorded even though the cached task still shows the default.
+        assert_eq!(store.task(&task).unwrap().unwrap().priority, 1);
+        assert!(store.update_priority(&task, 1).unwrap());
+        assert_eq!(queued_priorities(&store), vec![1]);
+
+        // Without such a pending expression the same value is a no-op again.
+        let plain = store.add_task("Write summary", &inbox).unwrap();
+        assert!(!store.update_priority(&plain, 1).unwrap());
+        assert!(queued_priorities(&store).len() == 1);
+    }
+
+    #[test]
+    fn a_rejected_priority_change_survives_until_it_is_corrected() {
+        let store = store();
+        store
+            .merge_remote(&[], &[remote_task("task", None)], &[], &[])
+            .unwrap();
+        store.update_priority("task", 4).unwrap();
+        let claimed = store.claim_next_outbox().unwrap().unwrap();
+        store.fail_outbox(claimed.seq, "rejected priority").unwrap();
+
+        // Nothing newer exists, so the rejection stays durable and visible.
+        assert_eq!(queued_priorities(&store), vec![4]);
+        assert_eq!(
+            store.outbox_error().unwrap().as_deref(),
+            Some("rejected priority")
+        );
+
+        // Choosing a priority again supersedes it, even the rejected value.
+        assert!(store.update_priority("task", 4).unwrap());
+        assert_eq!(queued_priorities(&store), vec![4]);
+        assert!(store.outbox_error().unwrap().is_none());
     }
 
     #[test]

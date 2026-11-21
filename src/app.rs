@@ -606,6 +606,10 @@ impl App {
             self.move_to_space(space)?;
             return Ok(());
         }
+        if let Some(level) = action.priority() {
+            self.set_selected_priority(level)?;
+            return Ok(());
+        }
         match action {
             Action::EditLabels => self.open_labels()?,
             Action::EditAssignee => {
@@ -664,6 +668,10 @@ impl App {
             Action::Cancel
             | Action::RenameProject
             | Action::CloseDialog
+            | Action::Priority1
+            | Action::Priority2
+            | Action::Priority3
+            | Action::Priority4
             | Action::Space0
             | Action::Space1
             | Action::Space2
@@ -699,6 +707,15 @@ impl App {
                 self.status = "Draft cancelled".into();
             }
             return Ok(());
+        }
+        // Priority keys act on the task whose details are open, like the other
+        // task commands available from the dialog.
+        if let Some(level) = self.keybindings.main_action(key).and_then(Action::priority)
+            && let Some(Overlay::Details { task, .. }) = self.overlay.as_ref()
+        {
+            let task_id = task.id.clone();
+            self.overlay = None;
+            return self.set_priority(&task_id, level);
         }
         match self.overlay.as_mut() {
             Some(Overlay::Help { .. }) if self.keybindings.matches(Action::CloseDialog, key) => {
@@ -2457,6 +2474,36 @@ impl App {
         self.refresh_after_action(Some(task_id))?;
         self.focus = Focus::Tasks;
         self.status = "Due date removed · pending sync".into();
+        self.mark_pending_and_sync();
+        Ok(())
+    }
+
+    fn set_selected_priority(&mut self, level: u8) -> Result<()> {
+        if self.focus != Focus::Tasks {
+            return Ok(());
+        }
+        self.force_tasks()?;
+        let Some(task_id) = self.selected_task().map(|task| task.id.clone()) else {
+            return Ok(());
+        };
+        self.set_priority(&task_id, level)
+    }
+
+    fn set_priority(&mut self, task_id: &str, level: u8) -> Result<()> {
+        let before = self
+            .store
+            .task(task_id)?
+            .context("selected task no longer exists")?;
+        // Todoist numbers priorities in reverse, so p1 is stored as 4.
+        let priority = 5 - level.clamp(1, 4);
+        if !self.store.update_priority(&before.id, priority)? {
+            self.status = format!("Task is already p{level}");
+            return Ok(());
+        }
+        self.record_task_change(before.clone(), &before.id, "priority change")?;
+        self.refresh_after_action(Some(&before.id))?;
+        self.focus = Focus::Tasks;
+        self.status = format!("Priority set to p{level} · pending sync");
         self.mark_pending_and_sync();
         Ok(())
     }
@@ -4477,6 +4524,94 @@ mod tests {
             );
             assert_eq!(app.selected_task().unwrap().checked, !recurring);
         }
+    }
+
+    #[test]
+    fn priority_keys_set_todoist_priorities_from_the_list_and_details_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        let task_id = store.add_task("Prioritize me", &inbox).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        let press = |app: &mut App, character: char| {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        };
+
+        // Navigation focus keeps the digits inert.
+        press(&mut app, '1');
+        assert_eq!(app.store.task(&task_id).unwrap().unwrap().priority, 1);
+
+        press(&mut app, 'l');
+        press(&mut app, '1');
+        assert_eq!(app.selected_task().unwrap().priority, 4);
+        assert_eq!(app.status, "Priority set to p1 · pending sync");
+
+        press(&mut app, '3');
+        assert_eq!(app.selected_task().unwrap().priority, 2);
+        assert_eq!(app.selected_task().unwrap().id, task_id);
+
+        press(&mut app, '3');
+        assert_eq!(app.status, "Task is already p3");
+
+        // The same command is available while the task details are open.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.overlay, Some(Overlay::Details { .. })));
+        press(&mut app, '4');
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_task().unwrap().priority, 1);
+        assert_eq!(app.focus, Focus::Tasks);
+    }
+
+    #[test]
+    fn priority_changes_can_be_undone_and_redone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("todoist-tui.db")).unwrap();
+        let inbox = store.projects().unwrap().remove(0);
+        store.add_task("Prioritize me", &inbox).unwrap();
+        let sync = SyncManager::new(store.clone(), None).unwrap();
+        let mut app = App::new(
+            store,
+            sync,
+            KeyBindings::defaults(),
+            dir.path().join("config.toml"),
+        )
+        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_task().unwrap().priority, 3);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_task().unwrap().priority, 1);
+        assert_eq!(app.status, "Undid priority change · pending sync");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.selected_task().unwrap().priority, 3);
+        assert_eq!(app.status, "Redid priority change · pending sync");
+        assert_eq!(
+            app.store
+                .outbox()
+                .unwrap()
+                .into_iter()
+                .filter_map(|entry| match entry.operation {
+                    Operation::UpdatePriority { priority } => Some(priority),
+                    _ => None,
+                })
+                .next_back(),
+            Some(3)
+        );
     }
 
     #[test]

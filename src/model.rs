@@ -401,6 +401,15 @@ pub(crate) fn contains_assignee(expression: &str) -> bool {
         .any(|word| word.starts_with('+') && word.len() > 1)
 }
 
+pub(crate) fn contains_priority(expression: &str) -> bool {
+    expression.split_whitespace().any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "p1" | "p2" | "p3" | "p4" | "!!1" | "!!2" | "!!3" | "!!4"
+        )
+    })
+}
+
 fn default_priority() -> u8 {
     1
 }

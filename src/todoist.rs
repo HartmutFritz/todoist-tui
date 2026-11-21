@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::{
     model::{
         Due, Operation, OutboxEntry, RemoteCollaborator, RemoteCollaboratorState, RemoteFilter,
-        RemoteLabel, RemoteProject, RemoteTask, Task, contains_assignee,
+        RemoteLabel, RemoteProject, RemoteTask, Task, contains_assignee, contains_priority,
     },
     store::Store,
 };
@@ -1397,15 +1397,6 @@ fn contains_explicit_project(expression: &str) -> bool {
     expression.split_whitespace().any(|word| {
         word.strip_prefix('#')
             .is_some_and(|project| !project.is_empty())
-    })
-}
-
-fn contains_priority(expression: &str) -> bool {
-    expression.split_whitespace().any(|word| {
-        matches!(
-            word.to_ascii_lowercase().as_str(),
-            "p1" | "p2" | "p3" | "p4" | "!!1" | "!!2" | "!!3" | "!!4"
-        )
     })
 }
 

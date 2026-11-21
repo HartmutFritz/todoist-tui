@@ -1156,6 +1156,16 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
             "close help, task details, or filter details",
         ),
     ];
+    const PRIORITY_HELP: [&str; 4] = [
+        "set selected task priority p1",
+        "set selected task priority p2",
+        "set selected task priority p3",
+        "set selected task priority p4",
+    ];
+    for (index, meaning) in PRIORITY_HELP.into_iter().enumerate() {
+        let action = Action::for_priority(index as u8 + 1).expect("priority level range is valid");
+        help.push((keys.display(action).into(), meaning));
+    }
     const SPACE_HELP: [&str; 10] = [
         "assign/remove project space 0",
         "assign/remove project space 1",

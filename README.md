@@ -115,6 +115,7 @@ below mean Shift+letter.
 | `d` | Complete / reopen a task |
 | `D` | Delete a task and its subtasks |
 | `t` / `T` | Edit / remove the due date |
+| `1` … `4` | Set the selected task's priority to p1 … p4 |
 | `@` / `v` | Toggle a label / move a task to another project |
 | `+` | Fuzzy-search an assignee for a team/shared task; choose Unassigned to clear |
 | `>` / `<` | Indent / promote a task |
@@ -200,6 +201,11 @@ Natural-language metadata is confirmed by Todoist during synchronization.
 Use `e` to edit a task's title and description; metadata not mentioned in the
 edited expression is preserved. Use `t` for a due expression such as `tod`,
 `tomorrow at 9`, or `every Friday`. Empty due input removes the date.
+
+From the task list or task details, `1` to `4` set the selected task's priority
+directly, where `1` is p1 and `4` is p4. The change applies immediately, works
+offline, supports undo/redo, and is queued for synchronization. The bindings are
+configurable as `[keybindings].priority_1` to `priority_4`.
 
 For a task in a team/shared project, add `+Name` to the edited first line, such as
 `Review proposal +Ada`. Todoist resolves the name during synchronization using

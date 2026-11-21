@@ -37,6 +37,10 @@ pub enum Action {
     OutdentTask,
     EditDue,
     RemoveDue,
+    Priority1,
+    Priority2,
+    Priority3,
+    Priority4,
     ShowError,
     ShowOutbox,
     AddTaskTop,
@@ -71,7 +75,7 @@ pub enum Action {
 }
 
 impl Action {
-    const ALL: [Self; 55] = [
+    const ALL: [Self; 59] = [
         Self::Down,
         Self::Up,
         Self::DownFive,
@@ -97,6 +101,10 @@ impl Action {
         Self::OutdentTask,
         Self::EditDue,
         Self::RemoveDue,
+        Self::Priority1,
+        Self::Priority2,
+        Self::Priority3,
+        Self::Priority4,
         Self::ShowError,
         Self::ShowOutbox,
         Self::AddTaskTop,
@@ -192,6 +200,10 @@ struct BindingConfig {
     outdent_task: Vec<String>,
     edit_due: Vec<String>,
     remove_due: Vec<String>,
+    priority_1: Vec<String>,
+    priority_2: Vec<String>,
+    priority_3: Vec<String>,
+    priority_4: Vec<String>,
     show_error: Vec<String>,
     show_outbox: Vec<String>,
     add_task_top: Vec<String>,
@@ -260,6 +272,10 @@ impl Default for BindingConfig {
             outdent_task: strings(&["<"]),
             edit_due: strings(&["t"]),
             remove_due: strings(&["shift+t"]),
+            priority_1: strings(&["1"]),
+            priority_2: strings(&["2"]),
+            priority_3: strings(&["3"]),
+            priority_4: strings(&["4"]),
             show_error: strings(&["shift+e"]),
             show_outbox: strings(&["shift+s"]),
             add_task_top: strings(&["a"]),
@@ -441,6 +457,10 @@ impl KeyBindings {
             (Action::OutdentTask, config.outdent_task),
             (Action::EditDue, config.edit_due),
             (Action::RemoveDue, config.remove_due),
+            (Action::Priority1, config.priority_1),
+            (Action::Priority2, config.priority_2),
+            (Action::Priority3, config.priority_3),
+            (Action::Priority4, config.priority_4),
             (Action::ShowError, config.show_error),
             (Action::ShowOutbox, config.show_outbox),
             (Action::AddTaskTop, add_task_top),
@@ -647,6 +667,10 @@ impl Action {
             Self::OutdentTask => "outdent_task",
             Self::EditDue => "edit_due",
             Self::RemoveDue => "remove_due",
+            Self::Priority1 => "priority_1",
+            Self::Priority2 => "priority_2",
+            Self::Priority3 => "priority_3",
+            Self::Priority4 => "priority_4",
             Self::ShowError => "show_error",
             Self::ShowOutbox => "show_outbox",
             Self::AddTaskTop => "add_task_top",
@@ -693,6 +717,27 @@ impl Action {
             7 => Some(Self::Space7),
             8 => Some(Self::Space8),
             9 => Some(Self::Space9),
+            _ => None,
+        }
+    }
+
+    /// `level` is the displayed priority, so 1 is p1 and 4 is p4.
+    pub const fn for_priority(level: u8) -> Option<Self> {
+        match level {
+            1 => Some(Self::Priority1),
+            2 => Some(Self::Priority2),
+            3 => Some(Self::Priority3),
+            4 => Some(Self::Priority4),
+            _ => None,
+        }
+    }
+
+    pub const fn priority(self) -> Option<u8> {
+        match self {
+            Self::Priority1 => Some(1),
+            Self::Priority2 => Some(2),
+            Self::Priority3 => Some(3),
+            Self::Priority4 => Some(4),
             _ => None,
         }
     }
@@ -922,6 +967,48 @@ mod tests {
             keys.special_add_project(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
             Some("week")
         );
+    }
+
+    #[test]
+    fn priority_digits_are_bound_by_default_and_remain_configurable() {
+        let bindings = KeyBindings::defaults();
+        for (character, level) in [('1', 1), ('2', 2), ('3', 3), ('4', 4)] {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert_eq!(
+                bindings.main_action(key).and_then(Action::priority),
+                Some(level)
+            );
+            assert_eq!(
+                Action::for_priority(level).and_then(Action::priority),
+                Some(level)
+            );
+        }
+        assert_eq!(Action::for_priority(0), None);
+        assert_eq!(Action::for_priority(5), None);
+        assert_eq!(Action::Down.priority(), None);
+
+        let config: FileConfig =
+            toml::from_str("[keybindings]\npriority_1 = ['alt+1']\npriority_2 = []\n").unwrap();
+        let bindings = KeyBindings::from_file_config(config).unwrap();
+        assert_eq!(
+            bindings
+                .main_action(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT))
+                .and_then(Action::priority),
+            Some(1)
+        );
+        assert!(
+            bindings
+                .main_action(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+                .is_none()
+        );
+        assert_eq!(bindings.display(Action::Priority2), "unbound");
+
+        let conflicting: FileConfig =
+            toml::from_str("[keybindings]\npriority_1 = ['d']\n").unwrap();
+        assert!(KeyBindings::from_file_config(conflicting).is_err());
+        let conflicting_special: FileConfig =
+            toml::from_str("[special_add]\n'3' = '#week'\n").unwrap();
+        assert!(KeyBindings::from_file_config(conflicting_special).is_err());
     }
 
     #[test]
