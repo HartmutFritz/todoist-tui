@@ -176,6 +176,12 @@ pub struct Task {
     pub section_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTitle {
+    pub id: String,
+    pub content: String,
+}
+
 impl Task {
     pub fn display_group(&self) -> Option<&str> {
         self.labels
@@ -224,6 +230,9 @@ pub enum Operation {
     UpdateTask {
         content: String,
         description: String,
+    },
+    RenameTask {
+        content: String,
     },
     QuickEdit {
         expression: String,

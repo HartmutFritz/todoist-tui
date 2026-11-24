@@ -41,6 +41,7 @@ pub enum EditorPurpose {
     EditFilter,
     AddProject,
     RenameProject,
+    BulkRename,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +100,11 @@ impl EmbeddedEditor {
     #[cfg(test)]
     pub fn purpose(&self) -> EditorPurpose {
         self.purpose
+    }
+
+    #[cfg(test)]
+    pub fn task_id(&self) -> Option<&str> {
+        self.task_id.as_deref()
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -193,7 +199,10 @@ impl EmbeddedEditor {
             EditorPurpose::Due => {
                 command.args(["-c", "normal! G$", "-c", "startinsert!"]);
             }
-            EditorPurpose::Edit | EditorPurpose::EditFilter | EditorPurpose::RenameProject => {
+            EditorPurpose::Edit
+            | EditorPurpose::EditFilter
+            | EditorPurpose::RenameProject
+            | EditorPurpose::BulkRename => {
                 command.args(["-c", "normal! gg$", "-c", "startinsert!"]);
             }
         }
@@ -990,6 +999,7 @@ mod tests {
                 EditorPurpose::EditFilter,
                 EditorPurpose::AddProject,
                 EditorPurpose::RenameProject,
+                EditorPurpose::BulkRename,
             ] {
                 let mut editor = EmbeddedEditor::open_inner_with_options(
                     purpose,

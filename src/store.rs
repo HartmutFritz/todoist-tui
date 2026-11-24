@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::model::{
     Due, Filter, INBOX_LOCAL_ID, NavId, NavRow, Operation, OutboxEntry, PROJECT_SPACE_COUNT,
     Project, RemoteCollaborator, RemoteCollaboratorState, RemoteFilter, RemoteLabel, RemoteProject,
-    RemoteTask, Task, TaskOrder,
+    RemoteTask, Task, TaskOrder, TaskTitle,
 };
 
 #[path = "store_diagnostics.rs"]
@@ -1027,6 +1027,68 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Rename only titles, atomically, without invoking Quick Add parsing or
+    /// writing descriptions and other metadata back to the server.
+    pub fn rename_tasks(&self, titles: &[TaskTitle]) -> Result<(Vec<TaskTitle>, Vec<TaskTitle>)> {
+        let conn = self.connect()?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let mut seen = HashSet::new();
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for title in titles {
+            anyhow::ensure!(
+                !title.content.trim().is_empty(),
+                "Task titles cannot be empty"
+            );
+            anyhow::ensure!(
+                !title.content.contains(['\n', '\r']),
+                "Each task title must occupy one line"
+            );
+            let id = resolve_task_id_from(&tx, &title.id)?.unwrap_or_else(|| title.id.clone());
+            anyhow::ensure!(
+                seen.insert(id.clone()),
+                "A task appears more than once in the rename batch"
+            );
+            let current =
+                task_from(&tx, &id)?.context("A task to rename is no longer available")?;
+            if current.content == title.content {
+                continue;
+            }
+            before.push(TaskTitle {
+                id: id.clone(),
+                content: current.content,
+            });
+            after.push(TaskTitle {
+                id: id.clone(),
+                content: title.content.clone(),
+            });
+            tx.execute(
+                "UPDATE tasks SET content=?2 WHERE id=?1",
+                params![id, title.content],
+            )?;
+            tx.execute("DELETE FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind')='rename_task'", [&id])?;
+            queue(
+                &tx,
+                &id,
+                Operation::RenameTask {
+                    content: title.content.clone(),
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok((before, after))
+    }
+
+    pub fn resolve_task_ids<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        ids.into_iter()
+            .map(|id| Ok(resolve_task_id_from(&conn, id)?.unwrap_or_else(|| id.to_owned())))
+            .collect()
     }
 
     pub fn update_due(&self, id: &str, due_string: &str) -> Result<()> {
@@ -2276,6 +2338,7 @@ impl Store {
             let rejected_field_write = match &entry.operation {
                 Operation::UpdateAssignee { .. } => Some("update_assignee"),
                 Operation::UpdatePriority { .. } => Some("update_priority"),
+                Operation::RenameTask { .. } => Some("rename_task"),
                 _ => None,
             };
             let mut checkpoint = if entry.checkpoint.is_object() {
@@ -3319,6 +3382,7 @@ fn preserve_pending_task_fields(
                 remote.content.clone_from(&local.content);
                 remote.description.clone_from(&local.description);
             }
+            Operation::RenameTask { .. } => remote.content.clone_from(&local.content),
             Operation::UpdateDue { .. }
             | Operation::RestoreDue { .. }
             | Operation::RestoreRecurring { .. } => remote.due.clone_from(&local.due),
@@ -3746,7 +3810,9 @@ fn supersede_rejected_task_updates(tx: &Transaction<'_>, id: &str, deleting: boo
         if !deleting
             && !matches!(
                 operation,
-                Operation::QuickEdit { .. } | Operation::UpdateTask { .. }
+                Operation::QuickEdit { .. }
+                    | Operation::UpdateTask { .. }
+                    | Operation::RenameTask { .. }
             )
         {
             continue;
@@ -4238,6 +4304,120 @@ mod tests {
         assert_eq!(reopened.project_collaborators("team").unwrap()[0].id, "bob");
         reopened.merge_collaborator_states(&[], true).unwrap();
         assert!(reopened.project_collaborators("team").unwrap().is_empty());
+    }
+
+    #[test]
+    fn literal_title_batches_are_atomic_validate_all_targets_and_preserve_other_fields() {
+        let store = assignment_store();
+        store.update_assignee("task", Some("ada")).unwrap();
+        for entry in store.outbox().unwrap() {
+            store.finish_outbox(entry.seq).unwrap();
+        }
+        let second: RemoteTask = serde_json::from_value(serde_json::json!({"id":"second","project_id":"team","content":"Second","description":"Keep note","checked":true,"priority":3})).unwrap();
+        store.merge_remote(&[], &[second], &[], &[]).unwrap();
+        let before = store.task("task").unwrap().unwrap();
+        for invalid in [
+            TaskTitle {
+                id: "missing".into(),
+                content: "Missing task".into(),
+            },
+            TaskTitle {
+                id: "second".into(),
+                content: "  ".into(),
+            },
+            TaskTitle {
+                id: "task".into(),
+                content: "Duplicate target".into(),
+            },
+            TaskTitle {
+                id: "second".into(),
+                content: "Embedded\nline break".into(),
+            },
+        ] {
+            assert!(
+                store
+                    .rename_tasks(&[
+                        TaskTitle {
+                            id: "task".into(),
+                            content: "Must roll back".into()
+                        },
+                        invalid
+                    ])
+                    .is_err()
+            );
+            assert_eq!(store.task("task").unwrap().unwrap(), before);
+            assert_eq!(store.outbox_len().unwrap(), 0);
+        }
+        let titles = [
+            TaskTitle {
+                id: "task".into(),
+                content: "  tomorrow @literal p1 +Name  ".into(),
+            },
+            TaskTitle {
+                id: "second".into(),
+                content: "Same title".into(),
+            },
+        ];
+        let (old, new) = store.rename_tasks(&titles).unwrap();
+        assert_eq!(old.len(), 2);
+        assert_eq!(new, titles);
+        let mut expected = before;
+        expected.content = titles[0].content.clone();
+        assert_eq!(store.task("task").unwrap().unwrap(), expected);
+        let second = store.task("second").unwrap().unwrap();
+        assert!(second.checked);
+        assert_eq!(second.priority, 3);
+        assert_eq!(second.description, "Keep note");
+        assert_eq!(store.outbox_len().unwrap(), 2);
+        assert!(store.rename_tasks(&titles).unwrap().1.is_empty());
+        assert_eq!(store.outbox_len().unwrap(), 2);
+    }
+
+    #[test]
+    fn title_renames_protect_creation_and_edit_writebacks_without_freezing_other_fields() {
+        let store = assignment_store();
+        store
+            .edit_task("task", "Parsed tomorrow", "Old note")
+            .unwrap();
+        let edit = store.claim_next_outbox().unwrap().unwrap();
+        store
+            .rename_tasks(&[TaskTitle {
+                id: "task".into(),
+                content: "Literal tomorrow p1".into(),
+            }])
+            .unwrap();
+        let mut parsed = store.task("task").unwrap().unwrap();
+        parsed.content = "Parsed".into();
+        parsed.description = "Parsed note".into();
+        parsed.priority = 4;
+        store.apply_synced_task_edit(&parsed, edit.seq).unwrap();
+        let task = store.task("task").unwrap().unwrap();
+        assert_eq!(task.content, "Literal tomorrow p1");
+        assert_eq!(task.description, "Parsed note");
+        assert_eq!(task.priority, 4);
+        let local = store
+            .add_task(
+                "Unparsed tomorrow",
+                &store.project("team").unwrap().unwrap(),
+            )
+            .unwrap();
+        let (before, _) = store
+            .rename_tasks(&[TaskTitle {
+                id: local.clone(),
+                content: "Literal created title".into(),
+            }])
+            .unwrap();
+        let created: RemoteTask = serde_json::from_value(serde_json::json!({"id":"created","project_id":"team","content":"Unparsed","description":"Creation response note","responsible_uid":"ada","priority":3})).unwrap();
+        store.replace_task_id(&local, &created).unwrap();
+        let task = store.task(&local).unwrap().unwrap();
+        assert_eq!(task.content, "Literal created title");
+        assert_eq!(task.description, "Creation response note");
+        assert_eq!(task.responsible_uid.as_deref(), Some("ada"));
+        store.rename_tasks(&before).unwrap();
+        let restored = store.task("created").unwrap().unwrap();
+        assert_eq!(restored.content, "Unparsed tomorrow");
+        assert_eq!(restored.description, "Creation response note");
+        assert_eq!(restored.priority, 3);
     }
 
     #[test]

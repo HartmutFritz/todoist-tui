@@ -29,6 +29,8 @@ pub enum Action {
     MoveProjectUp,
     CopyTitle,
     EditTask,
+    ToggleTaskSelection,
+    BulkRename,
     CompleteTask,
     DeleteTask,
     MoveTask,
@@ -75,7 +77,7 @@ pub enum Action {
 }
 
 impl Action {
-    const ALL: [Self; 59] = [
+    const ALL: [Self; 61] = [
         Self::Down,
         Self::Up,
         Self::DownFive,
@@ -93,6 +95,8 @@ impl Action {
         Self::MoveProjectUp,
         Self::CopyTitle,
         Self::EditTask,
+        Self::ToggleTaskSelection,
+        Self::BulkRename,
         Self::CompleteTask,
         Self::DeleteTask,
         Self::MoveTask,
@@ -192,6 +196,8 @@ struct BindingConfig {
     move_project_up: Vec<String>,
     copy_title: Vec<String>,
     edit_task: Vec<String>,
+    toggle_task_selection: Vec<String>,
+    bulk_rename: Vec<String>,
     complete_task: Vec<String>,
     delete_task: Vec<String>,
     move_task: Vec<String>,
@@ -264,6 +270,8 @@ impl Default for BindingConfig {
             move_project_up: strings(&["shift+k"]),
             copy_title: strings(&["y"]),
             edit_task: strings(&["e"]),
+            toggle_task_selection: strings(&["space"]),
+            bulk_rename: strings(&["r"]),
             complete_task: strings(&["d"]),
             delete_task: strings(&["shift+d"]),
             move_task: strings(&["v"]),
@@ -449,6 +457,8 @@ impl KeyBindings {
             (Action::MoveProjectUp, config.move_project_up),
             (Action::CopyTitle, config.copy_title),
             (Action::EditTask, config.edit_task),
+            (Action::ToggleTaskSelection, config.toggle_task_selection),
+            (Action::BulkRename, config.bulk_rename),
             (Action::CompleteTask, config.complete_task),
             (Action::DeleteTask, config.delete_task),
             (Action::MoveTask, config.move_task),
@@ -530,7 +540,10 @@ impl KeyBindings {
         bindings.validate_first_sequence()?;
         bindings.validate_main_collisions()?;
         for action in Action::ALL {
-            if matches!(action, Action::Cancel | Action::RenameProject) {
+            if matches!(
+                action,
+                Action::Cancel | Action::RenameProject | Action::BulkRename
+            ) {
                 continue;
             }
             for sequence in &bindings.parsed[&action] {
@@ -548,6 +561,9 @@ impl KeyBindings {
             }
             if bindings.main.contains_key(&stroke)
                 || bindings.parsed[&Action::RenameProject]
+                    .iter()
+                    .any(|sequence| sequence.as_slice() == [stroke.clone()])
+                || bindings.parsed[&Action::BulkRename]
                     .iter()
                     .any(|sequence| sequence.as_slice() == [stroke.clone()])
                 || bindings
@@ -622,6 +638,8 @@ impl KeyBindings {
                         (*other, action),
                         (Action::Sync, Action::RenameProject)
                             | (Action::RenameProject, Action::Sync)
+                            | (Action::Sync, Action::BulkRename)
+                            | (Action::BulkRename, Action::Sync)
                     ) {
                         continue;
                     }
@@ -659,6 +677,8 @@ impl Action {
             Self::MoveProjectUp => "move_project_up",
             Self::CopyTitle => "copy_title",
             Self::EditTask => "edit_task",
+            Self::ToggleTaskSelection => "toggle_task_selection",
+            Self::BulkRename => "bulk_rename",
             Self::CompleteTask => "complete_task",
             Self::DeleteTask => "delete_task",
             Self::MoveTask => "move_task",
@@ -1415,6 +1435,32 @@ mod tests {
     fn distributed_example_is_valid() {
         let file: FileConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
         KeyBindings::from_file_config(file).unwrap();
+    }
+
+    #[test]
+    fn bulk_rename_can_share_sync_but_not_other_actions_or_special_add_keys() {
+        let defaults = KeyBindings::defaults();
+        let rename = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(defaults.main_action(rename), Some(Action::Sync));
+        assert!(defaults.matches(Action::BulkRename, rename));
+        assert_eq!(
+            defaults.main_action(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Some(Action::ToggleTaskSelection)
+        );
+        let shared: FileConfig = toml::from_str(
+            "[keybindings]\nsync=['f5']\nbulk_rename=['f5']\ntoggle_task_selection=['ctrl+space']",
+        )
+        .unwrap();
+        assert!(KeyBindings::from_file_config(shared).is_ok());
+        let collision: FileConfig = toml::from_str("[keybindings]\nbulk_rename=['e']").unwrap();
+        assert!(KeyBindings::from_file_config(collision).is_err());
+        let collision: FileConfig =
+            toml::from_str("[keybindings]\nsync=[]\nbulk_rename=['b']\n[special_add]\nb='Inbox'")
+                .unwrap();
+        assert!(KeyBindings::from_file_config(collision).is_err());
+        let unbound: FileConfig =
+            toml::from_str("[keybindings]\nbulk_rename=[]\ntoggle_task_selection=[]").unwrap();
+        assert!(KeyBindings::from_file_config(unbound).is_ok());
     }
 
     #[test]

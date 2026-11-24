@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::{
@@ -28,6 +28,7 @@ const RED: Color = Color::Rgb(164, 49, 61);
 const RED_BRIGHT: Color = Color::Rgb(211, 84, 96);
 const SELECT: Color = Color::Rgb(91, 34, 42);
 const INACTIVE_SELECT: Color = Color::Rgb(57, 57, 63);
+const MARKED: Color = Color::Rgb(47, 31, 36);
 const TEXT: Color = Color::Rgb(226, 222, 220);
 const MUTED: Color = Color::Rgb(139, 134, 132);
 const GOLD: Color = Color::Rgb(209, 166, 73);
@@ -75,6 +76,8 @@ impl TaskRenderCache {
         selected: Option<usize>,
         focused: bool,
         height: usize,
+        tasks: &[Task],
+        marked: &HashSet<String>,
     ) -> Vec<Line<'static>> {
         self.scroll = task_scroll(
             &self.layout.positions,
@@ -84,6 +87,7 @@ impl TaskRenderCache {
             self.scroll,
         );
         let scroll = self.scroll;
+        let mut task_index = self.layout.ends.partition_point(|end| *end <= scroll);
         let selected_range = selected.filter(|_| focused).and_then(|index| {
             Some((
                 *self.layout.positions.get(index)?,
@@ -97,7 +101,26 @@ impl TaskRenderCache {
             .skip(scroll)
             .take(height)
             .map(|(row, line)| {
+                while self
+                    .layout
+                    .ends
+                    .get(task_index)
+                    .is_some_and(|end| row >= *end)
+                {
+                    task_index += 1;
+                }
+                let task_start = self.layout.positions.get(task_index).copied();
+                let is_marked = task_start.is_some_and(|start| row >= start)
+                    && tasks
+                        .get(task_index)
+                        .is_some_and(|task| marked.contains(&task.id));
                 let mut line = line.clone();
+                if is_marked {
+                    line.style = line.style.bg(MARKED);
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(MARKED);
+                    }
+                }
                 if let Some((start, end)) =
                     selected_range.filter(|(start, end)| row >= *start && row < *end)
                 {
@@ -114,6 +137,16 @@ impl TaskRenderCache {
                         line.spans[0].content = "▸ ".into();
                     }
                     debug_assert!(end > start);
+                }
+                if is_marked && task_start == Some(row) {
+                    let focused_row =
+                        selected_range.is_some_and(|(start, end)| row >= start && row < end);
+                    line.spans[0].content = if focused_row { "▸✓" } else { "✓ " }.into();
+                    line.spans[0].style = line.spans[0].style.fg(if focused_row {
+                        Color::White
+                    } else {
+                        RED_BRIGHT
+                    });
                 }
                 line
             })
@@ -232,7 +265,15 @@ fn navigation_selection_color(focus: Focus) -> Color {
 fn draw_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let content_width = area.width.saturating_sub(2 + TASK_RIGHT_PADDING).into();
     let group_by_date = matches!(app.selected_nav(), Some(NavId::Upcoming));
-    let title = format!(" {} ", app.selected_nav_name());
+    let title = if app.marked_tasks.is_empty() {
+        format!(" {} ", app.selected_nav_name())
+    } else {
+        format!(
+            " {} · {} selected ",
+            app.selected_nav_name(),
+            app.marked_tasks.len()
+        )
+    };
     app.task_render_cache.ensure(
         &app.tasks,
         content_width,
@@ -241,9 +282,13 @@ fn draw_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         app.show_completed_tasks,
     );
     let inner_height = area.height.saturating_sub(2 + LIST_TOP_PADDING) as usize;
-    let lines =
-        app.task_render_cache
-            .visible(app.task_cursor, app.focus == Focus::Tasks, inner_height);
+    let lines = app.task_render_cache.visible(
+        app.task_cursor,
+        app.focus == Focus::Tasks,
+        inner_height,
+        &app.tasks,
+        &app.marked_tasks,
+    );
     frame.render_widget(
         Paragraph::new(lines).block(
             panel(Line::from(title), app.focus == Focus::Tasks).padding(Padding::new(
@@ -1076,6 +1121,14 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
             "edit title and description",
         ),
         (
+            keys.display(Action::ToggleTaskSelection).into(),
+            "toggle task selection, then move down",
+        ),
+        (
+            keys.display(Action::BulkRename).into(),
+            "bulk rename selected task titles in Neovim",
+        ),
+        (
             keys.display(Action::CompleteTask).into(),
             "complete / reopen selected task",
         ),
@@ -1224,6 +1277,10 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
         ]));
     }
     lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  Single-task editing commands also work in task details.",
+        Style::default().fg(MUTED),
+    ));
     lines.push(Line::styled(
         format!("  Config: {config_path}"),
         Style::default().fg(MUTED),
@@ -1777,7 +1834,13 @@ mod tests {
         let started = std::time::Instant::now();
         for selected in 0..20 {
             cache.ensure(&tasks, 80, true, false, false);
-            std::hint::black_box(cache.visible(Some(selected + 5000), true, 30));
+            std::hint::black_box(cache.visible(
+                Some(selected + 5000),
+                true,
+                30,
+                &tasks,
+                &HashSet::new(),
+            ));
         }
         eprintln!("20 cached viewport redraws: {:?}", started.elapsed());
     }
@@ -1800,7 +1863,7 @@ mod tests {
                 let mut cache = TaskRenderCache::default();
                 cache.ensure(&tasks, 18, true, false, true);
                 assert_eq!(
-                    cache.visible(Some(selected), focused, 5),
+                    cache.visible(Some(selected), focused, 5, &tasks, &HashSet::new()),
                     full.into_iter().skip(scroll).take(5).collect::<Vec<_>>()
                 );
             }
@@ -1810,9 +1873,68 @@ mod tests {
         cache.invalidate();
         cache.ensure(&tasks, 40, false, false, true);
         assert_eq!(
-            cache.visible(None, false, 30),
+            cache.visible(None, false, 30, &tasks, &HashSet::new()),
             task_lines(&tasks, None, false, false, false, true, 40).0
         );
+    }
+
+    #[test]
+    fn marked_task_rows_reuse_layout_keep_one_cursor_and_never_style_headings() {
+        let mut tasks = vec![
+            task(
+                "A long marked title wrapping across several rows",
+                &["Home"],
+            ),
+            task(
+                "Completed marked task wrapping across several rows",
+                &["Work"],
+            ),
+            task("Unmarked task", &["Work"]),
+        ];
+        tasks[1].checked = true;
+        let marked = HashSet::from([tasks[0].id.clone(), tasks[1].id.clone()]);
+        let mut cache = TaskRenderCache::default();
+        cache.ensure(&tasks, 18, true, false, true);
+        let layout_pointer = cache.layout.lines.as_ptr();
+        let rows = cache.visible(Some(1), true, 100, &tasks, &marked);
+        assert_eq!(
+            rows.iter()
+                .filter(|line| line
+                    .spans
+                    .first()
+                    .is_some_and(|span| span.content.contains('✓')))
+                .count(),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|line| line
+                    .spans
+                    .first()
+                    .is_some_and(|span| span.content.contains('▸')))
+                .count(),
+            1
+        );
+        for (index, row) in rows.iter().enumerate() {
+            if (cache.layout.positions[0]..cache.layout.ends[0]).contains(&index) {
+                assert_eq!(row.style.bg, Some(MARKED));
+            } else if (cache.layout.positions[1]..cache.layout.ends[1]).contains(&index) {
+                assert_eq!(row.style.bg, Some(SELECT));
+                assert!(
+                    row.spans
+                        .iter()
+                        .any(|span| span.style.add_modifier.contains(Modifier::CROSSED_OUT))
+                );
+            } else {
+                assert_ne!(row.style.bg, Some(MARKED));
+                assert_ne!(row.style.bg, Some(SELECT));
+            }
+        }
+        cache.visible(Some(2), true, 6, &tasks, &marked);
+        let scroll = cache.scroll;
+        cache.visible(Some(2), true, 6, &tasks, &HashSet::new());
+        assert_eq!(cache.scroll, scroll);
+        assert_eq!(cache.layout.lines.as_ptr(), layout_pointer);
     }
 
     #[test]
@@ -1821,7 +1943,7 @@ mod tests {
         let mut cache = TaskRenderCache::default();
         cache.ensure(&tasks, 8, false, false, false);
         assert!(cache.layout.positions[1] > u16::MAX as usize);
-        let visible = cache.visible(Some(1), true, 6);
+        let visible = cache.visible(Some(1), true, 6, &tasks, &HashSet::new());
         assert!(
             visible
                 .iter()

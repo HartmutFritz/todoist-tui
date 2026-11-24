@@ -49,6 +49,10 @@ move_project_down = ["shift+j"]
 move_project_up = ["shift+k"]
 copy_title = ["y"]
 edit_task = ["e"]
+# Toggle the current task's bulk-selection mark, then advance one row.
+toggle_task_selection = ["space"]
+# Contextual: overrides sync only in Tasks while tasks are marked.
+bulk_rename = ["r"]
 complete_task = ["d"]
 delete_task = ["shift+d"]
 move_task = ["v"]

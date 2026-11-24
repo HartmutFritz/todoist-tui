@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
@@ -15,7 +16,7 @@ use crate::{
     clipboard,
     editor::{EditorCursorShape, EditorOptions, EditorPurpose, EditorResult, EmbeddedEditor},
     keymap::{Action, KeyBindings},
-    model::{Filter, NavId, NavRow, Project, Task},
+    model::{Filter, NavId, NavRow, Project, Task, TaskTitle},
     store::{OUTBOX_PAGE_SIZE, OutboxPage, Store, TaskViewPreferences},
     sync::{SyncEvent, SyncFailureKind, SyncManager},
 };
@@ -27,6 +28,8 @@ const EDITOR_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SYNC_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HISTORY_LIMIT: usize = 100;
+const MAX_SYNC_EVENTS_PER_TICK: usize = 8;
+const SYNC_EVENT_BUDGET: Duration = Duration::from_millis(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -119,6 +122,7 @@ pub struct EditorDraft {
     special_add_target: Option<Project>,
     fallback: Option<Project>,
     placement: AddPlacement,
+    bulk_rename_targets: Option<Vec<TaskTitle>>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +241,10 @@ enum AddPlacement {
 
 #[derive(Debug, Clone)]
 enum HistoryEntry {
+    Rename {
+        before: Vec<TaskTitle>,
+        after: Vec<TaskTitle>,
+    },
     Change {
         before: Vec<Task>,
         after: Vec<Task>,
@@ -258,6 +266,7 @@ enum HistoryEntry {
 impl HistoryEntry {
     fn action(&self) -> &'static str {
         match self {
+            Self::Rename { .. } => "bulk rename",
             Self::Change { action, .. } => action,
             Self::Add {
                 parent_id: Some(_), ..
@@ -303,6 +312,7 @@ pub struct App {
     pub tasks: Vec<Task>,
     pub task_render_cache: crate::ui::TaskRenderCache,
     pub task_cursor: Option<usize>,
+    pub marked_tasks: HashSet<String>,
     pub focus: Focus,
     pub status: String,
     pub sync_status: SyncStatus,
@@ -330,11 +340,13 @@ pub struct App {
     last_sync_started: Instant,
     scheduled_sync_running: bool,
     sync_follow_up_requested: bool,
+    sync_events_pending: bool,
     transient_status: Option<(String, Instant)>,
     persistent_status: Option<String>,
     editor_options: EditorOptions,
     editor_add_fallback: Option<Project>,
     editor_mutation_committed: bool,
+    bulk_rename_targets: Option<Vec<TaskTitle>>,
     clipboard: clipboard::Clipboard,
     clipboard_success_message: &'static str,
     outbox_load: Option<std::sync::mpsc::Receiver<Result<OutboxPage>>>,
@@ -374,6 +386,7 @@ impl App {
             tasks: Vec::new(),
             task_render_cache: crate::ui::TaskRenderCache::default(),
             task_cursor: None,
+            marked_tasks: HashSet::new(),
             focus: Focus::Navigation,
             status,
             sync_status,
@@ -401,11 +414,13 @@ impl App {
             last_sync_started: Instant::now(),
             scheduled_sync_running: false,
             sync_follow_up_requested: false,
+            sync_events_pending: false,
             transient_status: None,
             persistent_status,
             editor_options: EditorOptions::default(),
             editor_add_fallback: None,
             editor_mutation_committed: false,
+            bulk_rename_targets: None,
             clipboard: clipboard::Clipboard::default(),
             clipboard_success_message: "Title copied",
             outbox_load: None,
@@ -442,6 +457,9 @@ impl App {
     }
 
     pub fn tick(&mut self) -> Result<bool> {
+        if self.quit {
+            return Ok(false);
+        }
         let mut changed = false;
         let outbox_result =
             self.outbox_load
@@ -476,9 +494,21 @@ impl App {
                 changed = true;
             }
         }
-        while let Some(event) = self.sync.next_event() {
+        self.sync_events_pending = false;
+        let sync_started = Instant::now();
+        for index in 0..MAX_SYNC_EVENTS_PER_TICK {
+            let Some(event) = self.sync.next_event() else {
+                break;
+            };
             changed = true;
             self.handle_sync_event(event)?;
+            if index + 1 == MAX_SYNC_EVENTS_PER_TICK || sync_started.elapsed() >= SYNC_EVENT_BUDGET
+            {
+                // A queued burst after a long idle must yield to terminal
+                // input, editor output and rendering between refresh batches.
+                self.sync_events_pending = true;
+                break;
+            }
         }
         if let Some(result) = self.clipboard.poll() {
             self.status = match result {
@@ -537,6 +567,9 @@ impl App {
     }
 
     pub fn poll_timeout(&self) -> Duration {
+        if self.sync_events_pending {
+            return Duration::ZERO;
+        }
         if self.editor_is_open() {
             return EDITOR_POLL_INTERVAL;
         }
@@ -575,6 +608,7 @@ impl App {
                 self.pending_add_target = None;
                 self.pending_add_placement = AddPlacement::Natural;
                 self.editor_add_fallback = None;
+                self.bulk_rename_targets = None;
                 self.status = "Edit cancelled".into();
             }
             return Ok(());
@@ -598,6 +632,18 @@ impl App {
             self.open_special_add(&project)?;
             return Ok(());
         }
+        if self.keybindings.matches(Action::Cancel, key) && !self.marked_tasks.is_empty() {
+            self.marked_tasks.clear();
+            self.status = "Task selection cleared".into();
+            return Ok(());
+        }
+
+        if self.focus == Focus::Tasks
+            && !self.marked_tasks.is_empty()
+            && self.keybindings.matches(Action::BulkRename, key)
+        {
+            return self.open_bulk_rename();
+        }
 
         let Some(action) = self.keybindings.main_action(key) else {
             return Ok(());
@@ -611,6 +657,7 @@ impl App {
             return Ok(());
         }
         match action {
+            Action::ToggleTaskSelection => self.toggle_task_selection()?,
             Action::EditLabels => self.open_labels()?,
             Action::EditAssignee => {
                 if self.focus == Focus::Tasks {
@@ -665,7 +712,13 @@ impl App {
             Action::MoveTask => self.open_project_picker()?,
             Action::IndentTask => self.change_task_depth(true)?,
             Action::OutdentTask => self.change_task_depth(false)?,
-            Action::Cancel
+            Action::Cancel => {
+                if !self.marked_tasks.is_empty() {
+                    self.marked_tasks.clear();
+                    self.status = "Task selection cleared".into();
+                }
+            }
+            Action::BulkRename
             | Action::RenameProject
             | Action::CloseDialog
             | Action::Priority1
@@ -686,6 +739,63 @@ impl App {
         Ok(())
     }
 
+    fn handle_task_details_action(&mut self, task_id: &str, action: Action) -> Result<bool> {
+        if !matches!(
+            action,
+            Action::EditTask
+                | Action::EditDue
+                | Action::RemoveDue
+                | Action::EditLabels
+                | Action::EditAssignee
+                | Action::MoveTask
+                | Action::AddChildTask
+                | Action::CompleteTask
+                | Action::DeleteTask
+                | Action::IndentTask
+                | Action::OutdentTask
+                | Action::MoveProjectDown
+                | Action::MoveProjectUp
+                | Action::Priority1
+                | Action::Priority2
+                | Action::Priority3
+                | Action::Priority4
+                | Action::CopyTitle
+                | Action::Undo
+                | Action::Redo
+        ) {
+            return Ok(false);
+        }
+        if action == Action::CopyTitle {
+            self.copy_selected_title()?;
+            return Ok(true);
+        }
+        self.overlay = None;
+        self.focus = Focus::Tasks;
+        if let Some(level) = action.priority() {
+            self.set_priority(task_id, level)?;
+            return Ok(true);
+        }
+        match action {
+            Action::EditTask => self.open_task_editor(task_id)?,
+            Action::EditDue => self.open_due_editor(task_id)?,
+            Action::RemoveDue => self.remove_due(task_id)?,
+            Action::EditLabels => self.open_task_labels(task_id)?,
+            Action::EditAssignee => self.open_assignee_picker(task_id)?,
+            Action::MoveTask => self.open_task_move_picker(task_id)?,
+            Action::AddChildTask => self.open_child_editor(task_id)?,
+            Action::CompleteTask => self.complete_task(task_id)?,
+            Action::DeleteTask => self.delete_task(task_id)?,
+            Action::IndentTask => self.change_task_depth_for(task_id, true)?,
+            Action::OutdentTask => self.change_task_depth_for(task_id, false)?,
+            Action::MoveProjectDown => self.move_task_in_view(task_id, true)?,
+            Action::MoveProjectUp => self.move_task_in_view(task_id, false)?,
+            Action::Undo => self.undo()?,
+            Action::Redo => self.redo()?,
+            _ => unreachable!("task-details action checked above"),
+        }
+        Ok(true)
+    }
+
     fn handle_overlay(&mut self, key: KeyEvent) -> Result<()> {
         if matches!(self.overlay, Some(Overlay::Outbox(_))) {
             return self.handle_outbox(key);
@@ -704,18 +814,22 @@ impl App {
                 self.pending_add_target = None;
                 self.pending_add_placement = AddPlacement::Natural;
                 self.editor_add_fallback = None;
+                self.bulk_rename_targets = None;
                 self.status = "Draft cancelled".into();
             }
             return Ok(());
         }
-        // Priority keys act on the task whose details are open, like the other
-        // task commands available from the dialog.
-        if let Some(level) = self.keybindings.main_action(key).and_then(Action::priority)
+        // Keep dialog movement as scrolling. All task commands use the dialog's
+        // ID, which may differ from the pane selection after a task search.
+        if !self.keybindings.matches(Action::Down, key)
+            && !self.keybindings.matches(Action::Up, key)
+            && let Some(action) = self.keybindings.main_action(key)
             && let Some(Overlay::Details { task, .. }) = self.overlay.as_ref()
         {
             let task_id = task.id.clone();
-            self.overlay = None;
-            return self.set_priority(&task_id, level);
+            if self.handle_task_details_action(&task_id, action)? {
+                return Ok(());
+            }
         }
         match self.overlay.as_mut() {
             Some(Overlay::Help { .. }) if self.keybindings.matches(Action::CloseDialog, key) => {
@@ -748,38 +862,6 @@ impl App {
                 *scroll = scroll.saturating_sub(1);
             }
             Some(Overlay::ErrorDetails { .. }) => {}
-            Some(Overlay::Details { task, .. })
-                if self.keybindings.matches(Action::EditAssignee, key) =>
-            {
-                let task_id = task.id.clone();
-                self.open_assignee_picker(&task_id)?;
-            }
-            Some(Overlay::Details { task, .. })
-                if self.keybindings.matches(Action::EditTask, key) =>
-            {
-                let task_id = task.id.clone();
-                self.open_task_editor(&task_id)?;
-            }
-            Some(Overlay::Details { task, .. })
-                if self.keybindings.matches(Action::EditDue, key) =>
-            {
-                let task_id = task.id.clone();
-                self.open_due_editor(&task_id)?;
-            }
-            Some(Overlay::Details { task, .. })
-                if self.keybindings.matches(Action::RemoveDue, key) =>
-            {
-                let task_id = task.id.clone();
-                self.overlay = None;
-                self.remove_due(&task_id)?;
-            }
-            Some(Overlay::Details { task, .. })
-                if self.keybindings.matches(Action::DeleteTask, key) =>
-            {
-                let task_id = task.id.clone();
-                self.overlay = None;
-                self.delete_task(&task_id)?;
-            }
             Some(Overlay::FilterDetails { filter, .. })
                 if self.keybindings.matches(Action::EditTask, key) =>
             {
@@ -1289,7 +1371,11 @@ impl App {
     }
 
     fn select_nav(&mut self, index: usize) {
+        let previous = self.selected_nav().cloned();
         self.nav_cursor = index;
+        if previous.as_ref() != self.selected_nav() {
+            self.marked_tasks.clear();
+        }
         self.prioritize_current_filter();
         if let Some(id) = self.selected_nav().cloned() {
             self.pending_render = Some((id, Instant::now() + NAV_DEBOUNCE));
@@ -1322,6 +1408,7 @@ impl App {
             self.load_tasks(id)?;
         } else {
             self.tasks.clear();
+            self.marked_tasks.clear();
             self.task_render_cache.invalidate();
             self.task_cursor = None;
             self.rendered_nav = None;
@@ -1346,6 +1433,34 @@ impl App {
             sort_alphabetically,
             group_by_date,
         );
+        if !self.marked_tasks.is_empty() {
+            let same_view = match (&self.rendered_nav, &nav) {
+                (Some(previous), current) if previous == current => true,
+                (Some(NavId::Project(previous)), NavId::Project(current)) => self
+                    .store
+                    .project(previous)?
+                    .is_some_and(|project| project.id == *current),
+                (Some(NavId::Filter(previous)), NavId::Filter(current)) => self
+                    .store
+                    .filter(previous)?
+                    .is_some_and(|filter| filter.id == *current),
+                _ => false,
+            };
+            if same_view {
+                let visible = tasks
+                    .iter()
+                    .map(|task| task.id.as_str())
+                    .collect::<HashSet<_>>();
+                self.marked_tasks = self
+                    .store
+                    .resolve_task_ids(self.marked_tasks.iter().map(String::as_str))?
+                    .into_iter()
+                    .filter(|id| visible.contains(id.as_str()))
+                    .collect();
+            } else {
+                self.marked_tasks.clear();
+            }
+        }
         let remembered = self.remembered_tasks.get(&nav).cloned();
         let resolved = remembered
             .as_deref()
@@ -1420,10 +1535,19 @@ impl App {
         let nav = self.selected_nav().cloned();
         self.refresh_nav()?;
         if let Some(nav) = nav {
-            if let Some(id) = preferred {
-                self.remembered_tasks.insert(nav.clone(), id.into());
-            }
             self.load_tasks(nav)?;
+            if let Some(id) = preferred {
+                let index = self.tasks.iter().position(|task| task.id == id);
+                let index = match index {
+                    Some(index) => Some(index),
+                    None => self.store.resolve_task_id(id)?.and_then(|resolved| {
+                        self.tasks.iter().position(|task| task.id == resolved)
+                    }),
+                };
+                if let Some(index) = index {
+                    self.set_task_cursor(index);
+                }
+            }
         }
         Ok(())
     }
@@ -1442,24 +1566,29 @@ impl App {
         &mut self,
         copy: impl FnOnce(&mut clipboard::Clipboard, String) -> Result<bool>,
     ) -> Result<()> {
-        let (title, success_message) = match self.focus {
-            Focus::Navigation => {
-                let Some(NavRow::Item { name, .. }) = self.nav_rows.get(self.nav_cursor) else {
-                    self.status = "Select a project or filter before copying".into();
-                    return Ok(());
-                };
-                (name.clone(), "Project or filter title copied")
-            }
-            Focus::Tasks => {
-                self.force_tasks()?;
-                let Some(task) = self.selected_task() else {
-                    self.status = "Select a task before copying".into();
-                    return Ok(());
-                };
-                (task.content.clone(), "Task title copied")
+        let (title, success_message) = if let Some(Overlay::Details { task, .. }) =
+            self.overlay.as_ref()
+        {
+            (task.content.clone(), "Task title copied")
+        } else {
+            match self.focus {
+                Focus::Navigation => {
+                    let Some(NavRow::Item { name, .. }) = self.nav_rows.get(self.nav_cursor) else {
+                        self.status = "Select a project or filter before copying".into();
+                        return Ok(());
+                    };
+                    (name.clone(), "Project or filter title copied")
+                }
+                Focus::Tasks => {
+                    self.force_tasks()?;
+                    let Some(task) = self.selected_task() else {
+                        self.status = "Select a task before copying".into();
+                        return Ok(());
+                    };
+                    (task.content.clone(), "Task title copied")
+                }
             }
         };
-
         self.status = match copy(&mut self.clipboard, title) {
             Ok(true) => {
                 self.clipboard_success_message = success_message;
@@ -1602,7 +1731,14 @@ impl App {
             return Ok(());
         }
         self.force_tasks()?;
-        if let Some(task) = self.selected_task().cloned() {
+        if let Some(task_id) = self.selected_task().map(|task| task.id.clone()) {
+            self.open_task_labels(&task_id)?;
+        }
+        Ok(())
+    }
+
+    fn open_task_labels(&mut self, task_id: &str) -> Result<()> {
+        if let Some(task) = self.store.task(task_id)? {
             let mut known = self.store.labels()?;
             for assigned in &task.labels {
                 if !known
@@ -1712,6 +1848,78 @@ impl App {
         Ok(())
     }
 
+    fn toggle_task_selection(&mut self) -> Result<()> {
+        if self.focus != Focus::Tasks {
+            return Ok(());
+        }
+        if self.pending_render.is_some() || self.rendered_nav.as_ref() != self.selected_nav() {
+            self.force_tasks()?;
+        }
+        let Some(task_id) = self.selected_task().map(|task| task.id.clone()) else {
+            return Ok(());
+        };
+        if !self.marked_tasks.remove(&task_id) {
+            self.marked_tasks.insert(task_id);
+        }
+        self.status = format!(
+            "{} task{} selected",
+            self.marked_tasks.len(),
+            if self.marked_tasks.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        // Match Yazi's default Space behavior: toggle, then advance one row.
+        self.move_down()
+    }
+
+    fn open_bulk_rename(&mut self) -> Result<()> {
+        self.force_tasks()?;
+        let targets = self
+            .tasks
+            .iter()
+            .filter(|task| self.marked_tasks.contains(&task.id))
+            .map(|task| TaskTitle {
+                id: task.id.clone(),
+                content: task.content.clone(),
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.status = "No tasks selected for bulk rename".into();
+            return Ok(());
+        }
+        if targets
+            .iter()
+            .any(|task| task.content.contains(['\n', '\r']))
+        {
+            self.status =
+                "Bulk rename requires single-line task titles; edit multiline titles individually"
+                    .into();
+            return Ok(());
+        }
+        let initial = targets
+            .iter()
+            .map(|task| task.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let editor = EmbeddedEditor::open(
+            EditorPurpose::BulkRename,
+            None,
+            &initial,
+            18,
+            82,
+            self.editor_options,
+        )?;
+        self.pending_add_target = None;
+        self.pending_add_placement = AddPlacement::Natural;
+        self.editor_add_fallback = None;
+        self.bulk_rename_targets = Some(targets);
+        self.overlay = Some(Overlay::Editor(editor));
+        Ok(())
+    }
+
     fn open_add(&mut self, requested: AddPlacement) -> Result<()> {
         self.force_tasks()?;
         let Some(project) = self.add_target_project()? else {
@@ -1768,10 +1976,18 @@ impl App {
             return Ok(());
         }
         self.force_tasks()?;
-        let Some(parent) = self.selected_task() else {
+        let Some(parent_id) = self.selected_task().map(|task| task.id.clone()) else {
             self.status = "Select a task before adding a subtask".into();
             return Ok(());
         };
+        self.open_child_editor(&parent_id)
+    }
+
+    fn open_child_editor(&mut self, parent_id: &str) -> Result<()> {
+        let parent = self
+            .store
+            .task(parent_id)?
+            .context("parent task no longer exists")?;
         if parent.checked {
             self.status = "Cannot add a subtask to a completed task".into();
             return Ok(());
@@ -1898,9 +2114,17 @@ impl App {
             return Ok(());
         }
         self.force_tasks()?;
-        let Some(task) = self.selected_task().cloned() else {
+        let Some(task_id) = self.selected_task().map(|task| task.id.clone()) else {
             return Ok(());
         };
+        self.open_task_move_picker(&task_id)
+    }
+
+    fn open_task_move_picker(&mut self, task_id: &str) -> Result<()> {
+        let task = self
+            .store
+            .task(task_id)?
+            .context("moved task no longer exists")?;
         let projects = self
             .store
             .projects()?
@@ -1957,30 +2181,37 @@ impl App {
             self.status = message.into();
             return Ok(());
         }
-        let previous_index = self.task_cursor.unwrap_or(0);
         let nav = self.selected_nav().cloned();
         let before = self
             .store
             .task(task_id)?
             .context("moved task no longer exists")?;
+        let previous_index = (self.rendered_nav.as_ref() == self.selected_nav())
+            .then(|| self.tasks.iter().position(|task| task.id == before.id))
+            .flatten();
         let tree_before = self
             .store
             .tasks_for_view(&NavId::Project(before.project_id.clone()), true)?;
         self.store.move_task(task_id, &project.id)?;
-        self.record_tree_change(tree_before, "task move", task_id)?;
+        self.record_tree_change(tree_before, "task move", &before.id)?;
         self.refresh_nav()?;
         if let Some(nav) = nav {
             match &nav {
                 NavId::Project(_) => {
-                    self.remembered_tasks.remove(&nav);
+                    if previous_index.is_some() {
+                        self.remembered_tasks.remove(&nav);
+                    }
                     self.load_tasks(nav)?;
-                    if !self.tasks.is_empty() {
+                    if !self.tasks.is_empty()
+                        && let Some(previous_index) = previous_index
+                    {
                         self.set_task_cursor(previous_index.min(self.tasks.len() - 1));
                     }
                 }
                 NavId::Filter(_) | NavId::Today | NavId::Upcoming => {
-                    self.remembered_tasks
-                        .insert(nav.clone(), task_id.to_owned());
+                    if previous_index.is_some() {
+                        self.remembered_tasks.insert(nav.clone(), before.id.clone());
+                    }
                     self.load_tasks(nav)?;
                 }
             }
@@ -1997,28 +2228,64 @@ impl App {
             return Ok(());
         }
         self.force_tasks()?;
-        let Some(index) = self.task_cursor else {
+        let Some(task_id) = self.selected_task().map(|task| task.id.clone()) else {
             self.status = "Select a task before changing its hierarchy".into();
             return Ok(());
         };
-        let task = self.tasks[index].clone();
+        self.change_task_depth_for(&task_id, indent)
+    }
+
+    fn task_order_context(&self, task: &Task) -> Result<(Cow<'_, [Task]>, bool, bool)> {
+        if self.rendered_nav.as_ref() == self.selected_nav()
+            && self.tasks.iter().any(|row| row.id == task.id)
+        {
+            return Ok((
+                Cow::Borrowed(&self.tasks),
+                self.sort_tasks_alphabetically,
+                matches!(self.selected_nav(), Some(NavId::Upcoming)),
+            ));
+        }
+        // Search can open details for a task outside the current view. Its own
+        // project's cached ordering is the context for hierarchy/reorder keys.
+        let nav = NavId::Project(task.project_id.clone());
+        let sorted = self.alphabetical_sort.get(&nav).copied().unwrap_or(false);
+        let mut tasks = self.store.tasks_for_view(&nav, true)?;
+        order_tasks(&mut tasks, self.group_tasks_by_label, sorted, false);
+        Ok((Cow::Owned(tasks), sorted, false))
+    }
+
+    fn change_task_depth_for(&mut self, task_id: &str, indent: bool) -> Result<()> {
+        let task = self
+            .store
+            .task(task_id)?
+            .context("selected task no longer exists")?;
         if task.checked {
             self.status = "Cannot change the hierarchy of a completed task".into();
             return Ok(());
         }
 
         let new_parent_id = if indent {
-            let candidate = self.tasks[..index].iter().rev().find(|candidate| {
-                !candidate.checked
-                    && candidate.project_id == task.project_id
-                    && candidate.parent_id == task.parent_id
-                    && candidate.section_id == task.section_id
-            });
+            let (tasks, _, _) = self.task_order_context(&task)?;
+            let index = tasks
+                .iter()
+                .position(|row| row.id == task.id)
+                .context("selected task is no longer available")?;
+            let candidate = tasks[..index]
+                .iter()
+                .rev()
+                .find(|candidate| {
+                    !candidate.checked
+                        && candidate.project_id == task.project_id
+                        && candidate.parent_id == task.parent_id
+                        && candidate.section_id == task.section_id
+                })
+                .map(|candidate| candidate.id.clone());
+            drop(tasks);
             let Some(candidate) = candidate else {
                 self.status = "Cannot indent: no preceding sibling can become the parent".into();
                 return Ok(());
             };
-            Some(candidate.id.clone())
+            Some(candidate)
         } else {
             let Some(parent_id) = task.parent_id.as_deref() else {
                 self.status = "Cannot outdent: task is already at the top level".into();
@@ -2064,6 +2331,7 @@ impl App {
             special_add_target: self.pending_add_target.clone(),
             fallback: self.editor_add_fallback.clone(),
             placement: self.pending_add_placement,
+            bulk_rename_targets: self.bulk_rename_targets.clone(),
         };
         let validation = match result.purpose {
             EditorPurpose::Add | EditorPurpose::AddChild | EditorPurpose::Edit => {
@@ -2080,6 +2348,11 @@ impl App {
                 parse_project_editor(&result.text).map(|_| ())
             }
             EditorPurpose::Due => Ok(()),
+            EditorPurpose::BulkRename => self
+                .bulk_rename_targets
+                .as_ref()
+                .ok_or_else(|| "Bulk rename targets are no longer available".to_owned())
+                .and_then(|targets| parse_bulk_rename(&result.text, targets.len()).map(|_| ())),
         };
         if let Err(message) = validation {
             self.reopen_editor_draft(draft, message);
@@ -2109,6 +2382,7 @@ impl App {
         self.pending_add_target = draft.special_add_target.clone();
         self.pending_add_placement = draft.placement;
         self.editor_add_fallback = draft.fallback.clone();
+        self.bulk_rename_targets = draft.bulk_rename_targets.clone();
         self.status = message.clone();
         match EmbeddedEditor::open(
             draft.result.purpose,
@@ -2135,10 +2409,49 @@ impl App {
         if !result.accepted {
             self.pending_add_target = None;
             self.pending_add_placement = AddPlacement::Natural;
+            self.bulk_rename_targets = None;
             self.status = "Edit cancelled".into();
             return Ok(());
         }
         match result.purpose {
+            EditorPurpose::BulkRename => {
+                let targets = self
+                    .bulk_rename_targets
+                    .as_ref()
+                    .context("bulk rename targets are no longer available")?;
+                let names =
+                    parse_bulk_rename(&result.text, targets.len()).map_err(anyhow::Error::msg)?;
+                let titles = targets
+                    .iter()
+                    .zip(names)
+                    .filter(|(target, content)| target.content != *content)
+                    .map(|(target, content)| TaskTitle {
+                        id: target.id.clone(),
+                        content,
+                    })
+                    .collect::<Vec<_>>();
+                let (before, after) = self.store.rename_tasks(&titles)?;
+                self.editor_mutation_committed = true;
+                let count = after.len();
+                if count > 0 {
+                    self.record_history(HistoryEntry::Rename { before, after });
+                }
+                self.bulk_rename_targets = None;
+                self.marked_tasks.clear();
+                self.refresh_after_action(None)?;
+                self.focus = Focus::Tasks;
+                self.status = if count == 0 {
+                    "No task titles changed".into()
+                } else {
+                    format!(
+                        "Renamed {count} task{} · pending sync",
+                        if count == 1 { "" } else { "s" }
+                    )
+                };
+                if count > 0 {
+                    self.mark_pending_and_sync();
+                }
+            }
             EditorPurpose::Add => {
                 let (expression, description) = split_task_editor_text(&result.text);
                 if expression.is_empty() {
@@ -2351,10 +2664,20 @@ impl App {
             return Ok(());
         }
         self.force_tasks()?;
-        let Some(index) = self.task_cursor else {
+        let Some(task_id) = self.selected_task().map(|task| task.id.clone()) else {
             return Ok(());
         };
-        let before = self.tasks[index].clone();
+        self.complete_task(&task_id)
+    }
+
+    fn complete_task(&mut self, task_id: &str) -> Result<()> {
+        let before = self
+            .store
+            .task(task_id)?
+            .context("selected task no longer exists")?;
+        let index = (self.rendered_nav.as_ref() == self.selected_nav())
+            .then(|| self.tasks.iter().position(|task| task.id == before.id))
+            .flatten();
         let id = before.id.clone();
         let completed = !before.checked;
         let tree_before = self
@@ -2362,17 +2685,17 @@ impl App {
             .tasks_for_view(&NavId::Project(before.project_id.clone()), true)?;
         // Preserve the original displayed neighbor by ID: completing can move
         // the task to a different position or group while it remains visible.
-        let preferred_task = self
-            .tasks
-            .get(index + 1)
-            .or_else(|| {
-                if completed {
-                    index
-                        .checked_sub(1)
-                        .and_then(|previous| self.tasks.get(previous))
-                } else {
-                    None
-                }
+        let preferred_task = index
+            .and_then(|index| {
+                self.tasks.get(index + 1).or_else(|| {
+                    if completed {
+                        index
+                            .checked_sub(1)
+                            .and_then(|previous| self.tasks.get(previous))
+                    } else {
+                        None
+                    }
+                })
             })
             .map(|task| task.id.clone());
         self.store.set_task_completed(&id, completed)?;
@@ -2388,14 +2711,18 @@ impl App {
         let nav = self.selected_nav().cloned();
         self.refresh_nav()?;
         if let Some(nav) = nav {
-            if self.show_completed_tasks || !completed {
+            if index.is_some() && (self.show_completed_tasks || !completed) {
                 self.remembered_tasks
                     .insert(nav.clone(), preferred_task.unwrap_or(id));
-            } else {
+            } else if index.is_some() {
                 self.remembered_tasks.remove(&nav);
             }
             self.load_tasks(nav)?;
-            if completed && !self.show_completed_tasks && !self.tasks.is_empty() {
+            if completed
+                && !self.show_completed_tasks
+                && !self.tasks.is_empty()
+                && let Some(index) = index
+            {
                 self.set_task_cursor(index.min(self.tasks.len() - 1));
             }
         }
@@ -2421,7 +2748,14 @@ impl App {
     }
 
     fn delete_task(&mut self, task_id: &str) -> Result<()> {
-        let current_index = self.tasks.iter().position(|task| task.id == task_id);
+        let task_id = self
+            .store
+            .task(task_id)?
+            .context("selected task no longer exists")?
+            .id;
+        let current_index = (self.rendered_nav.as_ref() == self.selected_nav())
+            .then(|| self.tasks.iter().position(|task| task.id == task_id))
+            .flatten();
         let next_task = current_index
             .and_then(|index| self.tasks.get(index + 1))
             .map(|task| task.id.clone())
@@ -2431,14 +2765,14 @@ impl App {
                     .and_then(|index| self.tasks.get(index))
                     .map(|task| task.id.clone())
             });
-        let deleted = self.store.delete_task_tree(task_id)?;
+        let deleted = self.store.delete_task_tree(&task_id)?;
         self.record_history(HistoryEntry::Delete { tasks: deleted });
         let nav = self.selected_nav().cloned();
         self.refresh_nav()?;
         if let Some(nav) = nav {
             if let Some(next_task) = next_task {
                 self.remembered_tasks.insert(nav.clone(), next_task);
-            } else {
+            } else if current_index.is_some() {
                 self.remembered_tasks.remove(&nav);
             }
             self.load_tasks(nav)?;
@@ -2605,7 +2939,9 @@ impl App {
                 }
                 ids
             }
-            HistoryEntry::Change { .. } | HistoryEntry::Delete { .. } => Vec::new(),
+            HistoryEntry::Change { .. }
+            | HistoryEntry::Delete { .. }
+            | HistoryEntry::Rename { .. } => Vec::new(),
         };
         let preferred = match self.apply_history_entry(&mut entry, false) {
             Ok(preferred) => preferred,
@@ -2627,6 +2963,12 @@ impl App {
 
     fn apply_history_entry(&self, entry: &mut HistoryEntry, undo: bool) -> Result<Option<String>> {
         match entry {
+            HistoryEntry::Rename { before, after } => {
+                self.store.rename_tasks(if undo { before } else { after })?;
+                // Bulk rename preserves the view's current cursor, including
+                // when sorting repositions renamed tasks.
+                Ok(None)
+            }
             HistoryEntry::Change {
                 before,
                 after,
@@ -2798,15 +3140,25 @@ impl App {
 
     fn move_selected_task(&mut self, down: bool) -> Result<()> {
         self.force_tasks()?;
-        let Some(selected) = self.selected_task().cloned() else {
+        let Some(task_id) = self.selected_task().map(|task| task.id.clone()) else {
             self.status = "No task selected".into();
             return Ok(());
         };
+        self.move_task_in_view(&task_id, down)
+    }
+
+    fn move_task_in_view(&mut self, task_id: &str, down: bool) -> Result<()> {
+        let selected = self
+            .store
+            .task(task_id)?
+            .context("selected task no longer exists")?;
         if selected.checked {
             self.status = "Completed tasks cannot be reordered".into();
             return Ok(());
         }
-        if self.sort_tasks_alphabetically {
+        let (tasks, sorted, upcoming) = self.task_order_context(&selected)?;
+        if sorted {
+            drop(tasks);
             self.status = "Disable alphabetical sorting before reordering tasks".into();
             return Ok(());
         }
@@ -2816,9 +3168,7 @@ impl App {
             .due
             .as_ref()
             .and_then(crate::model::Due::concrete_date);
-        let upcoming = matches!(self.selected_nav(), Some(NavId::Upcoming));
-        let candidates = self
-            .tasks
+        let candidates = tasks
             .iter()
             .filter(|task| {
                 if task.checked
@@ -2840,6 +3190,8 @@ impl App {
             })
             .collect::<Vec<_>>();
         let Some(position) = candidates.iter().position(|task| task.id == selected.id) else {
+            drop(candidates);
+            drop(tasks);
             self.status = "Selected task is not in the current order".into();
             return Ok(());
         };
@@ -2850,7 +3202,12 @@ impl App {
         } else {
             position.checked_sub(1)
         };
-        let Some(target) = target_position.and_then(|position| candidates.get(position)) else {
+        let target_id = target_position
+            .and_then(|position| candidates.get(position))
+            .map(|task| task.id.clone());
+        drop(candidates);
+        drop(tasks);
+        let Some(target_id) = target_id else {
             self.status = format!(
                 "{} is already {} in this task group",
                 selected.content,
@@ -2858,7 +3215,6 @@ impl App {
             );
             return Ok(());
         };
-        let target_id = target.id.clone();
         self.store.reorder_task(&selected.id, &target_id)?;
         self.refresh_after_action(Some(&selected.id))?;
         self.status = format!(
@@ -3209,6 +3565,28 @@ impl App {
     }
 }
 
+fn parse_bulk_rename(text: &str, expected: usize) -> std::result::Result<Vec<String>, String> {
+    let names = text.lines().map(str::to_owned).collect::<Vec<_>>();
+    if names.len() != expected {
+        return Err(format!(
+            "Expected {expected} task titles, one per line; found {}. Keep the original line count.",
+            names.len()
+        ));
+    }
+    for (index, name) in names.iter().enumerate() {
+        if name.trim().is_empty() {
+            return Err(format!("Task title on line {} cannot be empty", index + 1));
+        }
+        if name.contains('\r') {
+            return Err(format!(
+                "Task title on line {} contains a line break",
+                index + 1
+            ));
+        }
+    }
+    Ok(names)
+}
+
 fn push_history(stack: &mut Vec<HistoryEntry>, entry: HistoryEntry) {
     if stack.len() == HISTORY_LIMIT {
         stack.remove(0);
@@ -3219,6 +3597,13 @@ fn push_history(stack: &mut Vec<HistoryEntry>, entry: HistoryEntry) {
 fn remap_history_task_ids(entries: &mut [HistoryEntry], old_ids: &[String], new_id: &str) {
     for entry in entries {
         match entry {
+            HistoryEntry::Rename { before, after } => {
+                for task in before.iter_mut().chain(after.iter_mut()) {
+                    if old_ids.contains(&task.id) {
+                        task.id = new_id.to_owned();
+                    }
+                }
+            }
             HistoryEntry::Change { before, after, .. } => {
                 for task in before.iter_mut().chain(after.iter_mut()) {
                     if old_ids.contains(&task.id) {
@@ -3657,6 +4042,773 @@ mod tests {
         ));
     }
 
+    fn bulk_rename_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = draft_test_app();
+        app.store
+            .merge_collaborators(&[crate::model::RemoteCollaborator {
+                id: "person".into(),
+                full_name: "Example Person".into(),
+            }])
+            .unwrap();
+        app.store.merge_remote(
+            &serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+                {"id":"work","name":"Work","shared":true,"can_assign_tasks":true},
+                {"id":"other","name":"Other"}
+            ])).unwrap(),
+            &serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+                {"id":"root","project_id":"work","content":"Alpha","description":"Keep this description","priority":4,"responsible_uid":"person","labels":["Work"],"child_order":0},
+                {"id":"child","project_id":"work","parent_id":"root","content":"Same","child_order":0},
+                {"id":"peer","project_id":"work","content":"Same","child_order":1},
+                {"id":"done","project_id":"work","content":"Done","checked":true,"child_order":2},
+                {"id":"other-task","project_id":"other","content":"Other task"}
+            ])).unwrap(), &[], &[]).unwrap();
+        app.store
+            .set_completed_task_visibility(&NavId::Project("work".into()), true)
+            .unwrap();
+        app.group_tasks_by_label = false;
+        app.refresh_nav().unwrap();
+        let index = app
+            .nav_rows
+            .iter()
+            .position(
+                |row| matches!(row, NavRow::Item { id: NavId::Project(id), .. } if id=="work"),
+            )
+            .unwrap();
+        app.select_nav(index);
+        app.enter_tasks().unwrap();
+        assert_eq!(
+            app.tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["root", "child", "peer", "done"]
+        );
+        (dir, app)
+    }
+
+    fn mark_bulk_tasks(app: &mut App, count: usize) {
+        for _ in 0..count {
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .unwrap();
+        }
+    }
+
+    fn saved_bulk_editor(app: &mut App) -> EditorResult {
+        let Some(Overlay::Editor(mut editor)) = app.overlay.take() else {
+            panic!("bulk editor did not open")
+        };
+        assert_eq!(editor.purpose(), EditorPurpose::BulkRename);
+        std::thread::sleep(Duration::from_millis(200));
+        editor
+            .send_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        editor
+            .send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = editor.poll().unwrap() {
+                assert!(result.accepted);
+                return result;
+            }
+            assert!(Instant::now() < deadline, "bulk editor did not save");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn space_toggles_task_marks_advances_and_keeps_them_scoped_to_the_current_view() {
+        let (_dir, mut app) = bulk_rename_app();
+        app.focus = Focus::Navigation;
+        mark_bulk_tasks(&mut app, 1);
+        assert!(app.marked_tasks.is_empty());
+        app.focus = Focus::Tasks;
+        mark_bulk_tasks(&mut app, 2);
+        assert_eq!(
+            app.marked_tasks,
+            HashSet::from(["root".into(), "child".into()])
+        );
+        assert_eq!(app.selected_task().unwrap().id, "peer");
+        app.move_up().unwrap();
+        mark_bulk_tasks(&mut app, 1);
+        assert_eq!(app.marked_tasks, HashSet::from(["root".into()]));
+        app.move_last().unwrap();
+        mark_bulk_tasks(&mut app, 1);
+        assert!(app.marked_tasks.contains("done"));
+        assert_eq!(app.selected_task().unwrap().id, "done");
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.marked_tasks,
+            HashSet::from(["root".into(), "done".into()])
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.marked_tasks.len(), 2);
+        let other = app
+            .nav_rows
+            .iter()
+            .position(
+                |row| matches!(row, NavRow::Item { id: NavId::Project(id), .. } if id=="other"),
+            )
+            .unwrap();
+        app.select_nav(other);
+        assert!(app.marked_tasks.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert!(app.status.contains("API token missing"));
+        app.force_tasks().unwrap();
+        mark_bulk_tasks(&mut app, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.marked_tasks.is_empty());
+    }
+
+    #[test]
+    fn bulk_rename_uses_one_literal_title_per_marked_row_and_one_title_only_undo_entry() {
+        let (_dir, mut app) = bulk_rename_app();
+        let before = app.tasks.clone();
+        mark_bulk_tasks(&mut app, 4);
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        let mut result = saved_bulk_editor(&mut app);
+        assert_eq!(result.text, "Alpha\nSame\nSame\nDone\n");
+        assert!(result.task_id.is_none());
+        result.text =
+            "Buy tomorrow @literal p1 +Name\nChild renamed\nPeer renamed\nDone renamed\n".into();
+        app.apply_editor_result(result).unwrap();
+        assert_eq!(app.undo_stack.len(), 1);
+        assert!(app.marked_tasks.is_empty());
+        assert_eq!(app.selected_task().unwrap().id, "done");
+        for (old, content) in before.iter().zip([
+            "Buy tomorrow @literal p1 +Name",
+            "Child renamed",
+            "Peer renamed",
+            "Done renamed",
+        ]) {
+            let mut expected = old.clone();
+            expected.content = content.into();
+            assert_eq!(app.store.task(&old.id).unwrap().unwrap(), expected);
+        }
+        assert!(
+            app.store
+                .outbox()
+                .unwrap()
+                .iter()
+                .all(|entry| matches!(entry.operation, crate::model::Operation::RenameTask { .. }))
+        );
+        for entry in app.store.outbox().unwrap() {
+            app.store.finish_outbox(entry.seq).unwrap();
+        }
+        let mut remote: crate::model::RemoteTask = serde_json::from_value(
+            serde_json::to_value(app.store.task("root").unwrap().unwrap()).unwrap(),
+        )
+        .unwrap();
+        remote.description = "Changed remotely after rename".into();
+        remote.labels = vec!["Later".into()];
+        remote.priority = 2;
+        app.store.merge_remote(&[], &[remote], &[], &[]).unwrap();
+        app.undo().unwrap();
+        assert_eq!(app.store.task("child").unwrap().unwrap().content, "Same");
+        assert_eq!(app.store.task("peer").unwrap().unwrap().content, "Same");
+        let root = app.store.task("root").unwrap().unwrap();
+        assert_eq!(root.content, "Alpha");
+        assert_eq!(root.description, "Changed remotely after rename");
+        assert_eq!(root.labels, ["Later"]);
+        assert_eq!(root.priority, 2);
+        app.redo().unwrap();
+        assert_eq!(
+            app.store.task("root").unwrap().unwrap().content,
+            "Buy tomorrow @literal p1 +Name"
+        );
+        assert_eq!(
+            app.store.task("root").unwrap().unwrap().description,
+            "Changed remotely after rename"
+        );
+    }
+
+    #[test]
+    fn invalid_bulk_rename_keeps_the_full_draft_and_mapping_and_cancel_keeps_marks() {
+        let (_dir, mut app) = bulk_rename_app();
+        mark_bulk_tasks(&mut app, 3);
+        app.open_bulk_rename().unwrap();
+        let targets = app.bulk_rename_targets.clone().unwrap();
+        drop(app.overlay.take());
+        for draft in [
+            "Too few\n",
+            "First\n \nThird\n",
+            "First\nSecond\nThird\nFourth\n",
+        ] {
+            app.apply_editor_result(EditorResult {
+                purpose: EditorPurpose::BulkRename,
+                task_id: None,
+                accepted: true,
+                text: draft.into(),
+            })
+            .unwrap();
+            assert_eq!(app.bulk_rename_targets.as_ref(), Some(&targets));
+            assert_eq!(app.store.outbox_len().unwrap(), 0);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Editor(editor)) if editor.notice().is_some())
+            );
+            let recovered = saved_bulk_editor(&mut app);
+            assert_eq!(recovered.text, draft);
+        }
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::BulkRename,
+            task_id: None,
+            accepted: false,
+            text: String::new(),
+        })
+        .unwrap();
+        assert_eq!(app.marked_tasks.len(), 3);
+        assert!(app.bulk_rename_targets.is_none());
+        assert_eq!(app.store.outbox_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn unchanged_bulk_lines_preserve_intervening_titles_and_marks_follow_id_remapping() {
+        let (_dir, mut app) = bulk_rename_app();
+        mark_bulk_tasks(&mut app, 3);
+        app.open_bulk_rename().unwrap();
+        drop(app.overlay.take());
+        let parsed: crate::model::RemoteTask = serde_json::from_value(serde_json::json!({
+            "id":"mapped-root","project_id":"work","content":"Server-confirmed title","description":"New description"
+        })).unwrap();
+        app.store.replace_task_id("root", &parsed).unwrap();
+        app.force_tasks().unwrap();
+        assert!(app.marked_tasks.contains("mapped-root"));
+        assert!(!app.marked_tasks.contains("root"));
+        // Alpha is unchanged relative to the document, so it must not overwrite
+        // the newer server title. Duplicate titles keep their original IDs.
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::BulkRename,
+            task_id: None,
+            accepted: true,
+            text: "Alpha\nChild changed\nSame\n".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            app.store.task("mapped-root").unwrap().unwrap().content,
+            "Server-confirmed title"
+        );
+        assert_eq!(
+            app.store.task("child").unwrap().unwrap().content,
+            "Child changed"
+        );
+        assert_eq!(app.store.task("peer").unwrap().unwrap().content, "Same");
+        assert_eq!(app.store.outbox_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn bulk_rename_retries_failed_local_writes_but_never_replays_a_committed_batch() {
+        let (dir, mut app) = bulk_rename_app();
+        mark_bulk_tasks(&mut app, 2);
+        app.open_bulk_rename().unwrap();
+        drop(app.overlay.take());
+        let mut writer = rusqlite::Connection::open(dir.path().join("drafts.db")).unwrap();
+        let transaction = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::BulkRename,
+            task_id: None,
+            accepted: true,
+            text: "First changed\nSecond changed\n".into(),
+        })
+        .unwrap();
+        assert_eq!(app.store.outbox_len().unwrap(), 0);
+        assert_eq!(app.marked_tasks.len(), 2);
+        assert_eq!(app.bulk_rename_targets.as_ref().unwrap()[0].id, "root");
+        assert!(matches!(&app.overlay, Some(Overlay::Editor(editor)) if editor.notice().is_some()));
+        transaction.rollback().unwrap();
+        let result = saved_bulk_editor(&mut app);
+        assert_eq!(result.text, "First changed\nSecond changed\n");
+        writer.execute("DROP TABLE filters", []).unwrap();
+        assert!(app.apply_editor_result(result).is_err());
+        assert_eq!(
+            app.store.task("root").unwrap().unwrap().content,
+            "First changed"
+        );
+        assert_eq!(
+            app.store.task("child").unwrap().unwrap().content,
+            "Second changed"
+        );
+        assert_eq!(app.store.outbox_len().unwrap(), 2);
+        assert_eq!(app.undo_stack.len(), 1);
+        assert!(app.bulk_rename_targets.is_none());
+        assert!(app.marked_tasks.is_empty());
+        assert!(!matches!(
+            app.overlay,
+            Some(Overlay::Editor(_) | Overlay::EditorRecovery { .. })
+        ));
+    }
+
+    #[test]
+    fn bulk_rename_in_a_filter_uses_only_marked_members_and_preserves_cursor_after_sorting() {
+        let (_dir, mut app) = bulk_rename_app();
+        let filter: crate::model::RemoteFilter = serde_json::from_value(serde_json::json!({"id":"favorite","name":"Favorite","query":"#Work","is_favorite":true})).unwrap();
+        app.store.merge_remote(&[], &[], &[], &[filter]).unwrap();
+        let members = ["root", "peer"]
+            .into_iter()
+            .map(|id| {
+                serde_json::from_value::<crate::model::RemoteTask>(
+                    serde_json::to_value(app.store.task(id).unwrap().unwrap()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        app.store
+            .replace_filter_membership("favorite", &members)
+            .unwrap();
+        app.refresh_nav().unwrap();
+        let index = app
+            .nav_rows
+            .iter()
+            .position(
+                |row| matches!(row, NavRow::Item { id: NavId::Filter(id), .. } if id=="favorite"),
+            )
+            .unwrap();
+        app.select_nav(index);
+        app.enter_tasks().unwrap();
+        app.toggle_alphabetical_sort().unwrap();
+        mark_bulk_tasks(&mut app, 2);
+        assert_eq!(app.selected_task().unwrap().id, "peer");
+        app.open_bulk_rename().unwrap();
+        assert_eq!(
+            app.bulk_rename_targets
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["root", "peer"]
+        );
+        drop(app.overlay.take());
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::BulkRename,
+            task_id: None,
+            accepted: true,
+            text: "Zebra root\nAardvark peer\n".into(),
+        })
+        .unwrap();
+        assert_eq!(app.selected_task().unwrap().id, "peer");
+        assert_eq!(app.task_cursor, Some(0));
+        assert_eq!(app.store.task("child").unwrap().unwrap().content, "Same");
+        assert_eq!(
+            app.store.task("root").unwrap().unwrap().description,
+            "Keep this description"
+        );
+    }
+
+    #[test]
+    fn bulk_rename_history_follows_tasks_recreated_after_a_synchronized_deletion() {
+        let (_dir, mut app) = bulk_rename_app();
+        mark_bulk_tasks(&mut app, 2);
+        app.open_bulk_rename().unwrap();
+        drop(app.overlay.take());
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::BulkRename,
+            task_id: None,
+            accepted: true,
+            text: "Parent renamed\nChild renamed\n".into(),
+        })
+        .unwrap();
+        app.delete_task("root").unwrap();
+        for entry in app.store.outbox().unwrap() {
+            app.store.finish_outbox(entry.seq).unwrap();
+        }
+        app.undo().unwrap();
+        let parent = app.store.task("root").unwrap().unwrap();
+        assert!(parent.id.starts_with("local:"));
+        app.undo().unwrap();
+        assert_eq!(app.store.task("root").unwrap().unwrap().content, "Alpha");
+        assert_eq!(app.store.task("child").unwrap().unwrap().content, "Same");
+        app.redo().unwrap();
+        assert_eq!(
+            app.store.task("root").unwrap().unwrap().content,
+            "Parent renamed"
+        );
+        assert_eq!(
+            app.store.task("child").unwrap().unwrap().content,
+            "Child renamed"
+        );
+        assert_eq!(
+            app.store.task("child").unwrap().unwrap().parent_id,
+            Some(parent.id)
+        );
+    }
+
+    #[test]
+    fn a_noop_bulk_save_does_not_queue_changes_or_clear_redo_and_missing_targets_apply_no_partial_batch()
+     {
+        let (_dir, mut app) = bulk_rename_app();
+        app.set_priority("root", 2).unwrap();
+        app.undo().unwrap();
+        let queued = app.store.outbox_len().unwrap();
+        mark_bulk_tasks(&mut app, 2);
+        app.open_bulk_rename().unwrap();
+        let result = saved_bulk_editor(&mut app);
+        app.apply_editor_result(result).unwrap();
+        assert!(app.marked_tasks.is_empty());
+        assert_eq!(app.store.outbox_len().unwrap(), queued);
+        assert_eq!(app.redo_stack.len(), 1);
+        app.set_task_cursor(0);
+        mark_bulk_tasks(&mut app, 2);
+        app.open_bulk_rename().unwrap();
+        drop(app.overlay.take());
+        app.store.delete_task_tree("child").unwrap();
+        let queued = app.store.outbox_len().unwrap();
+        app.apply_editor_result(EditorResult {
+            purpose: EditorPurpose::BulkRename,
+            task_id: None,
+            accepted: true,
+            text: "First changed\nChild changed\n".into(),
+        })
+        .unwrap();
+        assert_eq!(app.store.task("root").unwrap().unwrap().content, "Alpha");
+        assert_eq!(app.store.outbox_len().unwrap(), queued);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Editor(editor)) if editor.notice().unwrap().contains("no longer available"))
+        );
+        assert_eq!(app.bulk_rename_targets.as_ref().unwrap()[1].id, "child");
+    }
+
+    fn searched_details_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = assignee_test_app();
+        app.store.merge_remote(
+            &serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+                {"id":"destination","name":"Destination","workspace_id":"workspace"}
+            ])).unwrap(),
+            &serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+                {"id":"previous","project_id":"team","content":"Previous","child_order":-1,"labels":["Work"]},
+                {"id":"root","project_id":"team","content":"Assign this","description":"Complete description","child_order":0,"labels":["Work"],"due":{"string":"today","date":"2026-11-23","is_recurring":false}},
+                {"id":"next","project_id":"team","content":"Next","child_order":2,"labels":["Work"]},
+                {"id":"bg-a","project_id":"inbox","content":"Background first","child_order":0},
+                {"id":"bg-b","project_id":"inbox","content":"Background selected","child_order":1,"priority":2}
+            ])).unwrap(),
+            &serde_json::from_value::<Vec<crate::model::RemoteLabel>>(serde_json::json!([
+                {"id":"work","name":"Work"}, {"id":"urgent","name":"Urgent"}
+            ])).unwrap(), &[]).unwrap();
+        app.store.toggle_project_hidden("team").unwrap();
+        app.refresh_nav().unwrap();
+        let inbox = app
+            .nav_rows
+            .iter()
+            .position(
+                |row| matches!(row, NavRow::Item { id: NavId::Project(id), .. } if id=="inbox"),
+            )
+            .unwrap();
+        app.select_nav(inbox);
+        app.enter_tasks().unwrap();
+        let index = app.tasks.iter().position(|task| task.id == "bg-b").unwrap();
+        app.set_task_cursor(index);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "assign".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(&app.overlay, Some(Overlay::Details { task, .. }) if task.id=="root"));
+        assert_eq!(app.selected_task().unwrap().id, "bg-b");
+        (dir, app)
+    }
+
+    fn show_task_details(app: &mut App, id: &str) {
+        app.overlay = Some(Overlay::Details {
+            task: app.store.task(id).unwrap().unwrap(),
+            scroll: 0,
+        });
+    }
+
+    #[test]
+    fn task_details_move_labels_and_assignee_pickers_target_the_shown_hidden_task() {
+        for (key, query) in [('v', "dest"), ('@', "urg"), ('+', "ada")] {
+            let (_dir, mut app) = searched_details_app();
+            let background = app.store.task("bg-b").unwrap().unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                .unwrap();
+            match &app.overlay {
+                Some(Overlay::ProjectPicker {
+                    purpose: ProjectPickerPurpose::MoveTask { task_id },
+                    projects,
+                    ..
+                }) => {
+                    assert_eq!(key, 'v');
+                    assert_eq!(task_id, "root");
+                    assert!(!projects.iter().any(|project| project.id == "team"));
+                }
+                Some(Overlay::ProjectPicker {
+                    purpose: ProjectPickerPurpose::AssignTask { task_id },
+                    projects,
+                    ..
+                }) => {
+                    assert_eq!(key, '+');
+                    assert_eq!(task_id, "root");
+                    assert!(projects.iter().any(|person| person.id == "ada"));
+                }
+                Some(Overlay::LabelPicker { task_id, .. }) => {
+                    assert_eq!(key, '@');
+                    assert_eq!(task_id, "root");
+                }
+                _ => panic!("{key} did not open the target picker"),
+            }
+            for character in query.chars() {
+                app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                    .unwrap();
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            let target = app.store.task("root").unwrap().unwrap();
+            match key {
+                'v' => {
+                    assert_eq!(target.project_id, "destination");
+                    assert_eq!(
+                        app.store.task("child").unwrap().unwrap().project_id,
+                        "destination"
+                    );
+                }
+                '@' => assert_eq!(target.labels, ["Work", "Urgent"]),
+                '+' => assert_eq!(target.responsible_uid.as_deref(), Some("ada")),
+                _ => unreachable!(),
+            }
+            assert_eq!(app.store.task("bg-b").unwrap().unwrap(), background);
+            assert_eq!(app.selected_task().unwrap().id, "bg-b");
+            assert!(app.store.project("team").unwrap().unwrap().is_hidden);
+            assert!(app.overlay.is_none());
+            assert_eq!(app.focus, Focus::Tasks);
+            show_task_details(&mut app, "root");
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+                .unwrap();
+            assert!(app.overlay.is_none());
+            let undone = app.store.task("root").unwrap().unwrap();
+            assert_eq!(undone.project_id, "team");
+            assert_eq!(undone.labels, ["Work"]);
+            assert!(undone.responsible_uid.is_none());
+            assert_eq!(app.selected_task().unwrap().id, "bg-b");
+            show_task_details(&mut app, "root");
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+                .unwrap();
+            assert!(app.overlay.is_none());
+            assert_eq!(app.store.task("root").unwrap().unwrap(), target);
+        }
+    }
+
+    #[test]
+    fn task_details_edit_due_and_child_editors_keep_their_explicit_target() {
+        for (key, purpose, text) in [
+            ('e', EditorPurpose::Edit, "Edited target\nNew description"),
+            ('t', EditorPurpose::Due, "tomorrow"),
+            ('c', EditorPurpose::AddChild, "Child from details"),
+        ] {
+            let (_dir, mut app) = searched_details_app();
+            let background = app.store.task("bg-b").unwrap().unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                .unwrap();
+            let Some(Overlay::Editor(editor)) = app.overlay.take() else {
+                panic!("{key} did not open its editor")
+            };
+            assert_eq!(editor.purpose(), purpose);
+            assert_eq!(editor.task_id(), Some("root"));
+            let result = EditorResult {
+                purpose: editor.purpose(),
+                task_id: editor.task_id().map(str::to_owned),
+                accepted: true,
+                text: text.into(),
+            };
+            drop(editor);
+            app.apply_editor_result(result).unwrap();
+            let target = app.store.task("root").unwrap().unwrap();
+            match key {
+                'e' => {
+                    assert_eq!(target.content, "Edited target");
+                    assert_eq!(target.description, "New description");
+                }
+                't' => assert_eq!(target.due.unwrap().string.as_deref(), Some("tomorrow")),
+                'c' => {
+                    let tasks = app
+                        .store
+                        .tasks_for_view(&NavId::Project("team".into()), true)
+                        .unwrap();
+                    let child = tasks.iter().find(|task| task.content == text).unwrap();
+                    assert_eq!(child.parent_id.as_deref(), Some("root"));
+                    assert_eq!(child.project_id, "team");
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(app.store.task("bg-b").unwrap().unwrap(), background);
+            assert_eq!(app.selected_task().unwrap().id, "bg-b");
+        }
+    }
+
+    #[test]
+    fn task_details_direct_commands_resolve_current_ids_and_completion_state() {
+        for key in ['T', '1', 'd', 'D'] {
+            let (_dir, mut app) = searched_details_app();
+            let background = app.store.task("bg-b").unwrap().unwrap();
+            let mapped: crate::model::RemoteTask = serde_json::from_value(serde_json::json!({
+                "id":"mapped","project_id":"team","content":"Assign this","due":{"string":"today","date":"2026-11-23","is_recurring":false}
+            })).unwrap();
+            app.store.replace_task_id("root", &mapped).unwrap();
+            if key == 'd' {
+                // The snapshot in details is now stale: d must reopen the
+                // current completed task rather than complete that snapshot.
+                app.store.set_task_completed("mapped", true).unwrap();
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                .unwrap();
+            assert!(app.overlay.is_none());
+            if key == 'D' {
+                assert!(app.store.task("mapped").unwrap().is_none());
+                assert!(app.store.task("child").unwrap().is_none());
+            } else {
+                let task = app.store.task("mapped").unwrap().unwrap();
+                match key {
+                    'T' => assert!(task.due.is_none()),
+                    '1' => assert_eq!(task.priority, 4),
+                    'd' => assert!(!task.checked),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(app.store.task("bg-b").unwrap().unwrap(), background);
+            assert_eq!(app.selected_task().unwrap().id, "bg-b");
+        }
+    }
+
+    #[test]
+    fn task_details_hierarchy_and_reordering_use_the_target_projects_ordering_and_rules() {
+        let (_dir, mut app) = searched_details_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            app.store
+                .task("root")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some("previous")
+        );
+        assert_eq!(
+            app.store
+                .task("child")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some("root")
+        );
+        show_task_details(&mut app, "root");
+        app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.store.task("root").unwrap().unwrap().parent_id.is_none());
+        for (key, expected) in [
+            ('J', vec!["previous", "next", "root"]),
+            ('K', vec!["previous", "root", "next"]),
+        ] {
+            show_task_details(&mut app, "root");
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                .unwrap();
+            let tasks = app
+                .store
+                .tasks_for_view(&NavId::Project("team".into()), true)
+                .unwrap();
+            assert_eq!(
+                tasks
+                    .iter()
+                    .filter(|task| task.parent_id.is_none())
+                    .map(|task| task.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(app.selected_task().unwrap().id, "bg-b");
+        }
+        app.store
+            .set_alphabetical_sort(&NavId::Project("team".into()), true)
+            .unwrap();
+        app.refresh_nav().unwrap();
+        assert!(!app.sort_tasks_alphabetically);
+        show_task_details(&mut app, "root");
+        let queued = app.store.outbox_len().unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.status.contains("alphabetical"));
+        assert_eq!(app.store.outbox_len().unwrap(), queued);
+        app.store.set_task_completed("root", true).unwrap();
+        let queued = app.store.outbox_len().unwrap();
+        for key in ['>', 'J', 'c'] {
+            show_task_details(&mut app, "root");
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                .unwrap();
+            assert!(app.status.to_lowercase().contains("completed"));
+            assert_eq!(app.store.outbox_len().unwrap(), queued);
+        }
+    }
+
+    #[test]
+    fn task_details_respect_configured_actions_scrolling_and_close_keys() {
+        let (dir, mut app) = searched_details_app();
+        let path = dir.path().join("detail-keys.toml");
+        std::fs::write(&path, "[keybindings]\nmove_task=['ctrl+v']\nedit_labels=['ctrl+l']\ndown=['ctrl+n']\nup=['ctrl+p']\n").unwrap();
+        app.keybindings = KeyBindings::load(&path, true).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Details { scroll: 1, .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Details { scroll: 0, .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(&app.overlay, Some(Overlay::Details { .. })));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(
+            matches!(&app.overlay, Some(Overlay::ProjectPicker { purpose: ProjectPickerPurpose::MoveTask { task_id }, .. }) if task_id=="root")
+        );
+        show_task_details(&mut app, "root");
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(
+            matches!(&app.overlay, Some(Overlay::LabelPicker { task_id, .. }) if task_id=="root")
+        );
+        for key in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')] {
+            show_task_details(&mut app, "root");
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE))
+                .unwrap();
+            assert!(app.overlay.is_none());
+        }
+        assert_eq!(app.store.outbox_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn copying_from_details_uses_the_displayed_title_and_keeps_the_dialog_open() {
+        let (_dir, mut app) = searched_details_app();
+        app.focus = Focus::Navigation;
+        let mut copied = String::new();
+        app.copy_selected_title_with(|clipboard, title| {
+            copied = title.clone();
+            clipboard.start_with(title, |_, _| Ok(()))
+        })
+        .unwrap();
+        assert_eq!(copied, "Assign this");
+        assert!(matches!(&app.overlay, Some(Overlay::Details { task, .. }) if task.id=="root"));
+        finish_clipboard_copy(&mut app);
+        assert_eq!(app.status, "Task title copied");
+    }
+
     #[test]
     fn copy_title_uses_the_selection_in_the_focused_pane() {
         let dir = tempfile::tempdir().unwrap();
@@ -3709,14 +4861,15 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         };
         let (_dir, mut app) = draft_test_app();
-        let finish = Arc::new(AtomicBool::new(false));
-        let worker_finish = finish.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
         app.copy_selected_title_with(|clipboard, title| {
             clipboard.start_with(title, move |text, cancel| {
                 assert_eq!(text, "Inbox");
-                while !worker_finish.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                while !cancel.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(2));
                 }
+                worker_cancelled.store(true, Ordering::Release);
                 Ok(())
             })
         })
@@ -3730,9 +4883,10 @@ mod tests {
             .unwrap();
         assert!(app.quit);
         assert!(started.elapsed() < Duration::from_secs(1));
-        finish.store(true, Ordering::Release);
-        finish_clipboard_copy(&mut app);
-        assert_eq!(app.status, "Project or filter title copied");
+        assert!(!app.tick().unwrap());
+        drop(app);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -6898,6 +8052,42 @@ mod tests {
             .unwrap();
         await_outbox(&mut app);
         assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
+    }
+
+    #[test]
+    fn long_idle_sync_event_bursts_yield_to_navigation_and_quit_without_more_storage_work() {
+        let (dir, mut app) = draft_test_app();
+        let inbox = app.store.project("inbox").unwrap().unwrap();
+        app.store.add_task("First", &inbox).unwrap();
+        app.store.add_task("Second", &inbox).unwrap();
+        app.enter_tasks().unwrap();
+        app.last_sync_started = Instant::now()
+            .checked_sub(Duration::from_secs(6 * 3600))
+            .unwrap_or_else(Instant::now);
+        for index in 0..MAX_SYNC_EVENTS_PER_TICK * 4 {
+            app.sync.send_test_event(SyncEvent::AuxiliaryWarning {
+                message: format!("Queued warning {index}"),
+            });
+        }
+        app.tick().unwrap();
+        assert!(app.sync_events_pending);
+        assert_eq!(app.poll_timeout(), Duration::ZERO);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_task().unwrap().content, "Second");
+        app.sync.send_test_event(SyncEvent::DataRefreshed);
+        app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.quit);
+        rusqlite::Connection::open(dir.path().join("drafts.db"))
+            .unwrap()
+            .execute("DROP TABLE filters", [])
+            .unwrap();
+        assert!(
+            !app.tick().unwrap(),
+            "quitting must not drain refreshes or query storage"
+        );
+        assert!(app.sync.next_event().is_some());
     }
 
     #[test]

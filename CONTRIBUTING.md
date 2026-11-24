@@ -95,6 +95,26 @@ title immediately and defer database-backed task loading through the existing
 debounce. Prefer one SQLite connection per logical store operation and keep
 remote work in the synchronization thread.
 
+The UI must not acquire synchronization-worker mutexes. Retry deadlines are
+UI-owned snapshots published over a channel; preferred-filter updates travel in
+the other direction and are coalesced by the worker. Keep storage I/O outside
+coordination locks. `App::tick` processes at most eight sync notifications or
+eight milliseconds of notification work before yielding to input/rendering, and
+does no further refresh/storage work once quit is requested.
+
+Task-details commands must target the dialog's current task ID, including search
+results outside the active view. Share ID-targeted mutation helpers with the
+task list; retain background selection for out-of-view targets. Hierarchy and
+reordering use visible task order when available, otherwise the target project's
+cached order and alphabetical preference.
+
+Bulk rename freezes an ordered ID/title snapshot for its editor and draft
+recovery. Saved unchanged lines are omitted; changed titles and outbox writes
+commit in one transaction. `RenameTask` sends only literal content and protects
+that field in parser/creation writebacks. Its session undo entry stores titles
+only, so undo cannot overwrite metadata changed in the meantime. Keep bulk marks
+separate from cursor selection and style them at viewport extraction time.
+
 Filter refresh cadence is separate from freshness: successful outbox uploads and
 manual sync invalidate favorite-filter membership immediately. Keep that request
 pending through failed pushes/pulls and server backoff; periodic syncs alone use

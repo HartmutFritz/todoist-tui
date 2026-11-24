@@ -1,7 +1,8 @@
 use std::{
+    cell::{Cell, RefCell},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -44,15 +45,37 @@ pub struct SyncManager {
     running: Arc<AtomicBool>,
     tx: Sender<SyncEvent>,
     rx: Receiver<SyncEvent>,
-    retry: Arc<Mutex<RetryState>>,
+    // The UI owns its retry snapshot. Workers publish updates instead of
+    // making input/timer handling wait for a worker-held mutex.
+    retry: Cell<RetryState>,
+    retry_attempts: Arc<AtomicU32>,
+    retry_tx: Sender<RetryState>,
+    retry_rx: Receiver<RetryState>,
     auxiliary_due: Arc<Mutex<Instant>>,
     filter_refresh_requested: Arc<AtomicBool>,
-    preferred_filter: Arc<Mutex<Option<String>>>,
+    preferred_filter: RefCell<Option<String>>,
+    preference_tx: Sender<Option<String>>,
+    preferences: Arc<Mutex<FilterPreference>>,
 }
 
+#[derive(Clone, Copy)]
 struct RetryState {
     attempts: u32,
     deadline: Instant,
+}
+
+struct FilterPreference {
+    current: Option<String>,
+    updates: Receiver<Option<String>>,
+}
+
+impl FilterPreference {
+    fn latest(&mut self) -> Option<String> {
+        for update in self.updates.try_iter() {
+            self.current = update;
+        }
+        self.current.clone()
+    }
 }
 
 struct RunningGuard {
@@ -78,6 +101,8 @@ impl Drop for RunningGuard {
 impl SyncManager {
     pub fn new(store: Store, token: Option<String>) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel();
+        let (retry_tx, retry_rx) = mpsc::channel();
+        let (preference_tx, preference_rx) = mpsc::channel();
         let retry_after = store
             .meta("retry_not_before")?
             .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
@@ -93,15 +118,23 @@ impl SyncManager {
             running: Arc::new(AtomicBool::new(false)),
             tx,
             rx,
-            retry: Arc::new(Mutex::new(RetryState {
+            retry: Cell::new(RetryState {
                 attempts: u32::from(!retry_after.is_zero()),
                 deadline: Instant::now()
                     .checked_add(retry_after)
                     .unwrap_or_else(Instant::now),
-            })),
+            }),
+            retry_attempts: Arc::new(AtomicU32::new(u32::from(!retry_after.is_zero()))),
+            retry_tx,
+            retry_rx,
             auxiliary_due: Arc::new(Mutex::new(Instant::now())),
             filter_refresh_requested: Arc::new(AtomicBool::new(false)),
-            preferred_filter: Arc::new(Mutex::new(None)),
+            preferred_filter: RefCell::new(None),
+            preference_tx,
+            preferences: Arc::new(Mutex::new(FilterPreference {
+                current: None,
+                updates: preference_rx,
+            })),
         })
     }
 
@@ -121,12 +154,10 @@ impl SyncManager {
     }
 
     pub fn prefer_filter(&self, id: Option<&str>) {
-        let mut preferred = self
-            .preferred_filter
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut preferred = self.preferred_filter.borrow_mut();
         if preferred.as_deref() != id {
             *preferred = id.map(str::to_owned);
+            let _ = self.preference_tx.send(preferred.clone());
         }
     }
 
@@ -147,10 +178,11 @@ impl SyncManager {
         let store = self.store.clone();
         let running = self.running.clone();
         let tx = self.tx.clone();
-        let retry = self.retry.clone();
+        let retry_attempts = self.retry_attempts.clone();
+        let retry_tx = self.retry_tx.clone();
         let auxiliary_due = self.auxiliary_due.clone();
         let filter_refresh_requested = self.filter_refresh_requested.clone();
-        let preferred_filter = self.preferred_filter.clone();
+        let preferences = self.preferences.clone();
         let refresh_epoch = Instant::now();
         let _ = tx.send(SyncEvent::Started);
         let worker = thread::Builder::new()
@@ -194,10 +226,10 @@ impl SyncManager {
                                     .unwrap_or_else(|error| error.into_inner()))
                     {
                         let result = (|| -> anyhow::Result<AuxiliaryRefresh> {
-                            let preferred = preferred_filter
+                            let preferred = preferences
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner())
-                                .clone();
+                                .latest();
                             let preferred = preferred
                                 .map(|id| {
                                     store
@@ -249,11 +281,12 @@ impl SyncManager {
                 })();
                 match result {
                     Ok(pending) => {
-                        let mut retry = retry.lock().unwrap_or_else(|error| error.into_inner());
-                        retry.attempts = 0;
-                        retry.deadline = Instant::now();
+                        retry_attempts.store(0, Ordering::Release);
                         let _ = store.set_meta("retry_not_before", "");
-                        drop(retry);
+                        let _ = retry_tx.send(RetryState {
+                            attempts: 0,
+                            deadline: Instant::now(),
+                        });
                         running_guard.finish();
                         let _ = tx.send(SyncEvent::Finished { pending });
                     }
@@ -262,13 +295,13 @@ impl SyncManager {
                         // Transport/server failures back off without sleeping in
                         // the worker, so local changes remain completely usable.
                         if !queued_rejection {
-                            let mut retry = retry.lock().unwrap_or_else(|error| error.into_inner());
-                            retry.attempts = retry.attempts.saturating_add(1);
+                            let attempts = retry_attempts.load(Ordering::Acquire).saturating_add(1);
+                            retry_attempts.store(attempts, Ordering::Release);
                             let delay = retry_delay(&error).unwrap_or_else(|| {
-                                Duration::from_secs((2_u64.pow(retry.attempts.min(8))).min(300))
+                                Duration::from_secs((2_u64.pow(attempts.min(8))).min(300))
                             });
                             let delay = delay.max(Duration::from_secs(1));
-                            retry.deadline = Instant::now()
+                            let deadline = Instant::now()
                                 .checked_add(delay)
                                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
                             let persisted_delay = chrono::Duration::from_std(delay)
@@ -277,11 +310,14 @@ impl SyncManager {
                                 .checked_add_signed(persisted_delay)
                                 .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(1));
                             let _ = store.set_meta("retry_not_before", &until.to_rfc3339());
+                            let _ = retry_tx.send(RetryState { attempts, deadline });
                         } else {
-                            let mut retry = retry.lock().unwrap_or_else(|error| error.into_inner());
-                            retry.attempts = 0;
-                            retry.deadline = Instant::now();
+                            retry_attempts.store(0, Ordering::Release);
                             let _ = store.set_meta("retry_not_before", "");
+                            let _ = retry_tx.send(RetryState {
+                                attempts: 0,
+                                deadline: Instant::now(),
+                            });
                         }
                         running_guard.finish();
                         let _ = tx.send(SyncEvent::Failed {
@@ -306,17 +342,27 @@ impl SyncManager {
         self.rx.try_recv().ok()
     }
 
+    #[cfg(test)]
+    pub fn send_test_event(&self, event: SyncEvent) {
+        self.tx.send(event).unwrap();
+    }
+
     pub fn retry_after(&self) -> Duration {
-        self.retry
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        self.retry_state()
             .deadline
             .saturating_duration_since(Instant::now())
     }
 
     pub fn retry_due(&self) -> bool {
-        let retry = self.retry.lock().unwrap_or_else(|error| error.into_inner());
+        let retry = self.retry_state();
         retry.attempts > 0 && Instant::now() >= retry.deadline
+    }
+
+    fn retry_state(&self) -> RetryState {
+        for update in self.retry_rx.try_iter() {
+            self.retry.set(update);
+        }
+        self.retry.get()
     }
 
     #[cfg(test)]
@@ -367,5 +413,69 @@ mod tests {
             };
         }
         assert!(!running.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn ui_sync_methods_do_not_wait_for_worker_owned_state_and_keep_the_latest_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            SyncManager::new(Store::open(dir.path().join("cache.db")).unwrap(), None).unwrap();
+        let preferences = manager.preferences.clone();
+        let held = preferences.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let ui = thread::spawn(move || {
+            manager.prefer_filter(Some("first"));
+            manager.prefer_filter(None);
+            manager.prefer_filter(Some("latest"));
+            assert!(manager.retry_after().is_zero());
+            assert!(!manager.retry_due());
+            assert!(!manager.start());
+            tx.send(manager).unwrap();
+        });
+        // The simulated worker remains blocked/paused with its lock held until
+        // after all UI methods have returned. Always release it before joining
+        // so a regression fails rather than hanging the test process.
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        ui.join().unwrap();
+        let manager = result.expect("UI methods waited for synchronization worker state");
+        let mut state = manager.preferences.lock().unwrap();
+        assert_eq!(state.latest().as_deref(), Some("latest"));
+        assert_eq!(state.latest().as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn retry_snapshots_publish_backoff_and_recovery_without_ui_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            SyncManager::new(Store::open(dir.path().join("cache.db")).unwrap(), None).unwrap();
+        manager
+            .retry_tx
+            .send(RetryState {
+                attempts: 2,
+                deadline: Instant::now() + Duration::from_secs(600),
+            })
+            .unwrap();
+        let remaining = manager.retry_after();
+        assert!(remaining > Duration::from_secs(590));
+        assert!(remaining <= Duration::from_secs(600));
+        assert!(!manager.retry_due());
+        manager
+            .retry_tx
+            .send(RetryState {
+                attempts: 2,
+                deadline: Instant::now(),
+            })
+            .unwrap();
+        assert!(manager.retry_due());
+        assert!(manager.retry_after().is_zero());
+        manager
+            .retry_tx
+            .send(RetryState {
+                attempts: 0,
+                deadline: Instant::now(),
+            })
+            .unwrap();
+        assert!(!manager.retry_due());
     }
 }

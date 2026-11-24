@@ -328,6 +328,8 @@ impl TodoistClient {
                     "id": entry.entity_id, "content": content, "description": description
                 }),
             )?,
+            Operation::RenameTask { content } => self.command(entry, "item_update",
+                json!({"id": entry.entity_id, "content": content}))?,
             Operation::QuickEdit {
                 expression,
                 description,
@@ -2114,6 +2116,47 @@ mod tests {
         assert!(api.request().contains("item_delete"));
         assert!(api.request().contains(delete_uuid));
         assert!(api.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn bulk_title_renames_upload_literal_content_only_without_quick_add_parsing() {
+        let api = MockApi::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("rename.db")).unwrap();
+        store.merge_remote(&[], &serde_json::from_value::<Vec<RemoteTask>>(json!([
+            {"id":"first","project_id":"inbox","content":"Old","description":"Keep description","priority":3},
+            {"id":"second","project_id":"inbox","content":"Old","checked":true}
+        ])).unwrap(), &[], &[]).unwrap();
+        let titles = [
+            crate::model::TaskTitle {
+                id: "first".into(),
+                content: "tomorrow #Literal @label p1 +Person".into(),
+            },
+            crate::model::TaskTitle {
+                id: "second".into(),
+                content: "Another literal title".into(),
+            },
+        ];
+        store.rename_tasks(&titles).unwrap();
+        for title in &titles {
+            let entry = store.claim_next_outbox().unwrap().unwrap();
+            api.command(&entry.uuid);
+            api.client.push(&store, &entry).unwrap();
+            let request = api.request();
+            assert!(request.starts_with("POST /sync "));
+            assert_eq!(
+                request_commands(&request)[0]["args"],
+                json!({"id":title.id,"content":title.content})
+            );
+        }
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert!(api.requests.try_recv().is_err());
+        assert_eq!(
+            store.task("first").unwrap().unwrap().description,
+            "Keep description"
+        );
+        assert_eq!(store.task("first").unwrap().unwrap().priority, 3);
+        assert!(store.task("second").unwrap().unwrap().checked);
     }
 
     #[test]

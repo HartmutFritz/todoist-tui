@@ -112,6 +112,7 @@ below mean Shift+letter.
 | `a` / `q` | Add a task at the top / bottom in Todoist order |
 | `c` | Add a subtask |
 | `e` | Edit a task, or a filter from its details |
+| Space | Toggle a task's bulk-selection mark, then move down |
 | `d` | Complete / reopen a task |
 | `D` | Delete a task and its subtasks |
 | `t` / `T` | Edit / remove the due date |
@@ -123,7 +124,7 @@ below mean Shift+letter.
 | `L` / `A` / `C` | Toggle label grouping / current-view alphabetical order / completed tasks |
 | `P` / Ctrl+f | Add a project / personal filter |
 | `R` | Rename the selected project |
-| `r` | Synchronize |
+| `r` | Bulk rename marked tasks in the task pane; otherwise synchronize |
 | `J` / `K` | Move the focused project or task down / up among siblings |
 | `y` | Copy the focused title |
 | Ctrl+0 … Ctrl+9 | Set/remove a project's space override |
@@ -139,8 +140,8 @@ pickers use name prefixes; task search includes cached completed tasks.
 Type a search and press Enter, or press Esc once to select results with `j`/`k`.
 A second Esc cancels.
 
-With tasks focused, `v` moves to any other cached personal or team project,
-including hidden projects. Type a fuzzy destination search and press Enter. Parent
+From the task list or task details, `v` moves to any other cached personal or team
+project, including hidden projects. Type a fuzzy destination search and press Enter. Parent
 moves include their subtasks; supported moves work offline and support undo/redo.
 Todoist does not support moving individual tasks out of a team workspace; the
 application explains that restriction before applying a known unsupported move.
@@ -148,6 +149,12 @@ application explains that restriction before applying a known unsupported move.
 Help and detail dialogs close with Enter, Esc, or `q`. Tasks that have a
 description show a text indicator (`☰`) on the right; Enter opens the full
 description in a dialog titled **Task**, without shortcut hints in the title.
+
+Task shortcuts also work in that dialog: `e`, `v`, `@`, `+`, `t`/`T`, `1`–`4`,
+`d`/`D`, `c`, `>`/`<`, and `J`/`K` act on the task whose details are open.
+`y` copies its displayed title; `u`/Ctrl+r use the usual session undo/redo history.
+Editors and pickers replace the dialog; direct changes return to the task list.
+This also works for tasks opened through search, including other projects.
 
 Scroll task, filter, and error details with `j`/`k` (or your configured movement
 keys) to read long titles, queries, and descriptions in small terminals.
@@ -245,6 +252,27 @@ Use `favorite = false` for a non-favorite filter. Removing the current filter
 from favorites switches to a surviving view and restores its task selection.
 Unavailable views leave the task pane empty.
 
+### Bulk rename
+
+In the task pane, press **Space** to mark tasks (press it again on a marked task
+to unmark it). Space advances to the next task, as in Yazi. Checkmarks and the
+selection count show the current batch; Esc clears it. Marks stay with tasks
+when sorting or synchronizing, and clear when switching views.
+
+Press **`r`** with tasks marked to open **Neovim** containing one title per line,
+in the displayed task order. Edit those lines, keeping the same number of
+non-empty lines, then save normally. Line 1 renames the first marked task,
+line 2 the second, and so on. Unchanged lines leave their tasks untouched.
+Titles are literal: descriptions, labels, dates, priorities, assignees, and
+hierarchy are preserved. Duplicate titles are allowed. Edit existing multiline
+titles individually.
+
+Changes apply together locally, work offline, and synchronize in the background.
+`u`/Ctrl+r undo or redo the whole batch. A rejected save retains the draft for
+correction; cancelling retains the marks. A successful save clears the marks.
+With no marked tasks, `r` synchronizes as usual. The configurable actions are
+`toggle_task_selection` and `bulk_rename`.
+
 ## Configuration
 
 On Linux, configuration is optional and defaults to
@@ -284,7 +312,9 @@ from ordinary name-prefix jumps.
 ## Synchronization and data
 
 Synchronization starts at launch, after changes, and every 60 seconds. Local
-changes survive restarts. The bottom-left indicator shows the current state:
+changes survive restarts. Background refresh bursts yield to keyboard input;
+navigation and quitting remain available after long idle periods. The bottom-left
+indicator shows the current state:
 
 | Indicator | Meaning |
 | --- | --- |
