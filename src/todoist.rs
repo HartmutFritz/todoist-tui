@@ -3259,6 +3259,33 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_passes_reuse_one_synchronization_worker() {
+        use crate::sync::{SyncEvent, SyncManager};
+        let api = MockApi::new();
+        let (_dir, store, _task) = filter_sync_fixture();
+        api.respond(200, json!({"user":{"id":"account"}}));
+        api.respond(200, json!({"sync_token":"first"}));
+        api.respond(200, json!({"sync_token":"second"}));
+        let manager = SyncManager::with_test_client(store, api.client.clone());
+
+        for _ in 0..2 {
+            assert!(manager.start());
+            assert!(matches!(
+                wait_for_sync(&manager),
+                SyncEvent::Finished { .. }
+            ));
+        }
+
+        // A thread per pass closes its database connection as it exits, which
+        // deadlocks SQLite's unix VFS against another thread opening one.
+        assert_eq!(
+            manager.workers_started(),
+            1,
+            "each pass started its own worker thread"
+        );
+    }
+
+    #[test]
     fn server_backoff_prevents_duplicate_runs_and_survives_restart() {
         use crate::sync::{SyncEvent, SyncManager};
         let api = MockApi::new();

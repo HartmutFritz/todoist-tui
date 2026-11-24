@@ -1,7 +1,11 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
+    ops::Deref,
     path::PathBuf,
+    rc::Rc,
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result, bail};
@@ -37,6 +41,61 @@ const READY_OUTBOX: &str = "o.error IS NULL AND NOT EXISTS (
     WHERE reference.key IN ('id','parent_id','project_id') AND reference.type='text'
     AND reference.value LIKE 'local:%' AND creation.seq<>o.seq
     AND json_extract(creation.payload,'$.kind') IN ('quick_add','add_project','add_filter'))";
+
+// SQLite's unix VFS takes its process-global `unixBigLock` and a per-inode
+// lock in opposite orders when a connection is opened (`unixOpen` ->
+// `findReusableFd`) and when one is closed (`sqlite3WalClose` -> `unixLock`).
+// An open overlapping a close on the same database therefore deadlocks both
+// threads for good, with no way out but killing the process. Serializing the
+// two sequences removes that interleaving; reusing connections makes both
+// rare enough that this gate is effectively never contended.
+static CONNECTION_GATE: Mutex<()> = Mutex::new(());
+
+fn connection_gate() -> std::sync::MutexGuard<'static, ()> {
+    CONNECTION_GATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+thread_local! {
+    /// One reusable connection per database per thread. Connections are never
+    /// shared between threads, so no two statements can run on one at once.
+    static CONNECTIONS: RefCell<HashMap<PathBuf, Rc<GatedConnection>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Closes its connection under the gate, including when a thread exits and
+/// drops this thread's cache.
+struct GatedConnection(Option<Connection>);
+
+impl Deref for GatedConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.0
+            .as_ref()
+            .expect("connection is taken only while dropping it")
+    }
+}
+
+impl Drop for GatedConnection {
+    fn drop(&mut self) {
+        let _gate = connection_gate();
+        drop(self.0.take());
+    }
+}
+
+/// A connection borrowed from this thread's cache. Dropping it returns the
+/// connection to the cache instead of closing it.
+struct StoreConnection(Rc<GatedConnection>);
+
+impl Deref for StoreConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -75,7 +134,37 @@ impl Store {
         Ok(store)
     }
 
-    fn connect(&self) -> Result<Connection> {
+    /// Returns this thread's connection for the database, opening one on first
+    /// use. A nested call made while the cached connection is still borrowed
+    /// gets its own connection, so it never joins an outer transaction.
+    fn connect(&self) -> Result<StoreConnection> {
+        let cached = CONNECTIONS
+            .try_with(|connections| {
+                connections
+                    .borrow()
+                    .get(&self.path)
+                    // A second strong reference means an outer call still holds it.
+                    .filter(|connection| Rc::strong_count(connection) == 1)
+                    .map(Rc::clone)
+            })
+            .ok()
+            .flatten();
+        if let Some(connection) = cached {
+            return Ok(StoreConnection(connection));
+        }
+        let connection = Rc::new(GatedConnection(Some(self.open_connection()?)));
+        // A cache that is already gone leaves the connection owned by the
+        // returned handle, which simply closes it again when the call ends.
+        let _ = CONNECTIONS.try_with(|connections| {
+            connections
+                .borrow_mut()
+                .insert(self.path.clone(), Rc::clone(&connection))
+        });
+        Ok(StoreConnection(connection))
+    }
+
+    fn open_connection(&self) -> Result<Connection> {
+        let _gate = connection_gate();
         let conn = Connection::open(&self.path)
             .with_context(|| format!("open database {}", self.path.display()))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -83,6 +172,10 @@ impl Store {
         // as well, so a local command reports a retryable error rather than
         // freezing input for several seconds behind a background transaction.
         conn.busy_timeout(std::time::Duration::from_millis(100))?;
+        // Attach the write-ahead log and its shared-memory index while the gate
+        // is still held, so the complete open sequence stays serialized against
+        // another thread closing a connection.
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
         Ok(conn)
     }
 
@@ -306,7 +399,8 @@ impl Store {
     }
 
     pub fn filters(&self) -> Result<Vec<Filter>> {
-        filters_from(&self.connect()?, false)
+        let conn = self.connect()?;
+        filters_from(&conn, false)
     }
 
     pub fn filter(&self, id: &str) -> Result<Option<Filter>> {
@@ -2270,8 +2364,8 @@ impl Store {
     }
 
     pub fn claim_next_outbox(&self) -> Result<Option<OutboxEntry>> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let conn = self.connect()?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let entry = tx.query_row(
             &format!("SELECT seq,uuid,entity_id,payload,checkpoint FROM outbox o WHERE {READY_OUTBOX} ORDER BY seq LIMIT 1"), [], row_to_outbox,
         ).optional()?;
@@ -2581,7 +2675,8 @@ impl Store {
     }
 
     pub fn resolve_task_id(&self, id: &str) -> Result<Option<String>> {
-        resolve_task_id_from(&self.connect()?, id)
+        let conn = self.connect()?;
+        resolve_task_id_from(&conn, id)
     }
 
     pub fn resolve_sync_task_id(&self, id: &str) -> Result<String> {
@@ -2640,7 +2735,8 @@ impl Store {
     }
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
-        meta_from(&self.connect()?, key)
+        let conn = self.connect()?;
+        meta_from(&conn, key)
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
@@ -2662,8 +2758,8 @@ impl Store {
     }
 
     pub fn set_task_view_preferences(&self, preferences: TaskViewPreferences) -> Result<()> {
-        let mut conn = self.connect()?;
-        let transaction = conn.transaction()?;
+        let conn = self.connect()?;
+        let transaction = conn.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![
@@ -5240,15 +5336,81 @@ mod tests {
     }
 
     #[test]
+    fn connections_are_reused_per_thread_and_nested_calls_stay_independent() {
+        let store = store();
+        // A temporary table belongs to one connection, so finding it again
+        // proves the next call reused it instead of opening another.
+        {
+            let conn = store.connect().unwrap();
+            conn.execute_batch("CREATE TEMP TABLE reuse_probe(id INTEGER)")
+                .unwrap();
+        }
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM temp.reuse_probe", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        // While that handle is alive a nested call must get its own
+        // connection, so an inner call can never join an outer transaction.
+        let nested = store.connect().unwrap();
+        assert!(
+            nested
+                .query_row("SELECT count(*) FROM temp.reuse_probe", [], |row| row
+                    .get::<_, i64>(0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn concurrent_connection_churn_between_threads_does_not_deadlock() {
+        // Opening a connection takes SQLite's global VFS lock before a
+        // per-inode lock, while closing one takes them in the opposite order.
+        // Overlapping an open with a close used to wedge both threads for good.
+        let store = store();
+        store
+            .merge_remote(&[remote_project("project", "Project")], &[], &[], &[])
+            .unwrap();
+        let (finished, completions) = std::sync::mpsc::channel();
+        for worker in 0..2 {
+            let store = store.clone();
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                for round in 0..100 {
+                    store.projects().unwrap();
+                    if worker == 0 {
+                        store.set_meta("churn", &round.to_string()).unwrap();
+                    }
+                    // A short-lived thread opens a connection and closes it
+                    // again on exit, racing the other worker's statements.
+                    let opener = store.clone();
+                    std::thread::spawn(move || opener.projects().unwrap())
+                        .join()
+                        .unwrap();
+                }
+                let _ = finished.send(());
+            });
+        }
+        // Never join a possibly deadlocked thread: fail on a deadline instead
+        // of hanging the whole test run.
+        for _ in 0..2 {
+            completions
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("concurrent connection churn deadlocked");
+        }
+        assert_eq!(store.projects().unwrap().len(), 2);
+    }
+
+    #[test]
     fn contention_is_bounded_and_a_failed_mutation_never_partially_commits() {
         let store = store();
         store
             .merge_remote(&[remote_project("project", "Original")], &[], &[], &[])
             .unwrap();
-        let mut writer = store.connect().unwrap();
-        let lock = writer
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .unwrap();
+        let writer = store.connect().unwrap();
+        let lock = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).unwrap();
         let started = std::time::Instant::now();
         assert!(store.rename_project("project", "Not committed").is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));

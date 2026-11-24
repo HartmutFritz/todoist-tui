@@ -56,6 +56,13 @@ pub struct SyncManager {
     preferred_filter: RefCell<Option<String>>,
     preference_tx: Sender<Option<String>>,
     preferences: Arc<Mutex<FilterPreference>>,
+    // One long-lived worker rather than a thread per pass. An exiting thread
+    // closes its database connection, and SQLite's unix VFS deadlocks when a
+    // close overlaps another thread's open, so steady-state synchronization
+    // must stop creating and retiring threads. See `Store::connect`.
+    passes: RefCell<Option<Sender<()>>>,
+    #[cfg(test)]
+    workers_started: Cell<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +142,9 @@ impl SyncManager {
                 current: None,
                 updates: preference_rx,
             })),
+            passes: RefCell::new(None),
+            #[cfg(test)]
+            workers_started: Cell::new(0),
         })
     }
 
@@ -175,159 +185,8 @@ impl SyncManager {
         {
             return false;
         }
-        let store = self.store.clone();
-        let running = self.running.clone();
-        let tx = self.tx.clone();
-        let retry_attempts = self.retry_attempts.clone();
-        let retry_tx = self.retry_tx.clone();
-        let auxiliary_due = self.auxiliary_due.clone();
-        let filter_refresh_requested = self.filter_refresh_requested.clone();
-        let preferences = self.preferences.clone();
-        let refresh_epoch = Instant::now();
-        let _ = tx.send(SyncEvent::Started);
-        let worker = thread::Builder::new()
-            .name("todoist-tui-sync".into())
-            .spawn(move || {
-                let mut running_guard = RunningGuard {
-                    running,
-                    finished: false,
-                };
-                let mut queued_rejection = false;
-                let result = (|| -> anyhow::Result<usize> {
-                    client.verify_account(&store)?;
-                    // Refetch after every operation because Quick Add replaces temporary IDs
-                    // in all later entries atomically.
-                    loop {
-                        let Some(entry) = store.claim_next_outbox()? else {
-                            break;
-                        };
-                        if let Err(error) = client.push(&store, &entry) {
-                            if permanent_rejection(&error) {
-                                store.fail_outbox(entry.seq, &format!("{error:#}"))?;
-                            } else {
-                                return Err(error);
-                            }
-                        } else {
-                            // Retain invalidation if a later push/pull fails;
-                            // the retry may otherwise have an empty outbox.
-                            filter_refresh_requested.store(true, Ordering::Release);
-                        }
-                    }
-                    client.pull(&store)?;
-                    let _ = tx.send(SyncEvent::DataRefreshed);
-                    let uploads_waiting = store.has_uploadable_changes()?;
-                    let requested =
-                        !uploads_waiting && filter_refresh_requested.swap(false, Ordering::AcqRel);
-                    if !uploads_waiting
-                        && (requested
-                            || Instant::now()
-                                >= *auxiliary_due
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner()))
-                    {
-                        let result = (|| -> anyhow::Result<AuxiliaryRefresh> {
-                            let preferred = preferences
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .latest();
-                            let preferred = preferred
-                                .map(|id| {
-                                    store
-                                        .filter(&id)
-                                        .map(|filter| filter.map(|filter| filter.id))
-                                })
-                                .transpose()?
-                                .flatten();
-                            let refresh = client.pull_auxiliary_with_progress(
-                                &store,
-                                preferred.as_deref(),
-                                || filter_refresh_requested.load(Ordering::Acquire),
-                                |id| {
-                                    let _ = tx.send(SyncEvent::FilterRefreshed {
-                                        filter_id: id.into(),
-                                    });
-                                },
-                            )?;
-                            store.set_meta("auxiliary_warning", &refresh.warnings.join("\n\n"))?;
-                            Ok(refresh)
-                        })();
-                        if result.is_err() {
-                            // Retry a rate-limited/failed explicit refresh after
-                            // backoff, even if the periodic deadline is later.
-                            filter_refresh_requested.store(true, Ordering::Release);
-                        }
-                        let refresh = result?;
-                        // Only idle polling is minute-throttled. Successful
-                        // local writes and explicit refreshes bypass this timer.
-                        if refresh.filters_complete {
-                            *auxiliary_due
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner()) =
-                                refresh_epoch + Duration::from_secs(60);
-                        } else {
-                            filter_refresh_requested.store(true, Ordering::Release);
-                        }
-                        if !refresh.warnings.is_empty() {
-                            let _ = tx.send(SyncEvent::AuxiliaryWarning {
-                                message: refresh.warnings.join("\n\n"),
-                            });
-                        }
-                    }
-                    if let Some(message) = store.outbox_error()? {
-                        queued_rejection = true;
-                        anyhow::bail!("{message}");
-                    }
-                    store.outbox_len()
-                })();
-                match result {
-                    Ok(pending) => {
-                        retry_attempts.store(0, Ordering::Release);
-                        let _ = store.set_meta("retry_not_before", "");
-                        let _ = retry_tx.send(RetryState {
-                            attempts: 0,
-                            deadline: Instant::now(),
-                        });
-                        running_guard.finish();
-                        let _ = tx.send(SyncEvent::Finished { pending });
-                    }
-                    Err(error) => {
-                        // Rejections stay durable but do not delay a correction.
-                        // Transport/server failures back off without sleeping in
-                        // the worker, so local changes remain completely usable.
-                        if !queued_rejection {
-                            let attempts = retry_attempts.load(Ordering::Acquire).saturating_add(1);
-                            retry_attempts.store(attempts, Ordering::Release);
-                            let delay = retry_delay(&error).unwrap_or_else(|| {
-                                Duration::from_secs((2_u64.pow(attempts.min(8))).min(300))
-                            });
-                            let delay = delay.max(Duration::from_secs(1));
-                            let deadline = Instant::now()
-                                .checked_add(delay)
-                                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
-                            let persisted_delay = chrono::Duration::from_std(delay)
-                                .unwrap_or(chrono::Duration::days(1));
-                            let until = chrono::Utc::now()
-                                .checked_add_signed(persisted_delay)
-                                .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(1));
-                            let _ = store.set_meta("retry_not_before", &until.to_rfc3339());
-                            let _ = retry_tx.send(RetryState { attempts, deadline });
-                        } else {
-                            retry_attempts.store(0, Ordering::Release);
-                            let _ = store.set_meta("retry_not_before", "");
-                            let _ = retry_tx.send(RetryState {
-                                attempts: 0,
-                                deadline: Instant::now(),
-                            });
-                        }
-                        running_guard.finish();
-                        let _ = tx.send(SyncEvent::Failed {
-                            kind: classify_failure(&error),
-                            message: format!("{error:#}"),
-                        });
-                    }
-                }
-            });
-        if let Err(error) = worker {
+        let _ = self.tx.send(SyncEvent::Started);
+        if let Err(error) = self.request_pass(&client) {
             self.running.store(false, Ordering::Release);
             let _ = self.tx.send(SyncEvent::Failed {
                 kind: SyncFailureKind::Problem,
@@ -336,6 +195,59 @@ impl SyncManager {
             return false;
         }
         true
+    }
+
+    /// Hands one pass to the long-lived worker, starting a replacement when an
+    /// earlier worker stopped, so a pass that panics cannot end synchronization
+    /// for the rest of the session.
+    fn request_pass(&self, client: &TodoistClient) -> std::result::Result<(), String> {
+        let mut passes = self.passes.borrow_mut();
+        if let Some(sender) = passes.as_ref()
+            && sender.send(()).is_ok()
+        {
+            return Ok(());
+        }
+        *passes = None;
+        let sender = self
+            .spawn_worker(client)
+            .map_err(|error| error.to_string())?;
+        sender
+            .send(())
+            .map_err(|_| "worker stopped before its first pass".to_owned())?;
+        *passes = Some(sender);
+        Ok(())
+    }
+
+    fn spawn_worker(&self, client: &TodoistClient) -> std::io::Result<Sender<()>> {
+        let (sender, passes) = mpsc::channel();
+        let worker = Worker {
+            client: client.clone(),
+            store: self.store.clone(),
+            running: self.running.clone(),
+            tx: self.tx.clone(),
+            retry_attempts: self.retry_attempts.clone(),
+            retry_tx: self.retry_tx.clone(),
+            auxiliary_due: self.auxiliary_due.clone(),
+            filter_refresh_requested: self.filter_refresh_requested.clone(),
+            preferences: self.preferences.clone(),
+        };
+        thread::Builder::new()
+            .name("todoist-tui-sync".into())
+            .spawn(move || {
+                // Ends once the manager is dropped and closes its sender.
+                while passes.recv().is_ok() {
+                    worker.run();
+                }
+            })?;
+        #[cfg(test)]
+        self.workers_started.set(self.workers_started.get() + 1);
+        Ok(sender)
+    }
+
+    /// How many worker threads this manager has started. Passes must share one.
+    #[cfg(test)]
+    pub fn workers_started(&self) -> u32 {
+        self.workers_started.get()
     }
 
     pub fn next_event(&self) -> Option<SyncEvent> {
@@ -378,6 +290,169 @@ impl SyncManager {
             .unwrap();
         *manager.auxiliary_due.lock().unwrap() = Instant::now() + Duration::from_secs(3600);
         manager
+    }
+}
+
+struct Worker {
+    client: TodoistClient,
+    store: Store,
+    running: Arc<AtomicBool>,
+    tx: Sender<SyncEvent>,
+    retry_attempts: Arc<AtomicU32>,
+    retry_tx: Sender<RetryState>,
+    auxiliary_due: Arc<Mutex<Instant>>,
+    filter_refresh_requested: Arc<AtomicBool>,
+    preferences: Arc<Mutex<FilterPreference>>,
+}
+
+impl Worker {
+    fn run(&self) {
+        let mut running_guard = RunningGuard {
+            running: self.running.clone(),
+            finished: false,
+        };
+        let mut queued_rejection = false;
+        match self.pass(Instant::now(), &mut queued_rejection) {
+            Ok(pending) => {
+                self.retry_attempts.store(0, Ordering::Release);
+                let _ = self.store.set_meta("retry_not_before", "");
+                let _ = self.retry_tx.send(RetryState {
+                    attempts: 0,
+                    deadline: Instant::now(),
+                });
+                running_guard.finish();
+                let _ = self.tx.send(SyncEvent::Finished { pending });
+            }
+            Err(error) => {
+                // Rejections stay durable but do not delay a correction.
+                // Transport/server failures back off without sleeping in
+                // the worker, so local changes remain completely usable.
+                if queued_rejection {
+                    self.retry_attempts.store(0, Ordering::Release);
+                    let _ = self.store.set_meta("retry_not_before", "");
+                    let _ = self.retry_tx.send(RetryState {
+                        attempts: 0,
+                        deadline: Instant::now(),
+                    });
+                } else {
+                    let attempts = self
+                        .retry_attempts
+                        .load(Ordering::Acquire)
+                        .saturating_add(1);
+                    self.retry_attempts.store(attempts, Ordering::Release);
+                    let delay = retry_delay(&error).unwrap_or_else(|| {
+                        Duration::from_secs((2_u64.pow(attempts.min(8))).min(300))
+                    });
+                    let delay = delay.max(Duration::from_secs(1));
+                    let deadline = Instant::now()
+                        .checked_add(delay)
+                        .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
+                    let persisted_delay =
+                        chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::days(1));
+                    let until = chrono::Utc::now()
+                        .checked_add_signed(persisted_delay)
+                        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(1));
+                    let _ = self.store.set_meta("retry_not_before", &until.to_rfc3339());
+                    let _ = self.retry_tx.send(RetryState { attempts, deadline });
+                }
+                running_guard.finish();
+                let _ = self.tx.send(SyncEvent::Failed {
+                    kind: classify_failure(&error),
+                    message: format!("{error:#}"),
+                });
+            }
+        }
+    }
+
+    fn pass(&self, refresh_epoch: Instant, queued_rejection: &mut bool) -> anyhow::Result<usize> {
+        self.client.verify_account(&self.store)?;
+        // Refetch after every operation because Quick Add replaces temporary IDs
+        // in all later entries atomically.
+        loop {
+            let Some(entry) = self.store.claim_next_outbox()? else {
+                break;
+            };
+            if let Err(error) = self.client.push(&self.store, &entry) {
+                if permanent_rejection(&error) {
+                    self.store.fail_outbox(entry.seq, &format!("{error:#}"))?;
+                } else {
+                    return Err(error);
+                }
+            } else {
+                // Retain invalidation if a later push/pull fails;
+                // the retry may otherwise have an empty outbox.
+                self.filter_refresh_requested.store(true, Ordering::Release);
+            }
+        }
+        self.client.pull(&self.store)?;
+        let _ = self.tx.send(SyncEvent::DataRefreshed);
+        let uploads_waiting = self.store.has_uploadable_changes()?;
+        let requested =
+            !uploads_waiting && self.filter_refresh_requested.swap(false, Ordering::AcqRel);
+        if !uploads_waiting
+            && (requested
+                || Instant::now()
+                    >= *self
+                        .auxiliary_due
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()))
+        {
+            let result = (|| -> anyhow::Result<AuxiliaryRefresh> {
+                let preferred = self
+                    .preferences
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .latest();
+                let preferred = preferred
+                    .map(|id| {
+                        self.store
+                            .filter(&id)
+                            .map(|filter| filter.map(|filter| filter.id))
+                    })
+                    .transpose()?
+                    .flatten();
+                let refresh = self.client.pull_auxiliary_with_progress(
+                    &self.store,
+                    preferred.as_deref(),
+                    || self.filter_refresh_requested.load(Ordering::Acquire),
+                    |id| {
+                        let _ = self.tx.send(SyncEvent::FilterRefreshed {
+                            filter_id: id.into(),
+                        });
+                    },
+                )?;
+                self.store
+                    .set_meta("auxiliary_warning", &refresh.warnings.join("\n\n"))?;
+                Ok(refresh)
+            })();
+            if result.is_err() {
+                // Retry a rate-limited/failed explicit refresh after
+                // backoff, even if the periodic deadline is later.
+                self.filter_refresh_requested.store(true, Ordering::Release);
+            }
+            let refresh = result?;
+            // Only idle polling is minute-throttled. Successful
+            // local writes and explicit refreshes bypass this timer.
+            if refresh.filters_complete {
+                *self
+                    .auxiliary_due
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) =
+                    refresh_epoch + Duration::from_secs(60);
+            } else {
+                self.filter_refresh_requested.store(true, Ordering::Release);
+            }
+            if !refresh.warnings.is_empty() {
+                let _ = self.tx.send(SyncEvent::AuxiliaryWarning {
+                    message: refresh.warnings.join("\n\n"),
+                });
+            }
+        }
+        if let Some(message) = self.store.outbox_error()? {
+            *queued_rejection = true;
+            anyhow::bail!("{message}");
+        }
+        self.store.outbox_len()
     }
 }
 
