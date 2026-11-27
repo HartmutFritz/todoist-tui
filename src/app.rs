@@ -1,3 +1,10 @@
+//! Application state and the behavior of every key binding.
+//!
+//! Commands apply to the local cache first, update the visible state
+//! immediately and queue a synchronization operation, so every one of them
+//! works offline. `tick` drains background workers in bounded batches, which
+//! keeps input responsive while synchronization, the editor and the clipboard
+//! run. This module performs no network requests.
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -205,6 +212,11 @@ impl ProjectSearch {
     }
 }
 
+/// A picker entry matched by case-insensitive name prefix.
+pub trait PrefixSearchable {
+    fn search_name(&self) -> &str;
+}
+
 #[derive(Debug, Clone)]
 pub struct LabelPickerItem {
     pub name: String,
@@ -223,6 +235,24 @@ pub struct TaskPickerItem {
 pub struct FilterPickerItem {
     pub filter: Filter,
     search_name: String,
+}
+
+impl PrefixSearchable for LabelPickerItem {
+    fn search_name(&self) -> &str {
+        &self.search_name
+    }
+}
+
+impl PrefixSearchable for TaskPickerItem {
+    fn search_name(&self) -> &str {
+        &self.search_name
+    }
+}
+
+impl PrefixSearchable for FilterPickerItem {
+    fn search_name(&self) -> &str {
+        &self.search_name
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -739,61 +769,52 @@ impl App {
         Ok(())
     }
 
+    /// Runs a task command from the details dialog, or reports that the action
+    /// is not one the dialog handles.
     fn handle_task_details_action(&mut self, task_id: &str, action: Action) -> Result<bool> {
-        if !matches!(
-            action,
-            Action::EditTask
-                | Action::EditDue
-                | Action::RemoveDue
-                | Action::EditLabels
-                | Action::EditAssignee
-                | Action::MoveTask
-                | Action::AddChildTask
-                | Action::CompleteTask
-                | Action::DeleteTask
-                | Action::IndentTask
-                | Action::OutdentTask
-                | Action::MoveProjectDown
-                | Action::MoveProjectUp
-                | Action::Priority1
-                | Action::Priority2
-                | Action::Priority3
-                | Action::Priority4
-                | Action::CopyTitle
-                | Action::Undo
-                | Action::Redo
-        ) {
-            return Ok(false);
-        }
+        // Copying is the one supported command that keeps the dialog open.
         if action == Action::CopyTitle {
             self.copy_selected_title()?;
             return Ok(true);
         }
-        self.overlay = None;
-        self.focus = Focus::Tasks;
         if let Some(level) = action.priority() {
+            self.close_details();
             self.set_priority(task_id, level)?;
             return Ok(true);
         }
-        match action {
-            Action::EditTask => self.open_task_editor(task_id)?,
-            Action::EditDue => self.open_due_editor(task_id)?,
-            Action::RemoveDue => self.remove_due(task_id)?,
-            Action::EditLabels => self.open_task_labels(task_id)?,
-            Action::EditAssignee => self.open_assignee_picker(task_id)?,
-            Action::MoveTask => self.open_task_move_picker(task_id)?,
-            Action::AddChildTask => self.open_child_editor(task_id)?,
-            Action::CompleteTask => self.complete_task(task_id)?,
-            Action::DeleteTask => self.delete_task(task_id)?,
-            Action::IndentTask => self.change_task_depth_for(task_id, true)?,
-            Action::OutdentTask => self.change_task_depth_for(task_id, false)?,
-            Action::MoveProjectDown => self.move_task_in_view(task_id, true)?,
-            Action::MoveProjectUp => self.move_task_in_view(task_id, false)?,
-            Action::Undo => self.undo()?,
-            Action::Redo => self.redo()?,
-            _ => unreachable!("task-details action checked above"),
-        }
+        // One table, so a command can never be dispatched without being
+        // recognized or recognized without being dispatched.
+        let command: Option<fn(&mut Self, &str) -> Result<()>> = match action {
+            Action::EditTask => Some(|app, id| app.open_task_editor(id)),
+            Action::EditDue => Some(|app, id| app.open_due_editor(id)),
+            Action::RemoveDue => Some(|app, id| app.remove_due(id)),
+            Action::EditLabels => Some(|app, id| app.open_task_labels(id)),
+            Action::EditAssignee => Some(|app, id| app.open_assignee_picker(id)),
+            Action::MoveTask => Some(|app, id| app.open_task_move_picker(id)),
+            Action::AddChildTask => Some(|app, id| app.open_child_editor(id)),
+            Action::CompleteTask => Some(|app, id| app.complete_task(id)),
+            Action::DeleteTask => Some(|app, id| app.delete_task(id)),
+            Action::IndentTask => Some(|app, id| app.change_task_depth_for(id, true)),
+            Action::OutdentTask => Some(|app, id| app.change_task_depth_for(id, false)),
+            Action::MoveProjectDown => Some(|app, id| app.move_task_in_view(id, true)),
+            Action::MoveProjectUp => Some(|app, id| app.move_task_in_view(id, false)),
+            Action::Undo => Some(|app, _| app.undo()),
+            Action::Redo => Some(|app, _| app.redo()),
+            _ => None,
+        };
+        let Some(command) = command else {
+            return Ok(false);
+        };
+        self.close_details();
+        command(self, task_id)?;
         Ok(true)
+    }
+
+    /// Leaves the details dialog for the task pane, which every task command
+    /// run from the dialog does before it acts.
+    fn close_details(&mut self) {
+        self.overlay = None;
+        self.focus = Focus::Tasks;
     }
 
     fn handle_overlay(&mut self, key: KeyEvent) -> Result<()> {
@@ -889,12 +910,8 @@ impl App {
                         self.status = "Label change cancelled".into();
                     }
                 } else if self.keybindings.matches(Action::Confirm, key) {
-                    let matches = filtered_label_indices(labels, query);
-                    if let Some(label) = matches
-                        .get((*cursor).min(matches.len().saturating_sub(1)))
-                        .and_then(|index| labels.get(*index))
-                        .cloned()
-                    {
+                    let matches = prefix_matches(labels, query);
+                    if let Some(label) = highlighted(labels, &matches, *cursor).cloned() {
                         let id = task_id.clone();
                         let (updated, added) = toggled_labels(task_labels, &label.name);
                         self.overlay = None;
@@ -915,30 +932,11 @@ impl App {
                         self.status = "No label matches that prefix".into();
                     }
                 } else if *mode == PickerMode::Selecting {
-                    if self.keybindings.matches(Action::Up, key) {
-                        *cursor = cursor.saturating_sub(1);
-                    } else if self.keybindings.matches(Action::Down, key) {
-                        let count = filtered_label_indices(labels, query).len();
-                        if *cursor + 1 < count {
-                            *cursor += 1;
-                        }
-                    }
+                    move_picker_cursor(&self.keybindings, key, cursor, || {
+                        prefix_matches(labels, query).len()
+                    });
                 } else {
-                    match key.code {
-                        KeyCode::Backspace if !query.is_empty() => {
-                            query.pop();
-                            *cursor = 0;
-                        }
-                        KeyCode::Char(character)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            query.push(character);
-                            *cursor = 0;
-                        }
-                        _ => {}
-                    }
+                    edit_picker_query(key, query, cursor);
                 }
             }
             Some(Overlay::ProjectPicker {
@@ -961,11 +959,7 @@ impl App {
                     }
                 } else if self.keybindings.matches(Action::Confirm, key) {
                     let matches = search.matches(projects, query);
-                    if let Some(project) = matches
-                        .get((*cursor).min(matches.len().saturating_sub(1)))
-                        .and_then(|index| projects.get(*index))
-                        .cloned()
-                    {
+                    if let Some(project) = highlighted(projects, matches, *cursor).cloned() {
                         let purpose = purpose.clone();
                         self.overlay = None;
                         match purpose {
@@ -987,30 +981,11 @@ impl App {
                         .into();
                     }
                 } else if *mode == PickerMode::Selecting {
-                    if self.keybindings.matches(Action::Up, key) {
-                        *cursor = cursor.saturating_sub(1);
-                    } else if self.keybindings.matches(Action::Down, key) {
-                        let count = search.matches(projects, query).len();
-                        if *cursor + 1 < count {
-                            *cursor += 1;
-                        }
-                    }
+                    move_picker_cursor(&self.keybindings, key, cursor, || {
+                        search.matches(projects, query).len()
+                    });
                 } else {
-                    match key.code {
-                        KeyCode::Backspace if !query.is_empty() => {
-                            query.pop();
-                            *cursor = 0;
-                        }
-                        KeyCode::Char(character)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            query.push(character);
-                            *cursor = 0;
-                        }
-                        _ => {}
-                    }
+                    edit_picker_query(key, query, cursor);
                 }
             }
             Some(Overlay::TaskPicker {
@@ -1025,41 +1000,20 @@ impl App {
                         self.status = "Task search cancelled".into();
                     }
                 } else if self.keybindings.matches(Action::Confirm, key) {
-                    let matches = filtered_task_indices(tasks, query);
-                    if let Some(task) = matches
-                        .get((*cursor).min(matches.len().saturating_sub(1)))
-                        .and_then(|index| tasks.get(*index))
-                        .map(|item| item.task.clone())
+                    let matches = prefix_matches(tasks, query);
+                    if let Some(task) =
+                        highlighted(tasks, &matches, *cursor).map(|item| item.task.clone())
                     {
                         self.overlay = Some(Overlay::Details { task, scroll: 0 });
                     } else {
                         self.status = "No task matches that prefix".into();
                     }
                 } else if *mode == PickerMode::Selecting {
-                    if self.keybindings.matches(Action::Up, key) {
-                        *cursor = cursor.saturating_sub(1);
-                    } else if self.keybindings.matches(Action::Down, key) {
-                        let count = filtered_task_indices(tasks, query).len();
-                        if *cursor + 1 < count {
-                            *cursor += 1;
-                        }
-                    }
+                    move_picker_cursor(&self.keybindings, key, cursor, || {
+                        prefix_matches(tasks, query).len()
+                    });
                 } else {
-                    match key.code {
-                        KeyCode::Backspace if !query.is_empty() => {
-                            query.pop();
-                            *cursor = 0;
-                        }
-                        KeyCode::Char(character)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            query.push(character);
-                            *cursor = 0;
-                        }
-                        _ => {}
-                    }
+                    edit_picker_query(key, query, cursor);
                 }
             }
             Some(Overlay::FilterPicker {
@@ -1074,41 +1028,20 @@ impl App {
                         self.status = "Filter search cancelled".into();
                     }
                 } else if self.keybindings.matches(Action::Confirm, key) {
-                    let matches = filtered_filter_indices(filters, query);
-                    if let Some(filter) = matches
-                        .get((*cursor).min(matches.len().saturating_sub(1)))
-                        .and_then(|index| filters.get(*index))
-                        .map(|item| item.filter.clone())
+                    let matches = prefix_matches(filters, query);
+                    if let Some(filter) =
+                        highlighted(filters, &matches, *cursor).map(|item| item.filter.clone())
                     {
                         self.overlay = Some(Overlay::FilterDetails { filter, scroll: 0 });
                     } else {
                         self.status = "No filter matches that prefix".into();
                     }
                 } else if *mode == PickerMode::Selecting {
-                    if self.keybindings.matches(Action::Up, key) {
-                        *cursor = cursor.saturating_sub(1);
-                    } else if self.keybindings.matches(Action::Down, key) {
-                        let count = filtered_filter_indices(filters, query).len();
-                        if *cursor + 1 < count {
-                            *cursor += 1;
-                        }
-                    }
+                    move_picker_cursor(&self.keybindings, key, cursor, || {
+                        prefix_matches(filters, query).len()
+                    });
                 } else {
-                    match key.code {
-                        KeyCode::Backspace if !query.is_empty() => {
-                            query.pop();
-                            *cursor = 0;
-                        }
-                        KeyCode::Char(character)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            query.push(character);
-                            *cursor = 0;
-                        }
-                        _ => {}
-                    }
+                    edit_picker_query(key, query, cursor);
                 }
             }
             _ => {}
@@ -2624,9 +2557,7 @@ impl App {
                 let id = self.store.add_project(&name)?;
                 self.editor_mutation_committed = true;
                 self.refresh_nav()?;
-                if let Some(index) = self.nav_rows.iter().position(
-                    |row| matches!(row, NavRow::Item { id: NavId::Project(row_id), .. } if row_id == &id),
-                ) {
+                if let Some(index) = self.nav_rows.iter().position(|row| matches!(row, NavRow::Item { id: NavId::Project(row_id), .. } if row_id == &id)) {
                     self.select_nav(index);
                     self.force_tasks()?;
                 }
@@ -2646,9 +2577,7 @@ impl App {
                 let id = self.store.rename_project(&project_id, &name)?;
                 self.editor_mutation_committed = true;
                 self.refresh_nav()?;
-                if let Some(index) = self.nav_rows.iter().position(
-                    |row| matches!(row, NavRow::Item { id: NavId::Project(row_id), .. } if row_id == &id),
-                ) {
+                if let Some(index) = self.nav_rows.iter().position(|row| matches!(row, NavRow::Item { id: NavId::Project(row_id), .. } if row_id == &id)) {
                     self.select_nav(index);
                 }
                 self.focus = Focus::Navigation;
@@ -3683,30 +3612,55 @@ fn filtered_project_indices(projects: &[ProjectPickerItem], query: &str) -> Vec<
     ProjectSearch::default().matches(projects, query).to_vec()
 }
 
-pub fn filtered_label_indices(labels: &[LabelPickerItem], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    labels
-        .iter()
-        .enumerate()
-        .filter_map(|(index, label)| label.search_name.starts_with(&query).then_some(index))
-        .collect()
+/// The entry a picker highlights, clamped the way its renderer clamps it.
+fn highlighted<'a, T>(items: &'a [T], matches: &[usize], cursor: usize) -> Option<&'a T> {
+    matches
+        .get(cursor.min(matches.len().saturating_sub(1)))
+        .and_then(|index| items.get(*index))
 }
 
-pub fn filtered_task_indices(tasks: &[TaskPickerItem], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    tasks
-        .iter()
-        .enumerate()
-        .filter_map(|(index, task)| task.search_name.starts_with(&query).then_some(index))
-        .collect()
+/// Moves a picker's highlight while its selection mode is active.
+fn move_picker_cursor(
+    keybindings: &KeyBindings,
+    key: KeyEvent,
+    cursor: &mut usize,
+    match_count: impl FnOnce() -> usize,
+) {
+    if keybindings.matches(Action::Up, key) {
+        *cursor = cursor.saturating_sub(1);
+    } else if keybindings.matches(Action::Down, key) && *cursor + 1 < match_count() {
+        *cursor += 1;
+    }
 }
 
-pub fn filtered_filter_indices(filters: &[FilterPickerItem], query: &str) -> Vec<usize> {
+/// Applies one typed character or backspace to a picker's query, which restarts
+/// matching from the first result.
+fn edit_picker_query(key: KeyEvent, query: &mut String, cursor: &mut usize) {
+    match key.code {
+        KeyCode::Backspace if !query.is_empty() => {
+            query.pop();
+            *cursor = 0;
+        }
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            query.push(character);
+            *cursor = 0;
+        }
+        _ => {}
+    }
+}
+
+/// Indices of the entries whose lowercased name starts with `query`, in their
+/// original order.
+pub fn prefix_matches<T: PrefixSearchable>(items: &[T], query: &str) -> Vec<usize> {
     let query = query.trim().to_lowercase();
-    filters
+    items
         .iter()
         .enumerate()
-        .filter_map(|(index, filter)| filter.search_name.starts_with(&query).then_some(index))
+        .filter_map(|(index, item)| item.search_name().starts_with(&query).then_some(index))
         .collect()
 }
 
@@ -4050,18 +4004,25 @@ mod tests {
                 full_name: "Example Person".into(),
             }])
             .unwrap();
-        app.store.merge_remote(
-            &serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
-                {"id":"work","name":"Work","shared":true,"can_assign_tasks":true},
-                {"id":"other","name":"Other"}
-            ])).unwrap(),
-            &serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
-                {"id":"root","project_id":"work","content":"Alpha","description":"Keep this description","priority":4,"responsible_uid":"person","labels":["Work"],"child_order":0},
-                {"id":"child","project_id":"work","parent_id":"root","content":"Same","child_order":0},
-                {"id":"peer","project_id":"work","content":"Same","child_order":1},
-                {"id":"done","project_id":"work","content":"Done","checked":true,"child_order":2},
-                {"id":"other-task","project_id":"other","content":"Other task"}
-            ])).unwrap(), &[], &[]).unwrap();
+        app.store
+            .merge_remote(
+                &serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+                    {"id":"work","name":"Work","shared":true,"can_assign_tasks":true},
+                    {"id":"other","name":"Other"}
+                ]))
+                .unwrap(),
+                &serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+                    {"id":"root","project_id":"work","content":"Alpha","description":"Keep this description","priority":4,"responsible_uid":"person","labels":["Work"],"child_order":0},
+                    {"id":"child","project_id":"work","parent_id":"root","content":"Same","child_order":0},
+                    {"id":"peer","project_id":"work","content":"Same","child_order":1},
+                    {"id":"done","project_id":"work","content":"Done","checked":true,"child_order":2},
+                    {"id":"other-task","project_id":"other","content":"Other task"}
+                ]))
+                .unwrap(),
+                &[],
+                &[],
+            )
+            .unwrap();
         app.store
             .set_completed_task_visibility(&NavId::Project("work".into()), true)
             .unwrap();
@@ -4279,7 +4240,8 @@ mod tests {
         drop(app.overlay.take());
         let parsed: crate::model::RemoteTask = serde_json::from_value(serde_json::json!({
             "id":"mapped-root","project_id":"work","content":"Server-confirmed title","description":"New description"
-        })).unwrap();
+        }))
+        .unwrap();
         app.store.replace_task_id("root", &parsed).unwrap();
         app.force_tasks().unwrap();
         assert!(app.marked_tasks.contains("mapped-root"));
@@ -4655,7 +4617,8 @@ mod tests {
             let background = app.store.task("bg-b").unwrap().unwrap();
             let mapped: crate::model::RemoteTask = serde_json::from_value(serde_json::json!({
                 "id":"mapped","project_id":"team","content":"Assign this","due":{"string":"today","date":"2026-11-23","is_recurring":false}
-            })).unwrap();
+            }))
+            .unwrap();
             app.store.replace_task_id("root", &mapped).unwrap();
             if key == 'd' {
                 // The snapshot in details is now stale: d must reopen the
@@ -5285,7 +5248,7 @@ mod tests {
         );
         assert!(app.show_completed_tasks);
         assert_eq!(app.selected_task().unwrap().id, "b-done");
-        assert!(app.nav_rows.iter().any(|row|matches!(row,NavRow::Item{id:NavId::Filter(id),count:4,..} if id=="canonical-filter")));
+        assert!(app.nav_rows.iter().any(|row| matches!(row,NavRow::Item{id:NavId::Filter(id),count:4,..} if id=="canonical-filter")));
         app.store.replace_filter_membership("f2", &[]).unwrap();
         app.handle_sync_event(SyncEvent::FilterRefreshed {
             filter_id: "f2".into(),
@@ -5344,7 +5307,10 @@ mod tests {
     fn core_refresh_updates_today_before_sync_finishes_without_closing_a_dialog() {
         let (_dir, mut app) = draft_test_app();
         let today = Local::now().date_naive();
-        let mut task=serde_json::from_value::<crate::model::RemoteTask>(serde_json::json!({"id":"task","project_id":"inbox","content":"Newly due today","due":{"date":today.succ_opt().unwrap().format("%F").to_string(),"is_recurring":false}})).unwrap();
+        let mut task = serde_json::from_value::<crate::model::RemoteTask>(
+            serde_json::json!({"id":"task","project_id":"inbox","content":"Newly due today","due":{"date":today.succ_opt().unwrap().format("%F").to_string(),"is_recurring":false}}),
+        )
+        .unwrap();
         app.store
             .merge_remote(&[], std::slice::from_ref(&task), &[], &[])
             .unwrap();
@@ -5555,11 +5521,12 @@ mod tests {
                 } else {
                     today
                 };
-                let tasks=serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+                let tasks = serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
                         {"id":"gamma","project_id":"inbox","content":"Gamma","child_order":0,"labels":["B"],"due":{"date":gamma_date.format("%F").to_string(),"is_recurring":false}},
                         {"id":"alpha","project_id":"inbox","content":"Alpha","child_order":1,"labels":["A"],"due":{"date":today.format("%F").to_string(),"is_recurring":false}},
                         {"id":"beta","project_id":"inbox","content":"Beta","child_order":2,"labels":["B"],"due":{"date":today.format("%F").to_string(),"is_recurring":false}}
-                ])).unwrap();
+                ]))
+                .unwrap();
                 let projects = serde_json::from_value::<Vec<crate::model::RemoteProject>>(
                     serde_json::json!([{"id":"other","name":"Other"}]),
                 )
@@ -5633,7 +5600,12 @@ mod tests {
     fn completing_the_last_visible_task_selects_its_predecessor_or_the_only_task() {
         for count in [1, 3] {
             let (_dir, mut app) = draft_test_app();
-            let tasks=(0..count).map(|index|serde_json::from_value::<crate::model::RemoteTask>(serde_json::json!({"id":format!("task-{index}"),"project_id":"inbox","content":format!("Task {index}"),"child_order":index})).unwrap()).collect::<Vec<_>>();
+            let tasks = (0..count)
+                .map(|index| {
+                    serde_json::from_value::<crate::model::RemoteTask>(serde_json::json!({"id":format!("task-{index}"),"project_id":"inbox","content":format!("Task {index}"),"child_order":index}))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
             app.store.merge_remote(&[], &tasks, &[], &[]).unwrap();
             app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
                 .unwrap();
@@ -5653,12 +5625,13 @@ mod tests {
     fn parent_and_recurring_completion_select_the_original_child_row_when_history_is_shown() {
         for recurring in [false, true] {
             let (_dir, mut app) = draft_test_app();
-            let due=recurring.then(||serde_json::json!({"date":Local::now().date_naive().format("%F").to_string(),"string":"every day","is_recurring":true}));
-            let tasks=serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+            let due = recurring.then(|| serde_json::json!({"date":Local::now().date_naive().format("%F").to_string(),"string":"every day","is_recurring":true}));
+            let tasks = serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
                 {"id":"parent","project_id":"inbox","content":"Parent","child_order":0,"due":due},
                 {"id":"child","project_id":"inbox","parent_id":"parent","content":"Child","child_order":0},
                 {"id":"next","project_id":"inbox","content":"Next","child_order":1}
-            ])).unwrap();
+            ]))
+            .unwrap();
             app.store.merge_remote(&[], &tasks, &[], &[]).unwrap();
             app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
                 .unwrap();
@@ -6219,7 +6192,13 @@ mod tests {
                 .any(|entry| matches!(entry.operation, Operation::UpdatePriority { priority: 1 }))
         );
         app.redo().unwrap();
-        assert!(store.outbox().unwrap().iter().any(|entry| matches!(&entry.operation, Operation::QuickEdit { expression, .. } if expression == "Changed p1")));
+        assert!(
+            store
+                .outbox()
+                .unwrap()
+                .iter()
+                .any(|entry| matches!(&entry.operation, Operation::QuickEdit { expression, .. } if expression == "Changed p1"))
+        );
     }
 
     #[test]
@@ -6236,7 +6215,10 @@ mod tests {
             let store = Store::open(dir.path().join("cache.db")).unwrap();
             let today = Local::now().date_naive();
             let expected = Some(today + chrono::Duration::days(interval));
-            let remote = serde_json::from_value(serde_json::json!({"id":"task","project_id":"inbox","content":"Recurring","due":{"date":today.format("%F").to_string(),"string":expression,"is_recurring":true}})).unwrap();
+            let remote = serde_json::from_value(
+                serde_json::json!({"id":"task","project_id":"inbox","content":"Recurring","due":{"date":today.format("%F").to_string(),"string":expression,"is_recurring":true}}),
+            )
+            .unwrap();
             store.merge_remote(&[], &[remote], &[], &[]).unwrap();
             let sync = SyncManager::new(store.clone(), None).unwrap();
             let mut app = App::new(
@@ -6285,7 +6267,11 @@ mod tests {
                 queued.last().unwrap().operation,
                 Operation::CompleteTask
             ));
-            assert!(!queued.iter().any(|entry| matches!(&entry.operation, Operation::RestoreDue { due: Some(due) } if due.concrete_date() == expected)));
+            assert!(
+                !queued
+                    .iter()
+                    .any(|entry| matches!(&entry.operation, Operation::RestoreDue { due: Some(due) } if due.concrete_date() == expected))
+            );
         }
     }
 
@@ -6508,14 +6494,21 @@ mod tests {
 
     fn assignee_test_app() -> (tempfile::TempDir, App) {
         let (dir, mut app) = draft_test_app();
-        app.store.merge_remote(
-            &serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
-                {"id":"team","name":"Team Work","workspace_id":"workspace","can_assign_tasks":true}
-            ])).unwrap(),
-            &serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
-                {"id":"root","project_id":"team","content":"Assign this"},
-                {"id":"child","project_id":"team","parent_id":"root","content":"Keep this"}
-            ])).unwrap(), &[], &[]).unwrap();
+        app.store
+            .merge_remote(
+                &serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+                    {"id":"team","name":"Team Work","workspace_id":"workspace","can_assign_tasks":true}
+                ]))
+                .unwrap(),
+                &serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+                    {"id":"root","project_id":"team","content":"Assign this"},
+                    {"id":"child","project_id":"team","parent_id":"root","content":"Keep this"}
+                ]))
+                .unwrap(),
+                &[],
+                &[],
+            )
+            .unwrap();
         app.store
             .merge_collaborators(
                 &serde_json::from_value::<Vec<crate::model::RemoteCollaborator>>(
@@ -7001,7 +6994,13 @@ mod tests {
             for id in ["root", "child", "grandchild"] {
                 assert_eq!(reopened.task(id).unwrap().unwrap().project_id, destination);
             }
-            assert!(reopened.outbox().unwrap().iter().any(|entry|matches!(&entry.operation,crate::model::Operation::MoveTask{project_id} if project_id==destination)));
+            assert!(
+                reopened
+                    .outbox()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| matches!(&entry.operation,crate::model::Operation::MoveTask{project_id} if project_id==destination))
+            );
         }
     }
 
@@ -7035,9 +7034,10 @@ mod tests {
     #[test]
     fn moving_a_child_from_personal_to_team_detaches_only_that_subtree() {
         let (_dir, mut app) = draft_test_app();
-        let projects:Vec<crate::model::RemoteProject>=serde_json::from_value(serde_json::json!([
+        let projects: Vec<crate::model::RemoteProject> = serde_json::from_value(serde_json::json!([
             {"id":"personal","name":"Personal"},{"id":"team","name":"Team","workspace_id":"workspace"}
-        ])).unwrap();
+        ]))
+        .unwrap();
         let tasks: Vec<crate::model::RemoteTask> = serde_json::from_value(serde_json::json!([
             {"id":"root","project_id":"personal","content":"Root"},
             {"id":"child","project_id":"personal","parent_id":"root","content":"Child"},
@@ -7112,12 +7112,14 @@ mod tests {
     #[test]
     fn v_recovers_an_old_rejected_workspace_move_and_successful_sync_clears_its_message() {
         let (_dir, mut app) = draft_test_app();
-        let projects=serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
+        let projects = serde_json::from_value::<Vec<crate::model::RemoteProject>>(serde_json::json!([
             {"id":"team","name":"Team","workspace_id":"workspace"},{"id":"personal","name":"Personal"}
-        ])).unwrap();
-        let tasks=serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
+        ]))
+        .unwrap();
+        let tasks = serde_json::from_value::<Vec<crate::model::RemoteTask>>(serde_json::json!([
             {"id":"root","project_id":"team","content":"Root"},{"id":"child","project_id":"team","parent_id":"root","content":"Child"}
-        ])).unwrap();
+        ]))
+        .unwrap();
         app.store.merge_remote(&projects, &tasks, &[], &[]).unwrap();
         app.store.move_task("root", "personal").unwrap();
         let failed = app.store.claim_next_outbox().unwrap().unwrap();
@@ -7176,8 +7178,8 @@ mod tests {
                 search_name: name.to_lowercase(),
             })
             .collect::<Vec<_>>();
-        assert_eq!(filtered_filter_indices(&filters, "wa"), [1]);
-        assert_eq!(filtered_filter_indices(&filters, "WORK"), [2]);
+        assert_eq!(prefix_matches(&filters, "wa"), [1]);
+        assert_eq!(prefix_matches(&filters, "WORK"), [2]);
 
         assert_eq!(
             parse_filter_editor("My filter\n(today | overdue) & #Work\nFAVORITE = False\n"),
@@ -7480,11 +7482,14 @@ mod tests {
         }
         let tasks: Vec<crate::model::RemoteTask> =
             serde_json::from_value(serde_json::Value::Array(tasks)).unwrap();
-        store.merge_remote(
-            &[serde_json::from_value(serde_json::json!({"id":"work", "name":"Work"})).unwrap()],
-            &tasks, &[],
-            &[serde_json::from_value(serde_json::json!({"id":"favorite", "name":"Focus", "query":"#Work", "is_favorite":true})).unwrap()],
-        ).unwrap();
+        store
+            .merge_remote(
+                &[serde_json::from_value(serde_json::json!({"id":"work", "name":"Work"})).unwrap()],
+                &tasks,
+                &[],
+                &[serde_json::from_value(serde_json::json!({"id":"favorite", "name":"Focus", "query":"#Work", "is_favorite":true})).unwrap()],
+            )
+            .unwrap();
         store
             .replace_filter_membership("favorite", &tasks[..2])
             .unwrap();
@@ -7816,7 +7821,7 @@ mod tests {
                 search_name: "home".into(),
             },
         ];
-        assert_eq!(filtered_label_indices(&labels, "ho"), [1]);
+        assert_eq!(prefix_matches(&labels, "ho"), [1]);
 
         let (removed, added) = toggled_labels(&["home".into(), "Work".into()], "Home");
         assert!(!added);

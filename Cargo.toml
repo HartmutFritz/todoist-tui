@@ -42,4 +42,6 @@ libc = "0.2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = true
+# Keep the symbol table: a hard deadlock gives one chance to inspect the live
+# process, and without symbols a backtrace is bare addresses.
+strip = false

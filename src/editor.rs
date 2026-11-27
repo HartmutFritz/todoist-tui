@@ -1,3 +1,9 @@
+//! The embedded Neovim modal.
+//!
+//! A real Neovim process runs in a pseudo-terminal and is rendered inside the
+//! TUI, so the user's own configuration, plugins and mappings apply. Every key
+//! belongs to Neovim while it is open; a successful write accepts the text and
+//! closes it, and anything else cancels and keeps the draft.
 use std::{
     fs,
     io::{Read, Write},

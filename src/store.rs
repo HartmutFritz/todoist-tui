@@ -1,3 +1,10 @@
+//! The SQLite cache, the durable outbox and the local-change bookkeeping.
+//!
+//! Every read the interface performs and every change it makes goes through
+//! here: a mutation writes the new local state and its queued synchronization
+//! operation in one transaction, so a failure can never leave one without the
+//! other. Remote refreshes must not overwrite entities with pending local
+//! changes, which the `preserve_pending_*` helpers enforce.
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -25,6 +32,15 @@ mod diagnostics;
 mod order_storage;
 use crate::ordering::{OrderScope, Placement};
 pub use diagnostics::{OUTBOX_PAGE_SIZE, OutboxPage};
+
+// Positional column list every task query selects, in the order `row_to_task`
+// reads it. `TASK_COLUMNS_T` is the same list for queries that alias `tasks` as
+// `t` to join another table.
+const TASK_COLUMNS: &str = "id,project_id,content,description,labels_json,due_json,priority,\
+                            child_order,checked,parent_id,assignee_name,section_id,responsible_uid";
+const TASK_COLUMNS_T: &str = "t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,\
+                              t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,\
+                              t.section_id,t.responsible_uid";
 
 // Shared by claiming and auxiliary yield checks. Rejected operations and their
 // blocked dependants must not prevent unrelated cached views from refreshing.
@@ -446,9 +462,7 @@ impl Store {
         let filters = favorite_filters_from(&conn)?;
         let mut project_counts = HashMap::<String, usize>::new();
         {
-            let mut stmt = conn.prepare(
-                "SELECT project_id,COUNT(*) FROM tasks WHERE checked=0 AND deleted=0 GROUP BY project_id"
-            )?;
+            let mut stmt = conn.prepare("SELECT project_id,COUNT(*) FROM tasks WHERE checked=0 AND deleted=0 GROUP BY project_id")?;
             let rows = stmt.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
             })?;
@@ -621,14 +635,19 @@ impl Store {
     pub fn tasks_for_view(&self, nav: &NavId, show_completed: bool) -> Result<Vec<Task>> {
         let conn = self.connect()?;
         if matches!(nav, NavId::Today | NavId::Upcoming) {
+            // Both views read every cached task and keep the ones whose due
+            // date falls in their window.
             let sql = if show_completed {
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
-                 FROM tasks WHERE deleted=0 ORDER BY checked,child_order,id"
+                format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks WHERE deleted=0 ORDER BY checked,child_order,id"
+                )
             } else {
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
-                 FROM tasks WHERE checked=0 AND deleted=0 ORDER BY child_order,id"
+                format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks
+                     WHERE checked=0 AND deleted=0 ORDER BY child_order,id"
+                )
             };
-            let mut stmt = conn.prepare(sql)?;
+            let mut stmt = conn.prepare(&sql)?;
             let mut tasks = stmt
                 .query_map([], row_to_task)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -661,22 +680,37 @@ impl Store {
         }
         let (sql, id) = match (nav, show_completed) {
             (NavId::Project(id), true) => (
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
-                 FROM tasks WHERE project_id=?1 AND deleted=0 ORDER BY checked,child_order,id", id),
-            (NavId::Filter(id), true) => (
-                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id,t.responsible_uid
-                 FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
-                 WHERE ft.filter_id=?1 AND t.deleted=0 ORDER BY t.checked,t.child_order,t.id", id),
+                format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks
+                     WHERE project_id=?1 AND deleted=0 ORDER BY checked,child_order,id"
+                ),
+                id,
+            ),
             (NavId::Project(id), false) => (
-                "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
-                 FROM tasks WHERE project_id=?1 AND checked=0 AND deleted=0 ORDER BY child_order,id", id),
+                format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks
+                     WHERE project_id=?1 AND checked=0 AND deleted=0 ORDER BY child_order,id"
+                ),
+                id,
+            ),
+            (NavId::Filter(id), true) => (
+                format!(
+                    "SELECT {TASK_COLUMNS_T} FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
+                     WHERE ft.filter_id=?1 AND t.deleted=0 ORDER BY t.checked,t.child_order,t.id"
+                ),
+                id,
+            ),
             (NavId::Filter(id), false) => (
-                "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id,t.responsible_uid
-                 FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
-                 WHERE ft.filter_id=?1 AND t.checked=0 AND t.deleted=0 ORDER BY t.child_order,t.id", id),
+                format!(
+                    "SELECT {TASK_COLUMNS_T} FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id
+                     WHERE ft.filter_id=?1 AND t.checked=0 AND t.deleted=0
+                     ORDER BY t.child_order,t.id"
+                ),
+                id,
+            ),
             (NavId::Today | NavId::Upcoming, _) => unreachable!(),
         };
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([id], row_to_task)?;
         let mut tasks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         order_storage::sort_tasks(&conn, &mut tasks)?;
@@ -685,14 +719,16 @@ impl Store {
 
     pub fn tasks_for_search(&self) -> Result<Vec<(Task, String)>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT t.id,t.project_id,t.content,t.description,t.labels_json,t.due_json,
-                    t.priority,t.child_order,t.checked,t.parent_id,t.assignee_name,t.section_id,COALESCE(p.name,'Unknown project'),t.responsible_uid
+        // The project name follows the task columns, so `row_to_task` keeps
+        // reading the same positions.
+        let sql = format!(
+            "SELECT {TASK_COLUMNS_T},COALESCE(p.name,'Unknown project')
              FROM tasks t LEFT JOIN projects p ON p.id=t.project_id AND p.deleted=0
              WHERE t.deleted=0
-             ORDER BY t.checked,lower(t.content),t.child_order,t.id",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row_to_task(row)?, row.get(12)?)))?;
+             ORDER BY t.checked,lower(t.content),t.child_order,t.id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| Ok((row_to_task(row)?, row.get(13)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1024,7 +1060,10 @@ impl Store {
             "UPDATE tasks SET parent_id=?2,child_order=?3,section_id=?4 WHERE id=?1",
             params![id, parent_id, next_order, section_id],
         )?;
-        tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id) UPDATE tasks SET section_id=?2 WHERE id IN (SELECT id FROM tree)",params![id,section_id])?;
+        tx.execute(
+            "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id) UPDATE tasks SET section_id=?2 WHERE id IN (SELECT id FROM tree)",
+            params![id, section_id],
+        )?;
         order_storage::local_position(&tx, None, &order_storage::task_scope(&task), 0)?;
         order_storage::local_position(
             &tx,
@@ -1063,7 +1102,10 @@ impl Store {
             }],
             false,
         )?;
-        tx.execute("UPDATE outbox SET error=NULL WHERE entity_id=?1 AND json_extract(payload,'$.kind')='quick_add' AND json_extract(checkpoint,'$.parsed.id') IS NOT NULL", [&id])?;
+        tx.execute(
+            "UPDATE outbox SET error=NULL WHERE entity_id=?1 AND json_extract(payload,'$.kind')='quick_add' AND json_extract(checkpoint,'$.parsed.id') IS NOT NULL",
+            [&id],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1078,9 +1120,13 @@ impl Store {
         )?;
         anyhow::ensure!(changed == 1, "selected task no longer exists");
         supersede_rejected_task_updates(&tx, &id, false)?;
-        let failed_add: Option<(i64, String, String)> = tx.query_row(
-            "SELECT seq,payload,checkpoint FROM outbox WHERE entity_id=?1 AND error IS NOT NULL ORDER BY seq LIMIT 1",
-            [&id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
+        let failed_add: Option<(i64, String, String)> = tx
+            .query_row(
+                "SELECT seq,payload,checkpoint FROM outbox WHERE entity_id=?1 AND error IS NOT NULL ORDER BY seq LIMIT 1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
         if let Some((seq, payload, checkpoint)) = failed_add
             && let Operation::QuickAdd {
                 project_id,
@@ -1102,7 +1148,10 @@ impl Store {
                     target_order,
                     placement,
                 };
-                tx.execute("UPDATE outbox SET payload=?2,uuid=?3,claimed=0,error=NULL,checkpoint='null' WHERE seq=?1", params![seq, serde_json::to_string(&operation)?, Uuid::new_v4().to_string()])?;
+                tx.execute(
+                    "UPDATE outbox SET payload=?2,uuid=?3,claimed=0,error=NULL,checkpoint='null' WHERE seq=?1",
+                    params![seq, serde_json::to_string(&operation)?, Uuid::new_v4().to_string()],
+                )?;
                 tx.commit()?;
                 return Ok(());
             }
@@ -1246,9 +1295,7 @@ impl Store {
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let id = resolve_task_id_from(&tx, id)?.unwrap_or_else(|| id.to_owned());
         let task = task_from(&tx, &id)?.context("selected task no longer exists")?;
-        let rejected: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind')='update_priority')",
-            [&id], |row| row.get(0))?;
+        let rejected = has_rejected_operation(&tx, &id, &["update_priority"])?;
         // A queued expression Todoist has not parsed yet can still change the
         // priority remotely, so an explicit choice must be recorded even when
         // the cached value already matches it.
@@ -1294,14 +1341,16 @@ impl Store {
             "Assignees are available only in team or shared projects"
         );
         let assignee = if let Some(uid) = responsible_uid {
-            Some(collaborators_for_project(&tx, &task.project_id)?.into_iter()
-                .find(|person| person.id == uid).context("Collaborator is no longer available in this project; synchronize and retry")?)
+            Some(
+                collaborators_for_project(&tx, &task.project_id)?
+                    .into_iter()
+                    .find(|person| person.id == uid)
+                    .context("Collaborator is no longer available in this project; synchronize and retry")?,
+            )
         } else {
             None
         };
-        let rejected: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind')='update_assignee')",
-            [&id], |row| row.get(0))?;
+        let rejected = has_rejected_operation(&tx, &id, &["update_assignee"])?;
         if task.responsible_uid.as_deref() == responsible_uid
             && !rejected
             && !has_pending_assignee_edit(&tx, &id)?
@@ -1333,16 +1382,28 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let id = resolve_task_id_from(&tx, id)?.unwrap_or_else(|| id.to_owned());
         let task = task_from(&tx, &id)?.context("selected task no longer exists")?;
-        if completed && task.due.as_ref().is_some_and(|due| due.is_recurring) {
-            let due = task.due.as_ref().unwrap().next_occurrence();
+        if completed && let Some(recurring) = task.due.as_ref().filter(|due| due.is_recurring) {
+            let due = recurring.next_occurrence();
             tx.execute(
                 "UPDATE tasks SET checked=0,due_json=?2 WHERE id=?1",
                 params![id, serde_json::to_string(&due)?],
             )?;
         } else if completed {
-            let closing=tx.prepare("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
-                SELECT t.id,t.project_id,t.parent_id,t.section_id FROM tasks t JOIN tree ON t.id=tree.id WHERE t.checked=0 AND t.deleted=0 ORDER BY t.child_order,t.id")?
-                .query_map([&id],|row|Ok((row.get::<_,String>(0)?,OrderScope::Tasks{project_id:row.get(1)?,parent_id:row.get(2)?,section_id:row.get(3)?})))?
+            let closing = tx
+                .prepare(
+                    "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
+                SELECT t.id,t.project_id,t.parent_id,t.section_id FROM tasks t JOIN tree ON t.id=tree.id WHERE t.checked=0 AND t.deleted=0 ORDER BY t.child_order,t.id",
+                )?
+                .query_map([&id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        OrderScope::Tasks {
+                            project_id: row.get(1)?,
+                            parent_id: row.get(2)?,
+                            section_id: row.get(3)?,
+                        },
+                    ))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut next = HashMap::new();
             for (id, scope) in closing {
@@ -1357,7 +1418,11 @@ impl Store {
                     else {
                         unreachable!()
                     };
-                    tx.query_row("SELECT COALESCE(MAX(child_order),-1)+1 FROM tasks WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=1 AND deleted=0",params![project_id,parent_id,section_id],|row|row.get::<_,i64>(0))?
+                    tx.query_row(
+                        "SELECT COALESCE(MAX(child_order),-1)+1 FROM tasks WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=1 AND deleted=0",
+                        params![project_id, parent_id, section_id],
+                        |row| row.get::<_, i64>(0),
+                    )?
                 };
                 tx.execute(
                     "UPDATE tasks SET child_order=?2 WHERE id=?1",
@@ -1365,8 +1430,11 @@ impl Store {
                 )?;
                 next.insert(scope, rank + 1);
             }
-            tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
-                UPDATE tasks SET checked=1 WHERE id IN (SELECT id FROM tree)", [&id])?;
+            tx.execute(
+                "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
+                UPDATE tasks SET checked=1 WHERE id IN (SELECT id FROM tree)",
+                [&id],
+            )?;
             order_storage::local_position(&tx, None, &order_storage::task_scope(&task), 0)?;
         } else {
             let mut next = Some(id.clone());
@@ -1380,7 +1448,11 @@ impl Store {
                     break;
                 };
                 if ancestor.checked {
-                    let rank:i64=tx.query_row("SELECT COALESCE(MAX(child_order),-1)+1 FROM tasks WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=0 AND deleted=0",params![ancestor.project_id,ancestor.parent_id,ancestor.section_id],|row|row.get(0))?;
+                    let rank: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(child_order),-1)+1 FROM tasks WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=0 AND deleted=0",
+                        params![ancestor.project_id, ancestor.parent_id, ancestor.section_id],
+                        |row| row.get(0),
+                    )?;
                     tx.execute(
                         "UPDATE tasks SET child_order=?2 WHERE id=?1",
                         params![ancestor.id, rank],
@@ -1389,8 +1461,11 @@ impl Store {
                 scopes.push(order_storage::task_scope(&ancestor));
                 next = ancestor.parent_id;
             }
-            tx.execute("WITH RECURSIVE ancestors(id) AS (SELECT ?1 UNION SELECT t.parent_id FROM tasks t JOIN ancestors a ON t.id=a.id WHERE t.parent_id IS NOT NULL)
-                UPDATE tasks SET checked=0 WHERE id IN (SELECT id FROM ancestors)", [&id])?;
+            tx.execute(
+                "WITH RECURSIVE ancestors(id) AS (SELECT ?1 UNION SELECT t.parent_id FROM tasks t JOIN ancestors a ON t.id=a.id WHERE t.parent_id IS NOT NULL)
+                UPDATE tasks SET checked=0 WHERE id IN (SELECT id FROM ancestors)",
+                [&id],
+            )?;
             for scope in scopes {
                 order_storage::local_position(&tx, None, &scope, 0)?;
             }
@@ -1416,8 +1491,11 @@ impl Store {
             task_from_including_deleted(&tx, &task.id)?.context("edited task no longer exists")?;
         preserve_pending_task_fields(&tx, &task.id.clone(), completed_seq, &current, &mut task)?;
         if current.project_id != task.project_id || current.section_id != task.section_id {
-            tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
-                UPDATE tasks SET project_id=?2,section_id=?3 WHERE id IN (SELECT id FROM tree)", params![task.id, task.project_id,task.section_id])?;
+            tx.execute(
+                "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
+                UPDATE tasks SET project_id=?2,section_id=?3 WHERE id IN (SELECT id FROM tree)",
+                params![task.id, task.project_id, task.section_id],
+            )?;
         }
         {
             tx.execute(
@@ -1459,7 +1537,7 @@ impl Store {
         let conn = self.connect()?;
         let id = resolve_task_id_from(&conn, id)?.unwrap_or_else(|| id.into());
         let task = task_from(&conn, &id)?.context("selected task no longer exists")?;
-        let rejected:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind') IN ('move_task','move_task_parent'))",[&id],|row|row.get(0))?;
+        let rejected = has_rejected_operation(&conn, &id, &TASK_MOVE_KINDS)?;
         // After a rejected optimistic move the cached task can be displayed at
         // its intended destination; ordering metadata retains its server scope.
         let source = if rejected {
@@ -1483,7 +1561,10 @@ impl Store {
             resolve_project_id_from(&conn, project_id)?.unwrap_or_else(|| project_id.into());
         let destination =
             project_from(&conn, &project_id)?.context("destination project no longer exists")?;
-        Ok(source.and_then(|source|source.workspace_id).filter(|workspace|destination.workspace_id.as_ref()!=Some(workspace)).map(|_|"Todoist does not support moving individual tasks out of a team workspace. Choose another project in the same team."))
+        Ok(source
+            .and_then(|source| source.workspace_id)
+            .filter(|workspace| destination.workspace_id.as_ref() != Some(workspace))
+            .map(|_| "Todoist does not support moving individual tasks out of a team workspace. Choose another project in the same team."))
     }
 
     pub fn move_task(&self, id: &str, project_id: &str) -> Result<()> {
@@ -1503,8 +1584,11 @@ impl Store {
             project_from(&tx, &project_id)?.is_some(),
             "destination project no longer exists"
         );
-        tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
-            UPDATE tasks SET project_id=?2,section_id=NULL WHERE id IN (SELECT id FROM tree)", params![id, project_id])?;
+        tx.execute(
+            "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
+            UPDATE tasks SET project_id=?2,section_id=NULL WHERE id IN (SELECT id FROM tree)",
+            params![id, project_id],
+        )?;
         let changed = tx.execute(
             "UPDATE tasks SET project_id=?2,parent_id=NULL,child_order=?3 WHERE id=?1",
             params![id, project_id, next_order],
@@ -1546,7 +1630,10 @@ impl Store {
             }],
             false,
         )?;
-        tx.execute("UPDATE outbox SET error=NULL WHERE entity_id=?1 AND json_extract(payload,'$.kind')='quick_add' AND json_extract(checkpoint,'$.parsed.id') IS NOT NULL", [&id])?;
+        tx.execute(
+            "UPDATE outbox SET error=NULL WHERE entity_id=?1 AND json_extract(payload,'$.kind')='quick_add' AND json_extract(checkpoint,'$.parsed.id') IS NOT NULL",
+            [&id],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1619,8 +1706,11 @@ impl Store {
             supersede_rejected_task_moves(tx, &id)?;
         }
         if current.project_id != target_project_id {
-            tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
-                UPDATE tasks SET project_id=?2,section_id=?3 WHERE id IN (SELECT id FROM tree)", params![id, target_project_id,target.section_id])?;
+            tx.execute(
+                "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
+                UPDATE tasks SET project_id=?2,section_id=?3 WHERE id IN (SELECT id FROM tree)",
+                params![id, target_project_id, target.section_id],
+            )?;
         }
         tx.execute(
             "UPDATE tasks SET project_id=?2,content=?3,description=?4,labels_json=?5,
@@ -1635,7 +1725,10 @@ impl Store {
                 target.priority,
                 target.child_order,
                 target.checked,
-                target_parent_id,target.section_id,target.responsible_uid,target.assignee
+                target_parent_id,
+                target.section_id,
+                target.responsible_uid,
+                target.assignee
             ],
         )?;
         if !target.checked {
@@ -1790,11 +1883,11 @@ impl Store {
         let conn = self.connect()?;
         let id = resolve_task_id_from(&conn, id)?.unwrap_or_else(|| id.to_owned());
         let root = task_from(&conn, &id)?.context("selected task no longer exists")?;
-        let mut stmt = conn.prepare(
-            "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,
-                    checked,parent_id,assignee_name,section_id,responsible_uid
-             FROM tasks WHERE project_id=?1 AND deleted=0 ORDER BY child_order,id",
-        )?;
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM tasks
+             WHERE project_id=?1 AND deleted=0 ORDER BY child_order,id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let project_tasks = stmt
             .query_map([root.project_id.as_str()], row_to_task)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1869,7 +1962,7 @@ impl Store {
                             .map(|resolved| resolved.unwrap_or_else(|| parent.to_owned()))
                     })
                     .transpose()?;
-                let pending_creation: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND json_extract(payload,'$.kind')='quick_add')", [&task.id], |row| row.get(0))?;
+                let pending_creation = has_queued_operation(&tx, &task.id, &["quick_add"])?;
                 if task.id.starts_with("local:") && !pending_creation {
                     let project_id = resolve_project_id_from(&tx, &task.project_id)?
                         .unwrap_or_else(|| task.project_id.clone());
@@ -2071,7 +2164,10 @@ impl Store {
                 params![id, responsible_uid],
             )?;
             queue(&tx, &id, Operation::UpdateAssignee { responsible_uid })?;
-            tx.execute("INSERT INTO task_id_aliases(old_id,new_id,rewrite_pending) VALUES(?1,?2,0) ON CONFLICT(old_id) DO UPDATE SET new_id=excluded.new_id,rewrite_pending=0", params![old_id, id])?;
+            tx.execute(
+                "INSERT INTO task_id_aliases(old_id,new_id,rewrite_pending) VALUES(?1,?2,0) ON CONFLICT(old_id) DO UPDATE SET new_id=excluded.new_id,rewrite_pending=0",
+                params![old_id, id],
+            )?;
             let mut task = snapshot.clone();
             task.id.clone_from(&id);
             task.project_id = project_id;
@@ -2366,11 +2462,18 @@ impl Store {
     pub fn claim_next_outbox(&self) -> Result<Option<OutboxEntry>> {
         let conn = self.connect()?;
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let entry = tx.query_row(
-            &format!("SELECT seq,uuid,entity_id,payload,checkpoint FROM outbox o WHERE {READY_OUTBOX} ORDER BY seq LIMIT 1"), [], row_to_outbox,
-        ).optional()?;
+        let entry = tx
+            .query_row(
+                &format!("SELECT seq,uuid,entity_id,payload,checkpoint FROM outbox o WHERE {READY_OUTBOX} ORDER BY seq LIMIT 1"),
+                [],
+                row_to_outbox,
+            )
+            .optional()?;
         if let Some(entry) = &entry {
-            tx.execute("UPDATE outbox SET checkpoint=json_set(CASE WHEN checkpoint='null' THEN '{}' ELSE checkpoint END,'$.key_migration',json('true')) WHERE seq=?1 AND claimed=0",[entry.seq])?;
+            tx.execute(
+                "UPDATE outbox SET checkpoint=json_set(CASE WHEN checkpoint='null' THEN '{}' ELSE checkpoint END,'$.key_migration',json('true')) WHERE seq=?1 AND claimed=0",
+                [entry.seq],
+            )?;
             tx.execute("UPDATE outbox SET claimed=1 WHERE seq=?1", [entry.seq])?;
         }
         let entry = entry
@@ -2466,11 +2569,13 @@ impl Store {
             )?;
             // Corrections queued while this request was in flight become safe
             // to unblock only once the original move is definitely rejected.
-            if rejected_move && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind') IN ('move_task','move_task_parent'))",params![entry.entity_id,seq],|row|row.get::<_,bool>(0))? {
-                supersede_rejected_task_moves(&tx,&entry.entity_id)?;
+            if rejected_move
+                && has_queued_operation_after(&tx, &entry.entity_id, seq, &TASK_MOVE_KINDS)?
+            {
+                supersede_rejected_task_moves(&tx, &entry.entity_id)?;
             }
             if let Some(kind) = rejected_field_write
-                && tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind')=?3)",params![entry.entity_id,seq,kind],|row|row.get::<_,bool>(0))?
+                && has_queued_operation_after(&tx, &entry.entity_id, seq, &[kind])?
             {
                 // Discard only this confirmed rejection; newer values for the
                 // same field and unrelated failed operations remain intact.
@@ -2514,16 +2619,21 @@ impl Store {
     }
 
     pub fn cancel_rejected_creation(&self, id: &str) -> Result<()> {
-        self.connect()?.execute("DELETE FROM outbox WHERE entity_id=?1 AND json_extract(payload,'$.kind')<>'delete_task'", [id])?;
+        self.connect()?
+            .execute("DELETE FROM outbox WHERE entity_id=?1 AND json_extract(payload,'$.kind')<>'delete_task'", [id])?;
         Ok(())
     }
 
     pub fn finish_local_delete(&self, entry: &OutboxEntry) -> Result<()> {
         let conn = self.connect()?;
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let ids = tx.prepare("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
-            SELECT id FROM tree WHERE id NOT LIKE 'local:%'")?
-            .query_map([&entry.entity_id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let ids = tx
+            .prepare(
+                "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id)
+            SELECT id FROM tree WHERE id NOT LIKE 'local:%'",
+            )?
+            .query_map([&entry.entity_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         for id in ids {
             queue(&tx, &id, Operation::DeleteTask)?;
         }
@@ -2580,7 +2690,8 @@ impl Store {
                 .unwrap_or_else(|_| current.section_id.clone()),
         };
         preserve_pending_task_fields(&tx, old_id, add_seq, &current, &mut updated)?;
-        let pending_assignee: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2 AND json_extract(payload,'$.kind')='update_assignee')", params![old_id, add_seq], |row| row.get(0))?;
+        let assignee = &["update_assignee"];
+        let pending_assignee = has_queued_operation_after(&tx, old_id, add_seq, assignee)?;
         let responsible_uid = if pending_assignee {
             tx.query_row(
                 "SELECT responsible_uid FROM tasks WHERE id=?1",
@@ -2592,15 +2703,27 @@ impl Store {
         };
         {
             tx.execute(
-            "UPDATE OR REPLACE tasks SET id=?2,project_id=?3,content=?4,description=?5,labels_json=?6,
+                "UPDATE OR REPLACE tasks SET id=?2,project_id=?3,content=?4,description=?5,labels_json=?6,
              due_json=?7,priority=?8,child_order=?9,checked=?10,deleted=?11,parent_id=?12,
              responsible_uid=?13,assignee_name=?14,section_id=?15 WHERE id=?1",
-            params![old_id,task.id,updated.project_id,updated.content,updated.description,
-                serde_json::to_string(&updated.labels)?,updated.due.as_ref().map(serde_json::to_string).transpose()?,
-                    updated.priority,updated.child_order,
-                    updated.checked,locally_deleted,updated.parent_id,
-                    responsible_uid,updated.assignee,updated.section_id],
-        )?;
+                params![
+                    old_id,
+                    task.id,
+                    updated.project_id,
+                    updated.content,
+                    updated.description,
+                    serde_json::to_string(&updated.labels)?,
+                    updated.due.as_ref().map(serde_json::to_string).transpose()?,
+                    updated.priority,
+                    updated.child_order,
+                    updated.checked,
+                    locally_deleted,
+                    updated.parent_id,
+                    responsible_uid,
+                    updated.assignee,
+                    updated.section_id
+                ],
+            )?;
         }
         remap_task_id(&tx, old_id, &task.id)?;
         tx.commit()?;
@@ -2740,10 +2863,8 @@ impl Store {
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.connect()?.execute(
-            "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![key,value],
-        )?;
+        self.connect()?
+            .execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
         Ok(())
     }
 
@@ -2762,14 +2883,7 @@ impl Store {
         let transaction = conn.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![
-                "task_view_group_by_label",
-                if preferences.group_by_label {
-                    "true"
-                } else {
-                    "false"
-                }
-            ],
+            params!["task_view_group_by_label", if preferences.group_by_label { "true" } else { "false" }],
         )?;
         transaction.commit()?;
         Ok(())
@@ -2939,7 +3053,10 @@ impl Store {
                 tx.execute("DELETE FROM projects WHERE id=?1", [&old])?;
                 rewrite_project_references(&tx, &old, &remote_inbox.id)?;
                 order_storage::remap(&tx, &old, &remote_inbox.id, true)?;
-                tx.execute("INSERT INTO project_id_aliases(old_id,new_id) VALUES(?1,?2) ON CONFLICT(old_id) DO UPDATE SET new_id=excluded.new_id", params![old, remote_inbox.id])?;
+                tx.execute(
+                    "INSERT INTO project_id_aliases(old_id,new_id) VALUES(?1,?2) ON CONFLICT(old_id) DO UPDATE SET new_id=excluded.new_id",
+                    params![old, remote_inbox.id],
+                )?;
                 transferred_inbox_hidden = Some((remote_inbox.id.as_str(), is_hidden));
             }
         }
@@ -3009,7 +3126,18 @@ impl Store {
                  ON CONFLICT(id) DO UPDATE SET name=excluded.name,parent_id=excluded.parent_id,
                   child_order=CASE WHEN ?10 THEN projects.child_order ELSE excluded.child_order END,workspace_id=excluded.workspace_id,is_inbox=excluded.is_inbox,
                  is_shared=excluded.is_shared,can_assign=excluded.can_assign,deleted=excluded.deleted",
-                params![p.id,p.name,p.parent_id,p.child_order,p.workspace_id,inbox,p.shared,p.can_assign_tasks,p.is_deleted || p.is_archived,protected_order.contains(&p.id)],
+                params![
+                    p.id,
+                    p.name,
+                    p.parent_id,
+                    p.child_order,
+                    p.workspace_id,
+                    inbox,
+                    p.shared,
+                    p.can_assign_tasks,
+                    p.is_deleted || p.is_archived,
+                    protected_order.contains(&p.id)
+                ],
             )?;
         }
         if let Some((remote_inbox_id, is_hidden)) = transferred_inbox_hidden {
@@ -3036,17 +3164,29 @@ impl Store {
                   priority=excluded.priority,child_order=CASE WHEN ?14 OR (tasks.checked=1 AND excluded.checked=1) THEN tasks.child_order ELSE excluded.child_order END,checked=excluded.checked,
                  deleted=excluded.deleted,parent_id=excluded.parent_id,
                  responsible_uid=excluded.responsible_uid,assignee_name=excluded.assignee_name",
-                params![task.id,task.project_id,task.content,task.description,serde_json::to_string(&task.labels)?,
-                    due.as_ref().map(serde_json::to_string).transpose()?,task.priority,task.child_order,
-                    task.checked || task.is_completed,task.is_deleted,task.parent_id,
-                    task.responsible_uid,assignee_name,protected_order.contains(&task.id)],
+                params![
+                    task.id,
+                    task.project_id,
+                    task.content,
+                    task.description,
+                    serde_json::to_string(&task.labels)?,
+                    due.as_ref().map(serde_json::to_string).transpose()?,
+                    task.priority,
+                    task.child_order,
+                    task.checked || task.is_completed,
+                    task.is_deleted,
+                    task.parent_id,
+                    task.responsible_uid,
+                    assignee_name,
+                    protected_order.contains(&task.id)
+                ],
             )?;
         }
         for label in labels {
             tx.execute(
                 "INSERT INTO labels(id,name,item_order,deleted) VALUES(?1,?2,?3,?4)
                  ON CONFLICT(id) DO UPDATE SET name=excluded.name,item_order=excluded.item_order,deleted=excluded.deleted",
-                params![label.id,label.name,label.item_order,label.is_deleted],
+                params![label.id, label.name, label.item_order, label.is_deleted],
             )?;
         }
         for filter in filters {
@@ -3059,8 +3199,16 @@ impl Store {
                  ON CONFLICT(id) DO UPDATE SET name=excluded.name,query=excluded.query,item_order=excluded.item_order,
                  is_favorite=excluded.is_favorite,workspace_id=excluded.workspace_id,
                  is_frozen=excluded.is_frozen,deleted=excluded.deleted",
-                params![filter.id,filter.name,filter.query,filter.item_order,filter.is_favorite,
-                    filter.workspace_id,filter.is_frozen,filter.is_deleted],
+                params![
+                    filter.id,
+                    filter.name,
+                    filter.query,
+                    filter.item_order,
+                    filter.is_favorite,
+                    filter.workspace_id,
+                    filter.is_frozen,
+                    filter.is_deleted
+                ],
             )?;
             if !filter.is_favorite || filter.is_deleted {
                 tx.execute("DELETE FROM filter_tasks WHERE filter_id=?1", [&filter.id])?;
@@ -3102,11 +3250,20 @@ impl Store {
                  parent_id=excluded.parent_id,responsible_uid=excluded.responsible_uid,
                  assignee_name=excluded.assignee_name
                  WHERE tasks.checked=1",
-                params![task.id,task.project_id,task.content,task.description,
+                params![
+                    task.id,
+                    task.project_id,
+                    task.content,
+                    task.description,
                     serde_json::to_string(&task.labels)?,
                     due.as_ref().map(serde_json::to_string).transpose()?,
-                    task.priority,task.child_order,task.is_deleted,task.parent_id,
-                    task.responsible_uid,assignee_name],
+                    task.priority,
+                    task.child_order,
+                    task.is_deleted,
+                    task.parent_id,
+                    task.responsible_uid,
+                    assignee_name
+                ],
             )?;
         }
         order_storage::hydrate(&tx)?;
@@ -3115,7 +3272,11 @@ impl Store {
     }
 
     pub fn filter_active_task_count(&self, filter_id: &str) -> Result<usize> {
-        let count:i64=self.connect()?.query_row("SELECT COUNT(*) FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id WHERE ft.filter_id=?1 AND t.checked=0 AND t.deleted=0",[filter_id],|row|row.get(0))?;
+        let count: i64 = self.connect()?.query_row(
+            "SELECT COUNT(*) FROM filter_tasks ft JOIN tasks t ON t.id=ft.task_id WHERE ft.filter_id=?1 AND t.checked=0 AND t.deleted=0",
+            [filter_id],
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
     }
 
@@ -3172,18 +3333,30 @@ impl Store {
                 .cloned();
             let due = reconciled_due(&tx, &task.id, task.due.as_ref())?;
             tx.execute(
-                    "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id,responsible_uid,assignee_name)
+                "INSERT INTO tasks(id,project_id,content,description,labels_json,due_json,priority,child_order,checked,deleted,parent_id,responsible_uid,assignee_name)
                      VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                      ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,content=excluded.content,
                      description=excluded.description,labels_json=excluded.labels_json,due_json=excluded.due_json,
                      priority=excluded.priority,child_order=CASE WHEN ?14 THEN tasks.child_order ELSE excluded.child_order END,checked=excluded.checked,
                      deleted=excluded.deleted,parent_id=excluded.parent_id,
                      responsible_uid=excluded.responsible_uid,assignee_name=excluded.assignee_name",
-                    params![task.id,task.project_id,task.content,task.description,serde_json::to_string(&task.labels)?,
-                        due.as_ref().map(serde_json::to_string).transpose()?,task.priority,task.child_order,
-                        task.checked || task.is_completed,task.is_deleted,task.parent_id,
-                        task.responsible_uid,assignee_name,protected_order.contains(&task.id)],
-                )?;
+                params![
+                    task.id,
+                    task.project_id,
+                    task.content,
+                    task.description,
+                    serde_json::to_string(&task.labels)?,
+                    due.as_ref().map(serde_json::to_string).transpose()?,
+                    task.priority,
+                    task.child_order,
+                    task.checked || task.is_completed,
+                    task.is_deleted,
+                    task.parent_id,
+                    task.responsible_uid,
+                    assignee_name,
+                    protected_order.contains(&task.id)
+                ],
+            )?;
             if !task.checked && !task.is_deleted {
                 tx.execute(
                     "INSERT OR IGNORE INTO filter_tasks(filter_id,task_id) VALUES(?1,?2)",
@@ -3409,18 +3582,13 @@ fn project_from(conn: &Connection, id: &str) -> Result<Option<Project>> {
 }
 
 fn task_from(conn: &Connection, id: &str) -> Result<Option<Task>> {
-    Ok(conn
-        .query_row(
-             "SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid
-             FROM tasks WHERE id=?1 AND deleted=0",
-            [id],
-            row_to_task,
-        )
-        .optional()?)
+    let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id=?1 AND deleted=0");
+    Ok(conn.query_row(&sql, [id], row_to_task).optional()?)
 }
 
 fn task_from_including_deleted(conn: &Connection, id: &str) -> Result<Option<Task>> {
-    Ok(conn.query_row("SELECT id,project_id,content,description,labels_json,due_json,priority,child_order,checked,parent_id,assignee_name,section_id,responsible_uid FROM tasks WHERE id=?1", [id], row_to_task).optional()?)
+    let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id=?1");
+    Ok(conn.query_row(&sql, [id], row_to_task).optional()?)
 }
 
 fn preserve_pending_task_fields(
@@ -3519,8 +3687,12 @@ fn preserve_pending_task_fields(
 }
 
 fn task_descends_from(conn: &Connection, id: &str, ancestor: &str) -> Result<bool> {
-    Ok(conn.query_row("WITH RECURSIVE ancestors(id) AS (SELECT ?1 UNION SELECT t.parent_id FROM tasks t JOIN ancestors a ON t.id=a.id WHERE t.parent_id IS NOT NULL)
-        SELECT EXISTS(SELECT 1 FROM ancestors WHERE id=?2)", params![id, ancestor], |row| row.get(0))?)
+    Ok(conn.query_row(
+        "WITH RECURSIVE ancestors(id) AS (SELECT ?1 UNION SELECT t.parent_id FROM tasks t JOIN ancestors a ON t.id=a.id WHERE t.parent_id IS NOT NULL)
+        SELECT EXISTS(SELECT 1 FROM ancestors WHERE id=?2)",
+        params![id, ancestor],
+        |row| row.get(0),
+    )?)
 }
 
 fn collaborator_names(conn: &Connection) -> Result<HashMap<String, String>> {
@@ -3536,7 +3708,7 @@ fn collaborators_for_project(
     let mut statement = conn.prepare(
         "SELECT c.id,c.full_name FROM collaborators c WHERE EXISTS (
            SELECT 1 FROM project_collaborators p WHERE p.project_id=?1 AND p.user_id=c.id
-         ) OR c.id=(SELECT value FROM meta WHERE key='account_id') ORDER BY lower(c.full_name),c.id"
+         ) OR c.id=(SELECT value FROM meta WHERE key='account_id') ORDER BY lower(c.full_name),c.id",
     )?;
     Ok(statement
         .query_map([project_id], |row| {
@@ -3553,24 +3725,87 @@ fn supersede_rejected_assignments(tx: &Transaction<'_>, id: &str) -> Result<()> 
     Ok(())
 }
 
+/// Queued operation kinds that move a task, as the outbox payload spells them.
+const TASK_MOVE_KINDS: [&str; 2] = ["move_task", "move_task_parent"];
+
+/// The queued operation kinds as a JSON array, so one statement can match any
+/// number of them without interpolating values into its SQL.
+fn kind_list(kinds: &[&str]) -> Result<String> {
+    Ok(serde_json::to_string(kinds)?)
+}
+
+/// Whether an operation of one of `kinds` is queued for `id`.
+fn has_queued_operation(conn: &Connection, id: &str, kinds: &[&str]) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1
+         AND json_extract(payload,'$.kind') IN (SELECT value FROM json_each(?2)))",
+        params![id, kind_list(kinds)?],
+        |row| row.get(0),
+    )?)
+}
+
+/// Whether an operation of one of `kinds` is queued for `id` after `seq`, which
+/// tells a correction queued during a request apart from the request itself.
+fn has_queued_operation_after(
+    conn: &Connection,
+    id: &str,
+    seq: i64,
+    kinds: &[&str],
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND seq>?2
+         AND json_extract(payload,'$.kind') IN (SELECT value FROM json_each(?3)))",
+        params![id, seq, kind_list(kinds)?],
+        |row| row.get(0),
+    )?)
+}
+
+/// Whether an operation of one of `kinds` queued for `id` has been permanently
+/// rejected, which still leaves it able to overwrite the cached value.
+fn has_rejected_operation(conn: &Connection, id: &str, kinds: &[&str]) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND error IS NOT NULL
+         AND json_extract(payload,'$.kind') IN (SELECT value FROM json_each(?2)))",
+        params![id, kind_list(kinds)?],
+        |row| row.get(0),
+    )?)
+}
+
+/// Whether a queued natural-language expression for `id` still mentions a
+/// field, which lets Todoist's parser overwrite the cached value even though
+/// the local change already matches it.
+fn has_pending_expression(
+    conn: &Connection,
+    id: &str,
+    kinds: &[&str],
+    mentions: fn(&str) -> bool,
+) -> Result<bool> {
+    let mut statement = conn.prepare(
+        "SELECT payload FROM outbox WHERE entity_id=?1
+         AND json_extract(payload,'$.kind') IN (SELECT value FROM json_each(?2))",
+    )?;
+    let payloads = statement
+        .query_map(params![id, kind_list(kinds)?], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(payloads
+        .iter()
+        .any(|payload| match serde_json::from_str::<Operation>(payload) {
+            Ok(
+                Operation::QuickEdit { expression, .. } | Operation::QuickAdd { expression, .. },
+            ) => mentions(&expression),
+            _ => false,
+        }))
+}
+
 fn has_pending_assignee_edit(conn: &Connection, id: &str) -> Result<bool> {
-    let payloads = conn.prepare(
-        "SELECT payload FROM outbox WHERE entity_id=?1 AND json_extract(payload,'$.kind')='quick_edit'"
-    )?.query_map([id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(payloads.iter().any(|payload| {
-        matches!(serde_json::from_str::<Operation>(payload), Ok(Operation::QuickEdit { expression, .. }) if crate::model::contains_assignee(&expression))
-    }))
+    has_pending_expression(conn, id, &["quick_edit"], crate::model::contains_assignee)
 }
 
 fn has_pending_priority_expression(conn: &Connection, id: &str) -> Result<bool> {
-    let payloads = conn.prepare(
-        "SELECT payload FROM outbox WHERE entity_id=?1 AND json_extract(payload,'$.kind') IN ('quick_edit','quick_add')"
-    )?.query_map([id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(payloads.iter().any(|payload| {
-        matches!(serde_json::from_str::<Operation>(payload),
-            Ok(Operation::QuickEdit { expression, .. } | Operation::QuickAdd { expression, .. })
-            if crate::model::contains_priority(&expression))
-    }))
+    let kinds = &["quick_edit", "quick_add"];
+    has_pending_expression(conn, id, kinds, crate::model::contains_priority)
 }
 
 fn resolve_task_id_from(conn: &Connection, id: &str) -> Result<Option<String>> {
@@ -3870,10 +4105,22 @@ fn remove_pending_priority_updates(tx: &Transaction<'_>, entity_id: &str) -> Res
 }
 
 fn supersede_rejected_task_moves(tx: &Transaction<'_>, id: &str) -> Result<()> {
-    let rejected = tx.prepare("SELECT seq FROM outbox WHERE entity_id=?1 AND error IS NOT NULL AND json_extract(payload,'$.kind') IN ('move_task','move_task_parent') ORDER BY seq")?
-        .query_map([id],|row|row.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rejected = tx
+        .prepare(
+            "SELECT seq FROM outbox WHERE entity_id=?1 AND error IS NOT NULL
+             AND json_extract(payload,'$.kind') IN (SELECT value FROM json_each(?2))
+             ORDER BY seq",
+        )?
+        .query_map(params![id, kind_list(&TASK_MOVE_KINDS)?], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     for seq in rejected {
-        let placement:Option<(i64,String,String,bool)>=tx.query_row("SELECT seq,entity_id,payload,claimed FROM outbox WHERE seq>?1 ORDER BY seq LIMIT 1",[seq],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
+        let placement: Option<(i64, String, String, bool)> = tx
+            .query_row("SELECT seq,entity_id,payload,claimed FROM outbox WHERE seq>?1 ORDER BY seq LIMIT 1", [seq], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()?;
         if let Some((next_seq, entity, payload, false)) = placement
             && entity == id
             && matches!(serde_json::from_str::<Operation>(&payload)?,Operation::OrderResources{plans} if plans.len()==1 && !plans[0].full && plans[0].positions.len()==1 && plans[0].positions[0].id==id)
@@ -3938,8 +4185,7 @@ fn queue_filter_change(
     is_workspace: bool,
 ) -> Result<()> {
     let entries = {
-        let mut stmt =
-            tx.prepare("SELECT seq,payload FROM outbox WHERE entity_id=?1 AND (claimed=0 OR error IS NOT NULL) ORDER BY seq")?;
+        let mut stmt = tx.prepare("SELECT seq,payload FROM outbox WHERE entity_id=?1 AND (claimed=0 OR error IS NOT NULL) ORDER BY seq")?;
         stmt.query_map([entity_id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?
@@ -3966,7 +4212,8 @@ fn queue_filter_change(
                     name: name.to_owned(),
                     query: query.to_owned(),
                     is_favorite,
-                })?, Uuid::new_v4().to_string()
+                })?,
+                Uuid::new_v4().to_string()
             ],
         )?;
     } else {
@@ -3986,8 +4233,7 @@ fn queue_filter_change(
 
 fn queue_project_rename(tx: &Transaction<'_>, entity_id: &str, name: &str) -> Result<()> {
     let entries = {
-        let mut stmt =
-            tx.prepare("SELECT seq,payload FROM outbox WHERE entity_id=?1 AND (claimed=0 OR error IS NOT NULL) ORDER BY seq")?;
+        let mut stmt = tx.prepare("SELECT seq,payload FROM outbox WHERE entity_id=?1 AND (claimed=0 OR error IS NOT NULL) ORDER BY seq")?;
         stmt.query_map([entity_id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?
@@ -4008,12 +4254,7 @@ fn queue_project_rename(tx: &Transaction<'_>, entity_id: &str, name: &str) -> Re
     if let Some(seq) = pending_add {
         tx.execute(
             "UPDATE outbox SET payload=?2,uuid=?3,claimed=0,error=NULL,checkpoint='null' WHERE seq=?1",
-            params![
-                seq,
-                serde_json::to_string(&Operation::AddProject {
-                    name: name.to_owned(),
-                })?, Uuid::new_v4().to_string()
-            ],
+            params![seq, serde_json::to_string(&Operation::AddProject { name: name.to_owned() })?, Uuid::new_v4().to_string()],
         )?;
     } else {
         queue(
@@ -4122,7 +4363,10 @@ fn remap_task_id(tx: &Transaction<'_>, old_id: &str, new_id: &str) -> Result<()>
             params![new_id, restored],
         )?;
     } else {
-        tx.execute("INSERT INTO task_id_aliases(old_id,new_id) VALUES(?1,?2) ON CONFLICT(old_id) DO UPDATE SET new_id=excluded.new_id", params![old_id, new_id])?;
+        tx.execute(
+            "INSERT INTO task_id_aliases(old_id,new_id) VALUES(?1,?2) ON CONFLICT(old_id) DO UPDATE SET new_id=excluded.new_id",
+            params![old_id, new_id],
+        )?;
     }
     Ok(())
 }
@@ -4166,7 +4410,10 @@ fn remap_view_preference(
 fn rewrite_project_references(tx: &Transaction<'_>, old_id: &str, new_id: &str) -> Result<()> {
     remap_view_preference(tx, "project", old_id, new_id)?;
     if old_id != new_id {
-        tx.execute("INSERT OR IGNORE INTO project_collaborators(project_id,user_id) SELECT ?2,user_id FROM project_collaborators WHERE project_id=?1", params![old_id,new_id])?;
+        tx.execute(
+            "INSERT OR IGNORE INTO project_collaborators(project_id,user_id) SELECT ?2,user_id FROM project_collaborators WHERE project_id=?1",
+            params![old_id, new_id],
+        )?;
         tx.execute(
             "DELETE FROM project_collaborators WHERE project_id=?1",
             [old_id],
@@ -4503,7 +4750,8 @@ mod tests {
                 content: "Literal created title".into(),
             }])
             .unwrap();
-        let created: RemoteTask = serde_json::from_value(serde_json::json!({"id":"created","project_id":"team","content":"Unparsed","description":"Creation response note","responsible_uid":"ada","priority":3})).unwrap();
+        let created: RemoteTask =
+            serde_json::from_value(serde_json::json!({"id":"created","project_id":"team","content":"Unparsed","description":"Creation response note","responsible_uid":"ada","priority":3})).unwrap();
         store.replace_task_id(&local, &created).unwrap();
         let task = store.task(&local).unwrap().unwrap();
         assert_eq!(task.content, "Literal created title");
@@ -5250,8 +5498,16 @@ mod tests {
                 .iter()
                 .any(|entry| matches!(entry.operation, Operation::UpdatePriority { priority: 4 }))
         );
-        assert!(queued.iter().any(|entry| matches!(&entry.operation, Operation::RestoreDue { due: Some(due) } if due.date.as_deref() == Some("2026-10-14"))));
-        assert!(queued.iter().any(|entry| matches!(&entry.operation, Operation::OrderResources { plans } if plans[0].positions[0].child_order == 7)));
+        assert!(
+            queued
+                .iter()
+                .any(|entry| matches!(&entry.operation, Operation::RestoreDue { due: Some(due) } if due.date.as_deref() == Some("2026-10-14")))
+        );
+        assert!(
+            queued
+                .iter()
+                .any(|entry| matches!(&entry.operation, Operation::OrderResources { plans } if plans[0].positions[0].child_order == 7))
+        );
     }
 
     #[test]
@@ -5325,7 +5581,13 @@ mod tests {
             .unwrap();
         assert!(first_completion > last_creation);
         assert_eq!(queued.last().unwrap().entity_id, restored[0].id);
-        assert_eq!(queued.iter().filter(|entry| matches!(&entry.operation, Operation::UpdateAssignee { responsible_uid: Some(uid) } if uid == "person")).count(), 2);
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|entry| matches!(&entry.operation, Operation::UpdateAssignee { responsible_uid: Some(uid) } if uid == "person"))
+                .count(),
+            2
+        );
         store
             .replace_task_id(&restored[0].id, &remote_task("new-parent", None))
             .unwrap();
@@ -5521,11 +5783,41 @@ mod tests {
         );
         assert_eq!(store.task("root").unwrap().unwrap().labels, ["Keep"]);
         assert_eq!(store.task("child").unwrap().unwrap().project_id, "team");
-        assert!(store.outbox().unwrap().iter().all(|entry|entry.seq!=failed.seq && !matches!(&entry.operation,Operation::OrderResources{plans} if plans.iter().any(|plan|matches!(&plan.scope,OrderScope::Tasks{project_id,..} if project_id=="personal")))));
+        assert!(store.outbox().unwrap().iter().all(|entry| entry.seq != failed.seq
+            && !matches!(&entry.operation,Operation::OrderResources{plans} if plans.iter().any(|plan|matches!(&plan.scope,OrderScope::Tasks{project_id,..} if project_id=="personal")))));
         assert!(matches!(
             store.claim_next_outbox().unwrap().unwrap().operation,
             Operation::UpdateLabels { .. }
         ));
+    }
+
+    #[test]
+    fn a_corrected_hierarchy_change_supersedes_its_confirmed_rejection() {
+        let store = team_move_fixture();
+        store.set_task_parent("child", None).unwrap();
+        let failed = store.claim_next_outbox().unwrap().unwrap();
+        assert!(matches!(
+            failed.operation,
+            Operation::MoveTaskParent {
+                parent_id: None,
+                ..
+            }
+        ));
+        store.set_task_parent("child", Some("root")).unwrap();
+        store
+            .fail_outbox(failed.seq, "Rejected hierarchy change")
+            .unwrap();
+
+        assert!(store.outbox_error().unwrap().is_none());
+        let next = store.claim_next_outbox().unwrap().unwrap();
+        assert!(
+            matches!(&next.operation, Operation::MoveTaskParent { parent_id: Some(parent), .. } if parent == "root")
+        );
+        assert_ne!(next.uuid, failed.uuid);
+        assert_eq!(
+            store.task("child").unwrap().unwrap().parent_id.as_deref(),
+            Some("root")
+        );
     }
 
     #[test]
@@ -5578,7 +5870,17 @@ mod tests {
             .into_iter()
             .find(|entry| matches!(entry.operation, Operation::OrderResources { .. }))
             .unwrap();
-        store.connect().unwrap().execute("UPDATE outbox SET claimed=1,checkpoint=?2 WHERE seq=?1",params![placement.seq,r#"{"keys_done":[false],"keys_writes":[{"command":"item_update","id":"root","field":"order_key","key":"a1"}]}"#]).unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE outbox SET claimed=1,checkpoint=?2 WHERE seq=?1",
+                params![
+                    placement.seq,
+                    r#"{"keys_done":[false],"keys_writes":[{"command":"item_update","id":"root","field":"order_key","key":"a1"}]}"#
+                ],
+            )
+            .unwrap();
         store
             .fail_outbox(failed.seq, "Confirmed move rejection")
             .unwrap();
@@ -5821,8 +6123,9 @@ mod tests {
              INSERT INTO projects VALUES('p','Shared',1,0,1,'w',1,2,'','third');
              INSERT INTO tasks VALUES('t','p','Legacy task','description','tomorrow',4,7,0,'[\"Work\"]');
              INSERT INTO filters VALUES('f','Important','p1',3);
-             INSERT INTO filter_tasks VALUES('f','t');"
-        ).unwrap();
+             INSERT INTO filter_tasks VALUES('f','t');",
+        )
+        .unwrap();
         drop(conn);
 
         let store = Store::open(path).unwrap();

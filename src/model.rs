@@ -1,3 +1,8 @@
+//! The domain types shared by storage, synchronization and rendering.
+//!
+//! [`Operation`] is also the durable outbox payload: its serialized form is
+//! read back from databases written by older versions, so variants and fields
+//! may be added but not renamed or removed.
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -452,29 +457,28 @@ pub struct RemoteLabel {
     pub is_deleted: bool,
 }
 
+/// Todoist returns IDs as strings in some responses and as numbers in others.
+fn id_from_value<E: serde::de::Error>(value: Value) -> Result<String, E> {
+    match value {
+        Value::String(id) => Ok(id),
+        Value::Number(id) => Ok(id.to_string()),
+        _ => Err(E::custom("expected string or numeric id")),
+    }
+}
+
 pub fn string_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = Value::deserialize(deserializer)?;
-    match value {
-        Value::String(s) => Ok(s),
-        Value::Number(n) => Ok(n.to_string()),
-        _ => Err(serde::de::Error::custom("expected string or numeric id")),
-    }
+    id_from_value(Value::deserialize(deserializer)?)
 }
 
 pub fn optional_string_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = Option::<Value>::deserialize(deserializer)?;
-    value
-        .map(|v| match v {
-            Value::String(s) => Ok(s),
-            Value::Number(n) => Ok(n.to_string()),
-            _ => Err(serde::de::Error::custom("expected string or numeric id")),
-        })
+    Option::<Value>::deserialize(deserializer)?
+        .map(id_from_value)
         .transpose()
 }
 
@@ -618,10 +622,7 @@ mod tests {
 
     #[test]
     fn legacy_quick_add_operations_default_to_no_parent() {
-        let operation: Operation = serde_json::from_str(
-            r##"{"kind":"quick_add","expression":"Task","project_id":"inbox","project_name":"Inbox"}"##,
-        )
-        .unwrap();
+        let operation: Operation = serde_json::from_str(r##"{"kind":"quick_add","expression":"Task","project_id":"inbox","project_name":"Inbox"}"##).unwrap();
         assert!(matches!(
             operation,
             Operation::QuickAdd {

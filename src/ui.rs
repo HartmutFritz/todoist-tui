@@ -1,3 +1,8 @@
+//! Rendering. Every widget is derived from [`crate::app::App`] state.
+//!
+//! Nothing here performs I/O or changes stored state; the only mutation is the
+//! cached task layout and viewport, which are reused while just the selection
+//! or focus changes.
 use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, Local, NaiveDate};
@@ -15,7 +20,7 @@ use crate::{
     app::{
         App, FilterPickerItem, Focus, LabelPickerItem, OutboxView, Overlay, PickerMode,
         ProjectPickerItem, ProjectPickerPurpose, ProjectSearch, SyncStatus, TaskPickerItem,
-        filtered_filter_indices, filtered_label_indices, filtered_task_indices,
+        prefix_matches,
     },
     editor::EditorCellStyle,
     keymap::{Action, KeyBindings},
@@ -584,8 +589,13 @@ fn task_depths(tasks: &[Task]) -> Vec<usize> {
         }
         for &index in path.iter().rev() {
             if depths[index].is_none() {
-                let parent = by_id[tasks[index].parent_id.as_deref().unwrap()];
-                depths[index] = Some(depths[parent].unwrap_or(0) + 1);
+                // A parent that is missing from this view leaves its child at
+                // the root, exactly as the walk above treats it.
+                let parent = tasks[index]
+                    .parent_id
+                    .as_deref()
+                    .and_then(|id| by_id.get(id));
+                depths[index] = Some(parent.map_or(0, |&parent| depths[parent].unwrap_or(0) + 1));
             }
             in_path[index] = None;
         }
@@ -1025,187 +1035,122 @@ fn editor_color(color: vt100::Color, default: Color) -> Color {
     }
 }
 
+/// One help row: the key column, then what that key does.
+fn help_row(key: &str, meaning: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {key:<14}        "),
+            Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(meaning.to_owned(), Style::default().fg(TEXT)),
+    ])
+}
+
 fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scroll: &mut usize) {
     let area = centered(frame.area(), 80, 44, 96, 94);
+    let show = |action| keys.display(action).to_string();
+    let pair = |first, second| format!("{} / {}", keys.display(first), keys.display(second));
     let mut help = vec![
+        (pair(Action::Down, Action::Up), "move down / up"),
         (
-            format!(
-                "{} / {}",
-                keys.display(Action::Down),
-                keys.display(Action::Up)
-            ),
-            "move down / up",
-        ),
-        (
-            format!(
-                "{} / {}",
-                keys.display(Action::DownFive),
-                keys.display(Action::UpFive)
-            ),
+            pair(Action::DownFive, Action::UpFive),
             "move down / up five rows",
         ),
         (
-            format!(
-                "{} / {}",
-                keys.display(Action::FocusNavigation),
-                keys.display(Action::FocusTasks)
-            ),
+            pair(Action::FocusNavigation, Action::FocusTasks),
             "focus projects / tasks",
         ),
+        (show(Action::Confirm), "enter tasks or show task details"),
+        (show(Action::SearchProjects), "fuzzy search all projects"),
+        (show(Action::SearchTasks), "search all cached tasks"),
+        (show(Action::SearchFilters), "search all cached filters"),
+        (show(Action::AddFilter), "add a personal filter in Neovim"),
         (
-            keys.display(Action::Confirm).into(),
-            "enter tasks or show task details",
-        ),
-        (
-            keys.display(Action::SearchProjects).into(),
-            "fuzzy search all projects",
-        ),
-        (
-            keys.display(Action::SearchTasks).into(),
-            "search all cached tasks",
-        ),
-        (
-            keys.display(Action::SearchFilters).into(),
-            "search all cached filters",
-        ),
-        (
-            keys.display(Action::AddFilter).into(),
-            "add a personal filter in Neovim",
-        ),
-        (
-            keys.display(Action::RenameProject).into(),
+            show(Action::RenameProject),
             "rename selected project (sync elsewhere)",
         ),
+        (show(Action::AddProject), "add a personal project in Neovim"),
         (
-            keys.display(Action::AddProject).into(),
-            "add a personal project in Neovim",
-        ),
-        (
-            format!(
-                "{} / {}",
-                keys.display(Action::MoveProjectDown),
-                keys.display(Action::MoveProjectUp)
-            ),
+            pair(Action::MoveProjectDown, Action::MoveProjectUp),
             "move selected project or task down / up among siblings",
         ),
         (
-            keys.display(Action::CopyTitle).into(),
+            show(Action::CopyTitle),
             "copy selected project/filter or task title",
         ),
-        (
-            format!(
-                "{} / {}",
-                keys.display(Action::First),
-                keys.display(Action::Last)
-            ),
-            "first / last row",
-        ),
+        (pair(Action::First, Action::Last), "first / last row"),
         (
             format!("{} + prefix", keys.display(Action::Jump)),
             "jump after at least two name characters",
         ),
+        (show(Action::AddTaskTop), "add task at top in manual order"),
         (
-            keys.display(Action::AddTaskTop).into(),
-            "add task at top in manual order",
-        ),
-        (
-            keys.display(Action::AddTaskBottom).into(),
+            show(Action::AddTaskBottom),
             "add task at bottom in manual order",
         ),
+        (show(Action::AddChildTask), "add subtask to selected task"),
+        (show(Action::EditTask), "edit title and description"),
         (
-            keys.display(Action::AddChildTask).into(),
-            "add subtask to selected task",
-        ),
-        (
-            keys.display(Action::EditTask).into(),
-            "edit title and description",
-        ),
-        (
-            keys.display(Action::ToggleTaskSelection).into(),
+            show(Action::ToggleTaskSelection),
             "toggle task selection, then move down",
         ),
         (
-            keys.display(Action::BulkRename).into(),
+            show(Action::BulkRename),
             "bulk rename selected task titles in Neovim",
         ),
         (
-            keys.display(Action::CompleteTask).into(),
+            show(Action::CompleteTask),
             "complete / reopen selected task",
         ),
         (
-            keys.display(Action::DeleteTask).into(),
+            show(Action::DeleteTask),
             "delete selected task and its subtasks",
         ),
-        (keys.display(Action::Undo).into(), "undo last task change"),
-        (keys.display(Action::Redo).into(), "redo last undone change"),
+        (show(Action::Undo), "undo last task change"),
+        (show(Action::Redo), "redo last undone change"),
+        (show(Action::MoveTask), "fuzzy search a move destination"),
         (
-            keys.display(Action::MoveTask).into(),
-            "fuzzy search a move destination",
-        ),
-        (
-            format!(
-                "{} / {}",
-                keys.display(Action::IndentTask),
-                keys.display(Action::OutdentTask)
-            ),
+            pair(Action::IndentTask, Action::OutdentTask),
             "indent under previous sibling / outdent one level",
         ),
+        (show(Action::EditDue), "edit natural-language due date"),
+        (show(Action::RemoveDue), "remove task due date"),
+        (show(Action::EditLabels), "search and toggle a task label"),
         (
-            keys.display(Action::EditDue).into(),
-            "edit natural-language due date",
-        ),
-        (
-            keys.display(Action::RemoveDue).into(),
-            "remove task due date",
-        ),
-        (
-            keys.display(Action::EditLabels).into(),
-            "search and toggle a task label",
-        ),
-        (
-            keys.display(Action::EditAssignee).into(),
+            show(Action::EditAssignee),
             "fuzzy search a team/shared task assignee; Unassigned clears",
         ),
+        (show(Action::ToggleLabelGrouping), "toggle label grouping"),
         (
-            keys.display(Action::ToggleLabelGrouping).into(),
-            "toggle label grouping",
-        ),
-        (
-            keys.display(Action::ToggleAlphabeticalSort).into(),
+            show(Action::ToggleAlphabeticalSort),
             "toggle alphabetical order in current view",
         ),
         (
-            keys.display(Action::ToggleCompletedTasks).into(),
+            show(Action::ToggleCompletedTasks),
             "show / hide completed in current view",
         ),
+        (show(Action::Sync), "synchronize in background"),
         (
-            keys.display(Action::Sync).into(),
-            "synchronize in background",
-        ),
-        (
-            keys.display(Action::ShowError).into(),
+            show(Action::ShowError),
             "show complete synchronization error",
         ),
         (
-            keys.display(Action::ShowOutbox).into(),
+            show(Action::ShowOutbox),
             "inspect queued/rejected operations locally",
         ),
         (
-            keys.display(Action::ToggleHiddenProjects).into(),
+            show(Action::ToggleHiddenProjects),
             "show / conceal hidden items",
         ),
         (
-            keys.display(Action::ToggleProjectHidden).into(),
+            show(Action::ToggleProjectHidden),
             "add / remove selected item from hidden group",
         ),
-        (keys.display(Action::Help).into(), "open this help"),
-        (keys.display(Action::Quit).into(), "quit application"),
+        (show(Action::Help), "open this help"),
+        (show(Action::Quit), "quit application"),
+        (show(Action::Cancel), "cancel prefix or change picker mode"),
         (
-            keys.display(Action::Cancel).into(),
-            "cancel prefix or change picker mode",
-        ),
-        (
-            keys.display(Action::CloseDialog).into(),
+            show(Action::CloseDialog),
             "close help, task details, or filter details",
         ),
     ];
@@ -1217,7 +1162,7 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
     ];
     for (index, meaning) in PRIORITY_HELP.into_iter().enumerate() {
         let action = Action::for_priority(index as u8 + 1).expect("priority level range is valid");
-        help.push((keys.display(action).into(), meaning));
+        help.push((show(action), meaning));
     }
     const SPACE_HELP: [&str; 10] = [
         "assign/remove project space 0",
@@ -1233,48 +1178,25 @@ fn draw_help(frame: &mut Frame<'_>, keys: &KeyBindings, config_path: &str, scrol
     ];
     for (space, meaning) in SPACE_HELP.into_iter().enumerate() {
         let action = Action::for_space(space as u8).expect("space range is valid");
-        help.push((keys.display(action).into(), meaning));
+        help.push((show(action), meaning));
     }
     help.retain(|(key, _)| {
         key.chars()
             .any(|character| character != '—' && character != '/' && !character.is_whitespace())
     });
     let mut lines = help
-        .into_iter()
-        .map(|(key, meaning)| {
-            Line::from(vec![
-                Span::styled(
-                    format!("  {key:<14}        "),
-                    Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(meaning, Style::default().fg(TEXT)),
-            ])
-        })
+        .iter()
+        .map(|(key, meaning)| help_row(key, meaning))
         .collect::<Vec<_>>();
     for (key, project) in keys.special_add_bindings() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {key:<14}        "),
-                Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("add task with #{project} as fallback"),
-                Style::default().fg(TEXT),
-            ),
-        ]));
+        lines.push(help_row(
+            key,
+            &format!("add task with #{project} as fallback"),
+        ));
     }
     for (prefix, project) in keys.project_jump_bindings() {
         let key = format!("{}{prefix}", keys.display(Action::Jump));
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {key:<14}        "),
-                Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("jump directly to #{project}"),
-                Style::default().fg(TEXT),
-            ),
-        ]));
+        lines.push(help_row(&key, &format!("jump directly to #{project}")));
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
@@ -1406,24 +1328,42 @@ fn draw_filter_details(
     draw_scrolling_dialog(frame, text, scrolling_title(&title, keys), area, scroll);
 }
 
-fn draw_task_picker(
-    frame: &mut Frame<'_>,
-    query: &str,
-    cursor: usize,
+/// Everything the shared picker chrome needs besides its rows.
+struct Picker<'a> {
+    area: Rect,
+    title: Line<'static>,
+    query: &'a str,
     mode: PickerMode,
-    tasks: &[TaskPickerItem],
+    cursor: usize,
+    matches: &'a [usize],
+    empty_notice: &'a str,
+}
+
+/// Draws a picker: its query line, the scrolled window of matching rows, the
+/// empty-result notice, and the terminal cursor while the query is editable.
+/// `row` renders one matching entry and receives the row's selected state and
+/// the width available for its content.
+fn draw_picker<T>(
+    frame: &mut Frame<'_>,
+    picker: Picker<'_>,
+    items: &[T],
+    mut row: impl FnMut(&T, bool, usize) -> Line<'static>,
 ) {
-    let area = centered(frame.area(), 72, 20, 94, 76);
-    let title = match mode {
-        PickerMode::Filtering => " Search tasks — type prefix; Esc selects ",
-        PickerMode::Selecting => " Search tasks — j/k select; Esc cancels ",
-    };
+    let Picker {
+        area,
+        title,
+        query,
+        mode,
+        cursor,
+        matches,
+        empty_notice,
+    } = picker;
     let block = panel(title, true);
     let inner = block.inner(area);
-    let matches = filtered_task_indices(tasks, query);
     let list_height = inner.height.saturating_sub(2) as usize;
     let selected = cursor.min(matches.len().saturating_sub(1));
     let scroll = selected.saturating_sub(list_height.saturating_sub(1));
+    let content_width = inner.width.saturating_sub(3) as usize;
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -1436,57 +1376,20 @@ fn draw_task_picker(
     ];
     if matches.is_empty() {
         lines.push(Line::styled(
-            "  No matching tasks",
+            format!("  {empty_notice}"),
             Style::default().fg(MUTED),
         ));
     } else {
-        let content_width = inner.width.saturating_sub(3) as usize;
         lines.extend(
             matches
                 .iter()
                 .skip(scroll)
                 .take(list_height)
                 .enumerate()
-                .filter_map(|(visible_index, task_index)| {
-                    tasks.get(*task_index).map(|item| {
-                        let is_selected = scroll + visible_index == selected;
-                        let row_style = if is_selected {
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(SELECT)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(TEXT)
-                        };
-                        let candidate_suffix = format!("  · {}", item.project_name);
-                        let suffix = if UnicodeWidthStr::width(candidate_suffix.as_str())
-                            <= content_width / 3
-                        {
-                            candidate_suffix
-                        } else {
-                            String::new()
-                        };
-                        let title_width =
-                            content_width.saturating_sub(UnicodeWidthStr::width(suffix.as_str()));
-                        let task_style = if item.task.checked {
-                            row_style.fg(MUTED).add_modifier(Modifier::CROSSED_OUT)
-                        } else {
-                            row_style
-                        };
-                        Line::from(vec![
-                            Span::styled(if is_selected { "▸ " } else { "  " }, row_style),
-                            Span::styled(
-                                complete_words_within(&item.task.content, title_width),
-                                task_style,
-                            ),
-                            Span::styled(suffix, row_style.fg(MUTED)),
-                        ])
-                        .style(if is_selected {
-                            Style::default().bg(SELECT)
-                        } else {
-                            Style::default()
-                        })
-                    })
+                .filter_map(|(visible_index, item_index)| {
+                    items
+                        .get(*item_index)
+                        .map(|item| row(item, scroll + visible_index == selected, content_width))
                 }),
         );
     }
@@ -1499,6 +1402,69 @@ fn draw_task_picker(
             inner.y,
         ));
     }
+}
+
+/// The highlight styling every picker row shares.
+fn picker_row_style(is_selected: bool) -> Style {
+    if is_selected {
+        Style::default()
+            .fg(Color::White)
+            .bg(SELECT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT)
+    }
+}
+
+fn draw_task_picker(
+    frame: &mut Frame<'_>,
+    query: &str,
+    cursor: usize,
+    mode: PickerMode,
+    tasks: &[TaskPickerItem],
+) {
+    let picker = Picker {
+        area: centered(frame.area(), 72, 20, 94, 76),
+        title: match mode {
+            PickerMode::Filtering => " Search tasks — type prefix; Esc selects ",
+            PickerMode::Selecting => " Search tasks — j/k select; Esc cancels ",
+        }
+        .into(),
+        query,
+        mode,
+        cursor,
+        matches: &prefix_matches(tasks, query),
+        empty_notice: "No matching tasks",
+    };
+    draw_picker(frame, picker, tasks, |item, is_selected, content_width| {
+        let row_style = picker_row_style(is_selected);
+        // Drop the project context rather than let it crowd out the title.
+        let candidate_suffix = format!("  · {}", item.project_name);
+        let suffix = if UnicodeWidthStr::width(candidate_suffix.as_str()) <= content_width / 3 {
+            candidate_suffix
+        } else {
+            String::new()
+        };
+        let title_width = content_width.saturating_sub(UnicodeWidthStr::width(suffix.as_str()));
+        let task_style = if item.task.checked {
+            row_style.fg(MUTED).add_modifier(Modifier::CROSSED_OUT)
+        } else {
+            row_style
+        };
+        Line::from(vec![
+            Span::styled(if is_selected { "▸ " } else { "  " }, row_style),
+            Span::styled(
+                complete_words_within(&item.task.content, title_width),
+                task_style,
+            ),
+            Span::styled(suffix, row_style.fg(MUTED)),
+        ])
+        .style(if is_selected {
+            Style::default().bg(SELECT)
+        } else {
+            Style::default()
+        })
+    });
 }
 
 fn draw_filter_picker(
@@ -1508,73 +1474,30 @@ fn draw_filter_picker(
     mode: PickerMode,
     filters: &[FilterPickerItem],
 ) {
-    let area = centered(frame.area(), 68, 18, 88, 72);
-    let title = match mode {
-        PickerMode::Filtering => " Search filters — type prefix; Esc selects ",
-        PickerMode::Selecting => " Search filters — j/k select; Esc cancels ",
+    let picker = Picker {
+        area: centered(frame.area(), 68, 18, 88, 72),
+        title: match mode {
+            PickerMode::Filtering => " Search filters — type prefix; Esc selects ",
+            PickerMode::Selecting => " Search filters — j/k select; Esc cancels ",
+        }
+        .into(),
+        query,
+        mode,
+        cursor,
+        matches: &prefix_matches(filters, query),
+        empty_notice: "No matching filters",
     };
-    let block = panel(title, true);
-    let inner = block.inner(area);
-    let matches = filtered_filter_indices(filters, query);
-    let list_height = inner.height.saturating_sub(2) as usize;
-    let selected = cursor.min(matches.len().saturating_sub(1));
-    let scroll = selected.saturating_sub(list_height.saturating_sub(1));
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "  > ",
-                Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
+    draw_picker(frame, picker, filters, |item, is_selected, _| {
+        Line::styled(
+            format!(
+                "{} {}{}",
+                if is_selected { "▸" } else { " " },
+                item.filter.name,
+                if item.filter.is_favorite { "  ★" } else { "" }
             ),
-            Span::styled(query.to_owned(), Style::default().fg(TEXT)),
-        ]),
-        Line::raw(""),
-    ];
-    if matches.is_empty() {
-        lines.push(Line::styled(
-            "  No matching filters",
-            Style::default().fg(MUTED),
-        ));
-    } else {
-        lines.extend(
-            matches
-                .iter()
-                .skip(scroll)
-                .take(list_height)
-                .enumerate()
-                .filter_map(|(visible_index, filter_index)| {
-                    filters.get(*filter_index).map(|item| {
-                        let is_selected = scroll + visible_index == selected;
-                        let style = if is_selected {
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(SELECT)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(TEXT)
-                        };
-                        let suffix = if item.filter.is_favorite { "  ★" } else { "" };
-                        Line::styled(
-                            format!(
-                                "{} {}{}",
-                                if is_selected { "▸" } else { " " },
-                                item.filter.name,
-                                suffix
-                            ),
-                            style,
-                        )
-                    })
-                }),
-        );
-    }
-    frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-    if mode == PickerMode::Filtering {
-        let query_width = UnicodeWidthStr::width(query) as u16;
-        frame.set_cursor_position(Position::new(
-            (inner.x + 4 + query_width).min(inner.right().saturating_sub(1)),
-            inner.y,
-        ));
-    }
+            picker_row_style(is_selected),
+        )
+    });
 }
 
 fn draw_label_picker(
@@ -1584,72 +1507,30 @@ fn draw_label_picker(
     mode: PickerMode,
     labels: &[LabelPickerItem],
 ) {
-    let area = centered(frame.area(), 62, 18, 76, 70);
-    let title = match mode {
-        PickerMode::Filtering => " Labels — type prefix; Esc selects ",
-        PickerMode::Selecting => " Labels — j/k select; Esc cancels ",
+    let picker = Picker {
+        area: centered(frame.area(), 62, 18, 76, 70),
+        title: match mode {
+            PickerMode::Filtering => " Labels — type prefix; Esc selects ",
+            PickerMode::Selecting => " Labels — j/k select; Esc cancels ",
+        }
+        .into(),
+        query,
+        mode,
+        cursor,
+        matches: &prefix_matches(labels, query),
+        empty_notice: "No matching labels",
     };
-    let block = panel(title, true);
-    let inner = block.inner(area);
-    let matches = filtered_label_indices(labels, query);
-    let list_height = inner.height.saturating_sub(2) as usize;
-    let selected = cursor.min(matches.len().saturating_sub(1));
-    let scroll = selected.saturating_sub(list_height.saturating_sub(1));
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "  > ",
-                Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
+    draw_picker(frame, picker, labels, |label, is_selected, _| {
+        Line::styled(
+            format!(
+                "{} [{}] {}",
+                if is_selected { "▸" } else { " " },
+                if label.selected { "✓" } else { " " },
+                label.name
             ),
-            Span::styled(query.to_owned(), Style::default().fg(TEXT)),
-        ]),
-        Line::raw(""),
-    ];
-    if matches.is_empty() {
-        lines.push(Line::styled(
-            "  No matching labels",
-            Style::default().fg(MUTED),
-        ));
-    } else {
-        lines.extend(
-            matches
-                .iter()
-                .skip(scroll)
-                .take(list_height)
-                .enumerate()
-                .filter_map(|(visible_index, label_index)| {
-                    labels.get(*label_index).map(|label| {
-                        let is_selected = scroll + visible_index == selected;
-                        let style = if is_selected {
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(SELECT)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(TEXT)
-                        };
-                        Line::styled(
-                            format!(
-                                "{} [{}] {}",
-                                if is_selected { "▸" } else { " " },
-                                if label.selected { "✓" } else { " " },
-                                label.name
-                            ),
-                            style,
-                        )
-                    })
-                }),
-        );
-    }
-    frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-    if mode == PickerMode::Filtering {
-        let query_width = unicode_width::UnicodeWidthStr::width(query) as u16;
-        frame.set_cursor_position(Position::new(
-            (inner.x + 4 + query_width).min(inner.right().saturating_sub(1)),
-            inner.y,
-        ));
-    }
+            picker_row_style(is_selected),
+        )
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1663,84 +1544,43 @@ fn draw_project_picker(
     search: &mut ProjectSearch,
     keys: &KeyBindings,
 ) {
-    let area = centered(frame.area(), 62, 18, 76, 70);
+    let assigning = matches!(purpose, ProjectPickerPurpose::AssignTask { .. });
     let action = match purpose {
         ProjectPickerPurpose::Jump => "Find project",
         ProjectPickerPurpose::MoveTask { .. } => "Move task",
         ProjectPickerPurpose::AssignTask { .. } => "Assign task",
     };
-    let title = match mode {
-        PickerMode::Filtering => format!(
-            " {action} — fuzzy search; {} selects ",
-            keys.display(Action::Cancel)
-        ),
-        PickerMode::Selecting => format!(
-            " {action} — {}/{} select; {} cancels ",
-            keys.display(Action::Down),
-            keys.display(Action::Up),
-            keys.display(Action::Cancel)
-        ),
-    };
-    let block = panel(title, true);
-    let inner = block.inner(area);
-    let matches = search.matches(projects, query);
-    let list_height = inner.height.saturating_sub(2) as usize;
-    let selected = cursor.min(matches.len().saturating_sub(1));
-    let scroll = selected.saturating_sub(list_height.saturating_sub(1));
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "  > ",
-                Style::default().fg(RED_BRIGHT).add_modifier(Modifier::BOLD),
+    let picker = Picker {
+        area: centered(frame.area(), 62, 18, 76, 70),
+        title: match mode {
+            PickerMode::Filtering => format!(
+                " {action} — fuzzy search; {} selects ",
+                keys.display(Action::Cancel)
             ),
-            Span::styled(query.to_owned(), Style::default().fg(TEXT)),
-        ]),
-        Line::raw(""),
-    ];
-    if matches.is_empty() {
-        lines.push(Line::styled(
-            if matches!(purpose, ProjectPickerPurpose::AssignTask { .. }) {
-                "  No matching assignees"
-            } else {
-                "  No matching projects"
-            },
-            Style::default().fg(MUTED),
-        ));
-    } else {
-        lines.extend(
-            matches
-                .iter()
-                .skip(scroll)
-                .take(list_height)
-                .enumerate()
-                .filter_map(|(visible_index, project_index)| {
-                    projects.get(*project_index).map(|project| {
-                        let is_selected = scroll + visible_index == selected;
-                        let style = if is_selected {
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(SELECT)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(TEXT)
-                        };
-                        Line::styled(
-                            format!("{} {}", if is_selected { "▸" } else { " " }, project.name),
-                            style,
-                        )
-                    })
-                }),
-        );
-    }
-    frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-    if mode == PickerMode::Filtering {
-        let query_width = unicode_width::UnicodeWidthStr::width(query) as u16;
-        frame.set_cursor_position(Position::new(
-            (inner.x + 4 + query_width).min(inner.right().saturating_sub(1)),
-            inner.y,
-        ));
-    }
+            PickerMode::Selecting => format!(
+                " {action} — {}/{} select; {} cancels ",
+                keys.display(Action::Down),
+                keys.display(Action::Up),
+                keys.display(Action::Cancel)
+            ),
+        }
+        .into(),
+        query,
+        mode,
+        cursor,
+        matches: search.matches(projects, query),
+        empty_notice: if assigning {
+            "No matching assignees"
+        } else {
+            "No matching projects"
+        },
+    };
+    draw_picker(frame, picker, projects, |project, is_selected, _| {
+        Line::styled(
+            format!("{} {}", if is_selected { "▸" } else { " " }, project.name),
+            picker_row_style(is_selected),
+        )
+    });
 }
 
 fn centered(
@@ -1799,12 +1639,14 @@ mod tests {
     }
 
     fn large_task_fixture() -> Vec<Task> {
-        (0..10_000).map(|index| {
-            let mut item = task(&format!("Task {index}: a long title with enough words to wrap over multiple visual rows"), &["Work"]);
-            item.id = index.to_string();
-            item.parent_id = (index % 20 != 0).then(|| (index - 1).to_string());
-            item
-        }).collect()
+        (0..10_000)
+            .map(|index| {
+                let mut item = task(&format!("Task {index}: a long title with enough words to wrap over multiple visual rows"), &["Work"]);
+                item.id = index.to_string();
+                item.parent_id = (index % 20 != 0).then(|| (index - 1).to_string());
+                item
+            })
+            .collect()
     }
 
     #[test]

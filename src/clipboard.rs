@@ -1,3 +1,8 @@
+//! Clipboard copies through the platform's helper programs.
+//!
+//! Helpers run on a worker thread under a deadline so a missing or hanging
+//! helper reports an error instead of blocking input. Wayland is tried before
+//! X11, and only one copy is in flight at a time.
 use std::{
     io::ErrorKind,
     sync::{

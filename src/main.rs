@@ -1,3 +1,8 @@
+//! Startup and the single input/render loop.
+//!
+//! The loop owns the terminal: it polls one key or resize event, hands it to
+//! [`app::App`], drains background work through `App::tick`, and redraws only
+//! when something changed. Nothing here performs network or database work.
 mod app;
 mod clipboard;
 mod config;

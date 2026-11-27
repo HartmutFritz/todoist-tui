@@ -34,11 +34,19 @@ impl Store {
         let total = usize::try_from(total)?;
         let rejected = usize::try_from(rejected)?;
         let offset = offset.min(total.saturating_sub(1) / OUTBOX_PAGE_SIZE * OUTBOX_PAGE_SIZE);
-        let rows = tx.prepare("SELECT seq,entity_id,payload,claimed,error,checkpoint FROM outbox ORDER BY seq LIMIT ?1 OFFSET ?2")?
-            .query_map(params![OUTBOX_PAGE_SIZE as i64, i64::try_from(offset)?], |row| Ok((
-                row.get::<_,i64>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?,
-                row.get::<_,bool>(3)?, row.get::<_,Option<String>>(4)?, row.get::<_,String>(5)?
-            )))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = tx
+            .prepare("SELECT seq,entity_id,payload,claimed,error,checkpoint FROM outbox ORDER BY seq LIMIT ?1 OFFSET ?2")?
+            .query_map(params![OUTBOX_PAGE_SIZE as i64, i64::try_from(offset)?], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut entries = Vec::with_capacity(rows.len());
         for (seq, id, payload, claimed, error, checkpoint) in rows {
             let value: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
@@ -60,16 +68,18 @@ impl Store {
                 // Match the rejection and temporary-resource rules used by
                 // claim_next_outbox. Never infer blockers from queue position:
                 // unrelated operations can pass a quarantined rejection.
-                tx.prepare("SELECT b.seq,CASE WHEN b.error IS NOT NULL THEN 'rejected dependency' ELSE 'awaiting resource creation' END
+                tx.prepare(
+                    "SELECT b.seq,CASE WHEN b.error IS NOT NULL THEN 'rejected dependency' ELSE 'awaiting resource creation' END
                     FROM outbox b WHERE b.seq<>?2 AND (
                       (b.error IS NOT NULL AND (b.entity_id=?1 OR instr(?3,json_quote(b.entity_id))>0))
                       OR (json_extract(b.payload,'$.kind') IN ('quick_add','add_project','add_filter') AND (
                         (b.entity_id=?1 AND ?1 LIKE 'local:%' AND json_extract(?3,'$.kind') NOT IN ('quick_add','add_project','add_filter'))
                         OR EXISTS(SELECT 1 FROM json_tree(?3) reference WHERE reference.key IN ('id','parent_id','project_id')
                           AND reference.type='text' AND reference.value LIKE 'local:%' AND reference.value=b.entity_id)
-                      ))) ORDER BY b.seq")?
-                    .query_map(params![id,seq,payload], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+                      ))) ORDER BY b.seq",
+                )?
+                .query_map(params![id, seq, payload], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
             } else {
                 Vec::new()
             };
@@ -202,7 +212,9 @@ mod tests {
         let first = store.claim_next_outbox().unwrap().unwrap();
         let error = "full rejection details\n".repeat(200);
         store.fail_outbox(first.seq, &error).unwrap();
-        store.save_checkpoint(first.seq,&serde_json::json!({"parsed":{"private":"not shown"},"update":true,"keys_done":[true,false]})).unwrap();
+        store
+            .save_checkpoint(first.seq, &serde_json::json!({"parsed":{"private":"not shown"},"update":true,"keys_done":[true,false]}))
+            .unwrap();
         let other = store.add_task("Independent task", &inbox).unwrap();
         store
             .set_meta("retry_not_before", "2027-01-01T00:00:00Z")
@@ -262,7 +274,11 @@ mod tests {
         let store = Store::open(dir.path().join("diagnostics.db")).unwrap();
         let conn = store.connect().unwrap();
         for index in 0..125 {
-            conn.execute("INSERT INTO outbox(uuid,entity_id,payload) VALUES(?1,?2,'{\"kind\":\"delete_task\"}')",params![index.to_string(),format!("task-{index}")]).unwrap();
+            conn.execute(
+                "INSERT INTO outbox(uuid,entity_id,payload) VALUES(?1,?2,'{\"kind\":\"delete_task\"}')",
+                params![index.to_string(), format!("task-{index}")],
+            )
+            .unwrap();
         }
         assert_eq!(store.outbox_diagnostics(0).unwrap().entries.len(), 50);
         let last = store.outbox_diagnostics(100).unwrap();

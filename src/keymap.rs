@@ -1,3 +1,9 @@
+//! Key bindings: defaults, configuration and event matching.
+//!
+//! Configured keys and incoming events are normalized the same way, so a
+//! binding written as `shift+a`, `A` or an uppercase non-ASCII letter matches
+//! the same event. Conflicting bindings are rejected at startup, before the
+//! terminal enters raw mode.
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,

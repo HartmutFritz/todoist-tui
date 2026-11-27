@@ -1,3 +1,8 @@
+//! The background synchronization worker and the state the interface reads.
+//!
+//! One long-lived worker thread runs the passes; the interface hands it work
+//! and reads progress through nonblocking channels and atomics, so storage or
+//! network delays can never block input.
 use std::{
     cell::{Cell, RefCell},
     sync::{

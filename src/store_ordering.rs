@@ -175,9 +175,11 @@ fn record(
     legacy: i64,
     active: bool,
 ) -> Result<()> {
-    conn.execute("INSERT INTO order_meta(resource,id,scope,domain,key,legacy,active) VALUES(?1,?2,?3,?4,?5,?6,?7)
+    conn.execute(
+        "INSERT INTO order_meta(resource,id,scope,domain,key,legacy,active) VALUES(?1,?2,?3,?4,?5,?6,?7)
         ON CONFLICT(resource,id) DO UPDATE SET scope=excluded.scope,domain=excluded.domain,key=excluded.key,legacy=excluded.legacy,active=excluded.active",
-        params![resource,id,serde_json::to_string(scope)?,serde_json::to_string(&scope.allocation_scope())?,key,legacy,active])?;
+        params![resource, id, serde_json::to_string(scope)?, serde_json::to_string(&scope.allocation_scope())?, key, legacy, active],
+    )?;
     Ok(())
 }
 
@@ -344,8 +346,10 @@ pub(super) fn local_position(
     else {
         return Ok(());
     };
-    let mut ids=conn.prepare("SELECT id FROM tasks WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=0 AND deleted=0 ORDER BY child_order,id")?
-        .query_map(params![project_id,parent_id,section_id],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut ids = conn
+        .prepare("SELECT id FROM tasks WHERE project_id=?1 AND parent_id IS ?2 AND section_id IS ?3 AND checked=0 AND deleted=0 ORDER BY child_order,id")?
+        .query_map(params![project_id, parent_id, section_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     if let Some(id) = id {
         ids.retain(|other| other != id);
         ids.insert((index.max(0) as usize).min(ids.len()), id.into());
@@ -414,8 +418,10 @@ pub(super) fn protected_ordinals(conn: &Connection) -> Result<HashSet<String>> {
 }
 
 fn pending_scope_changes(conn: &Connection) -> Result<HashSet<String>> {
-    Ok(conn.prepare("SELECT entity_id FROM outbox WHERE json_extract(payload,'$.kind') IN ('quick_add','move_task','move_task_parent')")?
-        .query_map([],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?)
+    Ok(conn
+        .prepare("SELECT entity_id FROM outbox WHERE json_extract(payload,'$.kind') IN ('quick_add','move_task','move_task_parent')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 pub(super) fn hydrate(conn: &Connection) -> Result<()> {
@@ -431,7 +437,10 @@ pub(super) fn hydrate(conn: &Connection) -> Result<()> {
                 parent_id,
                 section_id,
             } if !protected.contains(&node.id) => {
-                conn.execute("UPDATE tasks SET section_id=?2 WHERE id=?1 AND project_id=?3 AND parent_id IS ?4",params![node.id,section_id,project_id,parent_id])?;
+                conn.execute(
+                    "UPDATE tasks SET section_id=?2 WHERE id=?1 AND project_id=?3 AND parent_id IS ?4",
+                    params![node.id, section_id, project_id, parent_id],
+                )?;
             }
             OrderScope::Projects { folder_id, .. } if node.resource == "project" => {
                 conn.execute(
@@ -552,7 +561,10 @@ impl Store {
         for folder in folders {
             merge_fields(&tx, "folder", folder)?;
         }
-        tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![format!("folder_refresh:{workspace}"),chrono::Utc::now().timestamp().to_string()])?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![format!("folder_refresh:{workspace}"), chrono::Utc::now().timestamp().to_string()],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -577,7 +589,13 @@ impl Store {
         let resource = if projects { "project" } else { "task" };
         let mut groups: HashMap<OrderScope, Vec<TaskOrder>> = HashMap::new();
         for position in positions {
-            let node = conn.query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource=?1 AND id=?2", params![resource,position.id],row_node).optional()?;
+            let node = conn
+                .query_row(
+                    "SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource=?1 AND id=?2",
+                    params![resource, position.id],
+                    row_node,
+                )
+                .optional()?;
             if let Some(node) = node {
                 groups.entry(node.scope).or_default().push(position);
             }
@@ -587,7 +605,11 @@ impl Store {
             positions.sort_by(|a, b| a.child_order.cmp(&b.child_order).then(a.id.cmp(&b.id)));
             if !full && legacy_index {
                 let domain = serde_json::to_string(&scope.allocation_scope())?;
-                positions[0].child_order = conn.query_row("SELECT COUNT(*) FROM order_meta WHERE resource='task' AND domain=?1 AND active=1 AND legacy<?2 AND id<>?3", params![domain,positions[0].child_order,positions[0].id], |row| row.get(0))?;
+                positions[0].child_order = conn.query_row(
+                    "SELECT COUNT(*) FROM order_meta WHERE resource='task' AND domain=?1 AND active=1 AND legacy<?2 AND id<>?3",
+                    params![domain, positions[0].child_order, positions[0].id],
+                    |row| row.get(0),
+                )?;
             }
             plans.push(OrderPlan {
                 scope,
@@ -602,11 +624,26 @@ impl Store {
 
     pub fn placement_plan(&self, id: &str, placement: Placement) -> Result<OrderPlan> {
         let conn = self.connect()?;
-        let node = conn.query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource='task' AND id=?1", [id], row_node).optional()?.context("new task ordering metadata is unavailable")?;
+        let node = conn
+            .query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource='task' AND id=?1", [id], row_node)
+            .optional()?
+            .context("new task ordering metadata is unavailable")?;
         let domain = serde_json::to_string(&node.scope.allocation_scope())?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM order_meta WHERE resource='task' AND domain=?1 AND active=1 AND id<>?2", params![domain,id], |row| row.get(0))?;
-        let index = match placement { Placement::Top => 0, Placement::Bottom => count, Placement::Index(index) => index,
-            Placement::Legacy(value) => conn.query_row("SELECT COUNT(*) FROM order_meta WHERE resource='task' AND domain=?1 AND active=1 AND legacy<?2 AND id<>?3", params![domain,value,id], |row| row.get(0))? };
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM order_meta WHERE resource='task' AND domain=?1 AND active=1 AND id<>?2",
+            params![domain, id],
+            |row| row.get(0),
+        )?;
+        let index = match placement {
+            Placement::Top => 0,
+            Placement::Bottom => count,
+            Placement::Index(index) => index,
+            Placement::Legacy(value) => conn.query_row(
+                "SELECT COUNT(*) FROM order_meta WHERE resource='task' AND domain=?1 AND active=1 AND legacy<?2 AND id<>?3",
+                params![domain, value, id],
+                |row| row.get(0),
+            )?,
+        };
         Ok(OrderPlan {
             scope: node.scope,
             positions: vec![TaskOrder {
@@ -633,8 +670,10 @@ impl Store {
                 continue;
             }
             let domain = serde_json::to_string(&plan.scope.allocation_scope())?;
-            let nodes = conn.prepare("SELECT resource,id,scope,key,legacy FROM order_meta WHERE domain=?1 AND active=1 ORDER BY legacy,id")?
-                .query_map([domain],row_node)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let nodes = conn
+                .prepare("SELECT resource,id,scope,key,legacy FROM order_meta WHERE domain=?1 AND active=1 ORDER BY legacy,id")?
+                .query_map([domain], row_node)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut original = ordered(nodes);
             let resource = if matches!(plan.scope, OrderScope::Tasks { .. }) {
                 "task"
@@ -651,11 +690,15 @@ impl Store {
             // remotely absent resource merely to satisfy an ordering intent.
             if !plan.full
                 && let Some(position) = positions.first()
-                && !original
-                    .iter()
-                    .any(|node| node.resource == resource && node.id == position.id)
-                && let Some(node) = conn.query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource=?1 AND id=?2",params![resource,position.id],row_node).optional()?
-                && node.scope.allocation_scope()==plan.scope.allocation_scope()
+                && !original.iter().any(|node| node.resource == resource && node.id == position.id)
+                && let Some(node) = conn
+                    .query_row(
+                        "SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource=?1 AND id=?2",
+                        params![resource, position.id],
+                        row_node,
+                    )
+                    .optional()?
+                && node.scope.allocation_scope() == plan.scope.allocation_scope()
             {
                 original.push(node);
             }
@@ -827,7 +870,11 @@ impl Store {
                 if protected.contains(&position.id) {
                     continue;
                 }
-                let inactive:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM order_meta WHERE resource=?1 AND id=?2 AND active=0)",params![resource,position.id],|row|row.get(0))?;
+                let inactive: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM order_meta WHERE resource=?1 AND id=?2 AND active=0)",
+                    params![resource, position.id],
+                    |row| row.get(0),
+                )?;
                 if inactive {
                     tx.execute(
                         &format!(
@@ -851,7 +898,9 @@ impl Store {
 
     pub fn task_order_scope(&self, id: &str) -> Result<OrderScope> {
         let conn = self.connect()?;
-        Ok(conn.query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource='task' AND id=?1",[id],row_node)?.scope)
+        Ok(conn
+            .query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource='task' AND id=?1", [id], row_node)?
+            .scope)
     }
 
     pub fn task_order_section(&self, id: &str) -> Result<Option<String>> {
@@ -863,7 +912,9 @@ impl Store {
 
     pub fn folder_workspace(&self, id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
-        let node=conn.query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource='folder' AND id=?1",[id],row_node).optional()?;
+        let node = conn
+            .query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource='folder' AND id=?1", [id], row_node)
+            .optional()?;
         Ok(node.and_then(|node| match node.scope {
             OrderScope::Projects { workspace_id, .. } => workspace_id,
             _ => None,
@@ -895,8 +946,13 @@ impl Store {
             }
             if matches!(plan.scope, OrderScope::Projects { .. }) {
                 for position in &plan.positions {
-                    if let Some(node)=conn.query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource='project' AND id=?1",[&position.id],row_node).optional()?
-                    && let Some(workspace)=Self::workspace_for_order_scope(&node.scope){workspaces.insert(workspace.to_owned());}
+                    if let Some(node) = conn
+                        .query_row("SELECT resource,id,scope,key,legacy FROM order_meta WHERE resource='project' AND id=?1", [&position.id], row_node)
+                        .optional()?
+                        && let Some(workspace) = Self::workspace_for_order_scope(&node.scope)
+                    {
+                        workspaces.insert(workspace.to_owned());
+                    }
                 }
             }
         }
@@ -1005,7 +1061,11 @@ fn merge_fields(conn: &Connection, resource: &str, value: &Value) -> Result<()> 
             && !fields.is_inbox_project,
     )?;
     if resource == "task" {
-        let pending:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND json_extract(payload,'$.kind') IN ('quick_add','quick_edit','move_task','move_task_parent'))",[&fields.id],|row|row.get(0))?;
+        let pending: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE entity_id=?1 AND json_extract(payload,'$.kind') IN ('quick_add','quick_edit','move_task','move_task_parent'))",
+            [&fields.id],
+            |row| row.get(0),
+        )?;
         if !pending {
             conn.execute(
                 "UPDATE tasks SET section_id=?2 WHERE id=?1",
@@ -1221,7 +1281,8 @@ mod tests {
             [payload],
         )
         .unwrap();
-        conn.execute_batch("DROP TABLE order_meta; PRAGMA user_version=9; UPDATE meta SET value='old-token' WHERE key='sync_token';").unwrap();
+        conn.execute_batch("DROP TABLE order_meta; PRAGMA user_version=9; UPDATE meta SET value='old-token' WHERE key='sync_token';")
+            .unwrap();
         drop(conn);
         drop(store);
         let reopened = Store::open(path).unwrap();
@@ -1270,8 +1331,18 @@ mod tests {
         store.set_task_parent(&child, Some(&parent)).unwrap();
         store.map_created_task_id(&parent, "parent-server").unwrap();
         store.map_created_task_id(&child, "child-server").unwrap();
-        assert!(store.outbox().unwrap().iter().filter_map(|entry|match &entry.operation{Operation::OrderResources{plans}=>Some(plans),_=>None}).flatten().any(|plan|
-            matches!(&plan.scope,OrderScope::Tasks{parent_id:Some(id),..} if id=="parent-server") && plan.positions.iter().any(|position|position.id=="child-server")));
+        assert!(
+            store
+                .outbox()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| match &entry.operation {
+                    Operation::OrderResources { plans } => Some(plans),
+                    _ => None,
+                })
+                .flatten()
+                .any(|plan| matches!(&plan.scope,OrderScope::Tasks{parent_id:Some(id),..} if id=="parent-server") && plan.positions.iter().any(|position| position.id == "child-server"))
+        );
     }
 
     #[test]
@@ -1365,7 +1436,10 @@ mod tests {
                     .iter()
                     .position(|entry| matches!(entry.operation, Operation::MoveTask { .. }))
                     .unwrap();
-                let section=entries.iter().position(|entry|matches!(&entry.operation,Operation::MoveTaskParent{section_id:Some(section),..} if section=="s")).unwrap();
+                let section = entries
+                    .iter()
+                    .position(|entry| matches!(&entry.operation,Operation::MoveTaskParent{section_id:Some(section),..} if section=="s"))
+                    .unwrap();
                 let order = entries
                     .iter()
                     .position(|entry| matches!(entry.operation, Operation::OrderResources { .. }))

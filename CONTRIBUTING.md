@@ -51,6 +51,11 @@ flake source before applying the package's source filter.
 - Preserve pending local operations during remote refreshes.
 - Keep the default keymap and `config.example.toml` synchronized.
 - Run formatting, tests, and strict Clippy before submitting a change.
+- Keep statements short enough to fit the 100-column width. `rustfmt`
+  silently leaves a whole expression or function unformatted when one
+  statement inside it cannot be wrapped to fit, so `cargo fmt --check`
+  stays green while the code drifts out of style. Long SQL belongs in a
+  multi-line string literal, and a long call chain in a named local.
 
 Please describe user-visible behavior changes and any database migration in the
 pull request.

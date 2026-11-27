@@ -1,3 +1,8 @@
+//! Configuration, database location and token discovery.
+//!
+//! All of it is optional: with no configuration file the defaults apply, and
+//! with no token the application starts in local-only mode. Token contents are
+//! never logged or rendered.
 use std::{
     fs,
     path::{Path, PathBuf},
